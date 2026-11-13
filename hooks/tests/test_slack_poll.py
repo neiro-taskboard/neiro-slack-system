@@ -23,6 +23,9 @@ Covered:
      re-polling does not double-count
   9. 10 parallel flock-guarded polls -> exactly one wake (claim is single-flight,
      mirroring the flock in slack-new-messages.sh)
+ 10. waiting (pre-check failure) -> re-woken within 24h with first_wait_at
+     unchanged and attempts untouched; past 24h -> dead + dead-letter line
+     once, never re-woken (Yama's test 26 boundary pattern: 23h59m vs 24h01m)
 """
 import json
 import os
@@ -258,6 +261,54 @@ def test_skipped_lines_counted_snapshot():
           and stats3.get("state_skipped_lines") == 0, stats3)
 
 
+def test_waiting_boundary_24h():
+    # Yamaさんのテスト26（DLQ改訂）の境界パターンを、うちの waiting にも。
+    # 23時間59分ではまだ起こし直され、窓の起点 first_wait_at は変わらず、
+    # attempts も消費されない。24時間01分では dead になってデッドレターに
+    # 1行だけ残り、二度と起こされない。
+    env = Env()
+    ev = make_event()
+    now = datetime.now(timezone.utc)
+    first = now - timedelta(hours=23, minutes=59)
+    env.write_inbox([ev])
+    env.write_state([{"event_id": eid(ev), "status": "waiting", "attempts": 1,
+                      "first_wait_at": now_iso(first),
+                      "next_wake_at": now_iso(now - timedelta(seconds=10)),
+                      "updated_at": now_iso(first),
+                      "last_error": "pre-check unverifiable"}])
+    out = env.run()
+    check("waiting 23h59m -> re-woken",
+          out["decision"] == "wake" and len(out["payload"]["events"]) == 1, out)
+    rec = env.read_state()[eid(ev)]
+    check("waiting 23h59m -> first_wait_at unchanged",
+          rec.get("first_wait_at") == now_iso(first), rec)
+    check("waiting re-wake does not consume attempts",
+          rec.get("attempts") == 1, rec)
+
+    # 24時間01分では諦めとして dead へ。
+    first_expired = now - timedelta(hours=24, minutes=1)
+    env.write_state([{"event_id": eid(ev), "status": "waiting", "attempts": 1,
+                      "first_wait_at": now_iso(first_expired),
+                      "next_wake_at": now_iso(now - timedelta(seconds=10)),
+                      "updated_at": now_iso(first_expired),
+                      "last_error": "pre-check unverifiable"}])
+    out2 = env.run()
+    check("waiting 24h01m -> dead-lettered, not re-woken as event",
+          out2["decision"] == "wake"
+          and len(out2["payload"]["events"]) == 0
+          and len(out2["payload"]["dead_letter"]) == 1, out2)
+    rec2 = env.read_state()[eid(ev)]
+    check("waiting 24h01m -> status dead", rec2["status"] == "dead", rec2)
+    check("dead reason mentions 24h window",
+          "24h window expired" in (rec2.get("last_error") or ""), rec2)
+    check("dead-letter line appended exactly once",
+          len(env.read_dead()) == 1, env.read_dead())
+    out3 = env.run()
+    check("dead waiting event never re-woken",
+          out3["decision"] == "silent", out3)
+    check("no duplicate dead-letter line", len(env.read_dead()) == 1)
+
+
 def test_parallel_claims_single_flight():
     import concurrent.futures
     env = Env()
@@ -281,6 +332,7 @@ def main():
              test_done_never_rewoken,
              test_malformed_lines_skipped,
              test_skipped_lines_counted_snapshot,
+             test_waiting_boundary_24h,
              test_parallel_claims_single_flight]
     for t in tests:
         try:
