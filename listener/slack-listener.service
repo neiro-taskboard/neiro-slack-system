@@ -1,0 +1,28 @@
+[Unit]
+Description=Slack Socket Mode listener for Neiro
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/hatch/workspace/slack-listener
+ExecStart=/home/hatch/workspace/.venv-slack/bin/python /home/hatch/workspace/slack-listener/listener.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/home/hatch/workspace/slack-listener/listener.log
+StandardError=append:/home/hatch/workspace/slack-listener/listener.log
+Environment="HTTP_PROXY=http://hatch-egress-proxy:3128"
+Environment="HTTPS_PROXY=http://hatch-egress-proxy:3128"
+Environment="ALL_PROXY=http://hatch-egress-proxy:3128"
+Environment="http_proxy=http://hatch-egress-proxy:3128"
+Environment="https_proxy=http://hatch-egress-proxy:3128"
+Environment="all_proxy=http://hatch-egress-proxy:3128"
+Environment="NO_PROXY=localhost,127.0.0.1,::1"
+Environment="no_proxy=localhost,127.0.0.1,::1"
+Environment="SSL_CERT_FILE=/run/hatch/egress-tls/ca-bundle.pem"
+Environment="REQUESTS_CA_BUNDLE=/run/hatch/egress-tls/ca-bundle.pem"
+Environment="CURL_CA_BUNDLE=/run/hatch/egress-tls/ca-bundle.pem"
+
+[Install]
+WantedBy=multi-user.target

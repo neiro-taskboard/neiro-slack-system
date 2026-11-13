@@ -1,0 +1,6 @@
+config.json
+events/
+*.log
+__pycache__/
+*.bak-*
+heartbeat.json
