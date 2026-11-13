@@ -81,17 +81,24 @@
 #      で、削除せずに何件落ちるかだけ数えられる（Yama さんの
 #      prune-replies --dry-run / Yanayana さんの両 prune への追加、
 #      2026-11-12 と同じ考え方）。
-#   8. 他者の同一文面チェック（スレッド返信のみ）。送信前にスレッドを
-#      読み直し、送る文面が他者の既存投稿と一字一句一致していたら送ら
-#      ない（終了コード4）。Yanayana さんの reply_once.py の再発防止
-#      チェック（2026-11-14）を取り入れ。同日、Yanayana さんの返信の
-#      下書きを作る経路が直近の Yama さんの投稿文面を拾ってそのまま
-#      送ってしまい、2人の返信が一字一句同じになった事故が起きた。
-#      うちの従来の重複チェックは自分の返信との一致しか見ていないので
-#      同じ穴があった。読み直し自体が失敗したときも送らずに止める
-#      （fail-closed、終了コード3）。短い定型文が他者の投稿と偶然一致
-#      して止まる可能性はあるが、一字一句の一致に限るので稀で、止まった
-#      ときは文面を変えて送り直せばよい。
+#   8. 他者の同一文面チェック。送信前にスレッドを読み直し、送る文面が
+#      他者の既存投稿と一字一句一致していたら送らない（終了コード4）。
+#      Yanayana さんの reply_once.py の再発防止チェック（2026-11-14）
+#      を取り入れ。同日、Yanayana さんの返信の下書きを作る経路が直近の
+#      Yama さんの投稿文面を拾ってそのまま送ってしまい、2人の返信が
+#      一字一句同じになった事故が起きた。うちの従来の重複チェックは
+#      自分の返信との一致しか見ていないので同じ穴があった。読み直し
+#      自体が失敗したときも送らずに止める（fail-closed、終了コード3）。
+#      短い定型文が他者の投稿と偶然一致して止まる可能性はあるが、一字
+#      一句の一致に限るので稀で、止まったときは文面を変えて送り直せばよい。
+#      親投稿側も同じ考え方で拡張（2026-11-14、Yanayana さんの
+#      channel_send_once.py の拡張を取り入れ）。チャンネルへの通常送信
+#      では直近50件を読み直し、他者の既存投稿と一字一句一致（前後の
+#      空白を除く）していたら送らない（終了コード4）。読み直しができ
+#      なければ送らずに止める（fail-closed、終了コード3）。スレッド返信
+#      側のチェックとは別に読む（1回の送信で計3回の読み取りになるが、
+#      チャンネル投稿は頻度が低く、既存の check_bounded と分けておく
+#      方が変更が局所的で安全）。
 #
 # 使い方:
 #   slack-send-once.sh --channel C0CGYGT9V7G --message '...' [--workspace muse-board]
@@ -103,8 +110,9 @@
 # 終了コード: 0 = 送信済み（または既に投稿ありでスキップ）、1 = 送信失敗（送信を試みたが履歴にもなし）。
 #   --check-only のときは 0 = 重複あり、1 = 重複なし、2 = 確認できず。
 #   3 = 送信前の履歴確認ができず送らなかった（cannot-verify / pre-check失敗）。
-#   4 = 送る文面がスレッド内の他者の既存投稿と一字一句一致していたので
-#       送らなかった（Yanayana さんの reply_once.py の再発防止チェック、
+#   4 = 送る文面がスレッド内／チャンネル直近50件の他者の既存投稿と
+#       一字一句一致していたので送らなかった（Yanayana さんの
+#       reply_once.py / channel_send_once.py の再発防止チェック、
 #       2026-11-14）。呼び出し側は文面を変えて送り直すか、送らない判断をする。
 #   DLQ再送の改訂案（2026-11-13、Yama・Yanayana・Neiroで合意）：pre-check失敗は
 #   投稿の失敗ではなく API 待ちなので、送信失敗（1）と区別する。呼び出し側は
@@ -606,6 +614,57 @@ sys.exit(1)
   return 2
 }
 
+# 送信前の他者同一文面チェック（チャンネルへの親投稿）。
+#   0 = 他者の同一文面あり、1 = なし、2 = 履歴が読めなかった。
+# 直近 BOUNDED_N 件を読み直し、送る文面が他者の既存投稿と一字一句
+# 一致（前後の空白を除く）していないか確認する（Yanayana さんの
+# channel_send_once.py の拡張、2026-11-14 を取り入れ。Yama さんの
+# 直近50件の形と同じ）。自分の投稿との一致は check_bounded が見る
+# ので、ここでは他者の投稿だけを見る。check_bounded とは別に読む
+# （既存の読み取りと分けておく方が変更が局所的で安全。チャンネル
+# 投稿は頻度が低いので1回余分に読んでも問題ない）。
+# 読み直しは最大5回リトライし、それでも読めなければ cannot-verify
+# （fail-closed。呼び出し側は終了コード3として扱う）。
+check_other_bounded() {
+  local attempt=0 raw found rc
+  [ -n "$THREAD_TS" ] && return 1
+  while [ "$attempt" -lt "$HISTORY_ATTEMPTS" ]; do
+    attempt=$((attempt + 1))
+    raw=$("$SLACKCLI" conversations read "$CHANNEL" --limit "$BOUNDED_N" --json "${WS_ARGS[@]}" 2>/dev/null || true)
+    found=$(printf '%s' "$raw" | python3 -c "
+import sys, json
+raw = sys.stdin.read()
+i = raw.find('{')
+if i < 0:
+    sys.exit(2)
+try:
+    d = json.loads(raw[i:])
+except Exception:
+    sys.exit(2)
+target = open('$TMP_MSG', encoding='utf-8').read().strip()
+for m in d.get('messages', []):
+    if m.get('user') == '$SELF_ID':
+        continue
+    if (m.get('text') or '').strip() == target:
+        print('OTHER_DUP ' + str(m.get('ts', '')))
+        sys.exit(0)
+sys.exit(1)
+" 2>/dev/null)
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+      echo "other user's identical post found: ${found#OTHER_DUP }"
+      return 0
+    elif [ "$rc" -eq 1 ]; then
+      return 1
+    fi
+    # rc == 2: この読み取りが失敗した。再試行する。
+    # 間隔は 1・2・4・8 秒の指数バックオフ（check_bounded と同じ。
+    # 最後の試行の後に待つ意味はないので、次があるときだけ待つ）。
+    if [ "$attempt" -lt "$HISTORY_ATTEMPTS" ]; then sleep $((1 << (attempt - 1))); fi
+  done
+  return 2
+}
+
 # --- 1. 送信前の履歴確認 ---
 check_duplicate
 CHECK_RC=$?
@@ -653,10 +712,11 @@ if [ "$CHECK_ONLY" -eq 1 ]; then
   exit 1
 fi
 
-# --- 1b. 他者の同一文面チェック（スレッド返信のみ） ---
-# Yanayana さんの reply_once.py の再発防止チェック（2026-11-14）を取り入れ。
-# 送る文面がスレッド内の他者の既存投稿と一字一句一致していたら送らない。
-# 読み直しができなければ送らずに止める（fail-closed、終了コード3）。
+# --- 1b. 他者の同一文面チェック ---
+# Yanayana さんの reply_once.py / channel_send_once.py の再発防止
+# チェック（2026-11-14）を取り入れ。送る文面が他者の既存投稿と
+# 一字一句一致していたら送らない。読み直しができなければ送らずに
+# 止める（fail-closed、終了コード3）。
 if [ -n "$THREAD_TS" ]; then
   check_other_duplicate
   OTHER_RC=$?
@@ -666,6 +726,18 @@ if [ -n "$THREAD_TS" ]; then
   fi
   if [ "$OTHER_RC" -eq 2 ]; then
     record_ambiguous "other-duplicate check unreadable after retries (cannot-verify); not sending"
+    echo "cannot verify other-duplicate check after retries, not sending (fail-closed; exit 3 = pre-check failure, not a send failure)" >&2
+    exit 3
+  fi
+else
+  check_other_bounded
+  OTHER_RC=$?
+  if [ "$OTHER_RC" -eq 0 ]; then
+    echo "text exactly matches another user's recent post in this channel, not sending (exit 4)" >&2
+    exit 4
+  fi
+  if [ "$OTHER_RC" -eq 2 ]; then
+    record_ambiguous "other-duplicate check (channel) unreadable after retries (cannot-verify); not sending"
     echo "cannot verify other-duplicate check after retries, not sending (fail-closed; exit 3 = pre-check failure, not a send failure)" >&2
     exit 3
   fi
