@@ -26,6 +26,8 @@ Covered:
  10. waiting (pre-check failure) -> re-woken within 24h with first_wait_at
      unchanged and attempts untouched; past 24h -> dead + dead-letter line
      once, never re-woken (Yama's test 26 boundary pattern: 23h59m vs 24h01m)
+ 11. waiting re-wake -> payload event carries resend annotation
+     (first_wait_at + JST) for the "遅れての再送" prefix; new events don't
 """
 import json
 import os
@@ -309,6 +311,41 @@ def test_waiting_boundary_24h():
     check("no duplicate dead-letter line", len(env.read_dead()) == 1)
 
 
+def test_waiting_rewake_annotates_resend():
+    # DLQ再送の最終形（2026-11-14、Yanayana の reconcile_ambiguous.py 参考）:
+    # waiting で起こし直されるとき、ペイロードのイベントに resend が付き、
+    # first_wait_at（元の失敗時刻）と JST 表示が入る。新規イベントには付かない。
+    env = Env()
+    ev = make_event()
+    ev_new = make_event(ts="1794476893.695469")
+    now = datetime.now(timezone.utc)
+    first = now - timedelta(hours=1)
+    env.write_inbox([ev, ev_new])
+    env.write_state([{"event_id": eid(ev), "status": "waiting", "attempts": 1,
+                      "first_wait_at": now_iso(first),
+                      "next_wake_at": now_iso(now - timedelta(seconds=10)),
+                      "updated_at": now_iso(first),
+                      "last_error": "pre-check unverifiable"}])
+    out = env.run()
+    check("waiting re-wake + new event -> wake with 2 events",
+          out["decision"] == "wake" and len(out["payload"]["events"]) == 2, out)
+    by_ts = {e["ts"]: e for e in out["payload"]["events"]}
+    resend = by_ts[ev["ts"]].get("resend")
+    check("waiting event carries resend annotation",
+          isinstance(resend, dict), by_ts)
+    check("resend.first_wait_at is the original failure time",
+          resend and resend.get("first_wait_at") == now_iso(first), resend)
+    from zoneinfo import ZoneInfo
+    expected_jst = first.astimezone(ZoneInfo("Asia/Tokyo")).strftime("%Y-%m-%d %H:%M JST")
+    check("resend.first_wait_at_jst is JST for the prefix",
+          resend and resend.get("first_wait_at_jst") == expected_jst, resend)
+    check("new event has no resend annotation",
+          "resend" not in by_ts[ev_new["ts"]], by_ts[ev_new["ts"]])
+    rec = env.read_state()[eid(ev)]
+    check("resend annotation does not consume attempts",
+          rec.get("attempts") == 1, rec)
+
+
 def test_parallel_claims_single_flight():
     import concurrent.futures
     env = Env()
@@ -333,6 +370,7 @@ def main():
              test_malformed_lines_skipped,
              test_skipped_lines_counted_snapshot,
              test_waiting_boundary_24h,
+             test_waiting_rewake_annotates_resend,
              test_parallel_claims_single_flight]
     for t in tests:
         try:

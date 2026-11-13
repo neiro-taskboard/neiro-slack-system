@@ -20,6 +20,9 @@ Rules:
   ではなく API 待ちなので、attempts（retry_count）に数えない。1時間ごとに
   起こし直し、24時間以内に履歴が読めるようになれば通常通り返信する。
   24時間を過ぎても読めなければ諦めとして dead にし、デッドレターに記録する。
+  起こし直しのペイロードには resend（元の失敗時刻つき）を付け、ワーカーが
+  再送前に答え済み確認をしてから「遅れての再送」の接頭辞つきで送る
+  （2026-11-14、Yanayana の reconcile_ambiguous.py を参考に取り込み）。
 - Newly dead events are reported in the payload so the owner can be notified.
 
 Output: JSON {"decision": "wake"|"silent", "reason": str, "payload": {...}}
@@ -68,6 +71,20 @@ def parse_iso(s):
 
 def event_id(ev):
     return f"{ev.get('workspace_id','')}:{ev.get('channel','')}:{ev.get('ts','')}"
+
+
+def format_jst(dt):
+    """datetime -> '2026-11-13 23:42 JST'。
+
+    Yanayana の reconcile_ambiguous.py の format_failed_at_jst と同じ形。
+    再送文の接頭辞「遅れての再送（元の失敗時刻：…）」に入れる。
+    zoneinfo が使えなければ ISO 時刻をそのまま返す。
+    """
+    try:
+        from zoneinfo import ZoneInfo
+        return dt.astimezone(ZoneInfo("Asia/Tokyo")).strftime("%Y-%m-%d %H:%M JST")
+    except Exception:
+        return dt.isoformat()
 
 
 def load_state():
@@ -205,7 +222,17 @@ def main():
                 rec["status"] = "processing"
                 rec["updated_at"] = now_iso()
                 rec["next_wake_at"] = (now + timedelta(seconds=WAIT_WAKE_INTERVAL_SECS)).isoformat()
-                due.append(ev)
+                # DLQ再送の最終形（2026-11-14、Yanayana の reconcile_ambiguous.py
+                # を参考に取り込み）：再 wake であることをペイロードに明示し、
+                # 元の失敗時刻を添える。ワーカーは送る前に
+                # slack-answered-check.py で答え済み確認をし、再送文の先頭に
+                # 「遅れての再送（元の失敗時刻：…JST）」を付けて送る。
+                resend_ev = dict(ev)
+                resend_ev["resend"] = {
+                    "first_wait_at": first_wait.isoformat(),
+                    "first_wait_at_jst": format_jst(first_wait),
+                }
+                due.append(resend_ev)
                 changed = True
             continue
         attempts = int(rec.get("attempts", 0))
