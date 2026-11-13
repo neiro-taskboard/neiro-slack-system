@@ -28,6 +28,20 @@ DECISION=$(printf '%s' "$OUT" | python3 -c "import sys,json; print(json.load(sys
 REASON=$(printf '%s' "$OUT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('reason',''))")
 PAYLOAD=$(printf '%s' "$OUT" | python3 -c "import sys,json; print(json.dumps(json.load(sys.stdin).get('payload',{}), ensure_ascii=False))")
 
+# Periodic ambiguous reconciliation (slack-reconcile-ambiguous.py).
+# The script self-gates to at most once an hour, so calling it on every
+# poll is cheap (a gated no-op most of the time). Best-effort: it never
+# breaks the poll (|| true, 120s cap) and is skipped in dry-run mode.
+# It must run here — after the decision, before wake/silent — because
+# wake/silent exit the hook immediately.
+if [ "${HATCH_HOOK_DRY_RUN:-0}" != "1" ]; then
+  RECONCILE_PY="/home/hatch/hooks/scripts/slack-reconcile-ambiguous.py"
+  RECONCILE_OUT="$(timeout 120 python3 "$RECONCILE_PY" 2>&1 || true)"
+  if [ -n "$RECONCILE_OUT" ] && ! printf '%s' "$RECONCILE_OUT" | grep -q '"gated": true'; then
+    printf '%s\n' "$RECONCILE_OUT" >> "/home/hatch/hooks/state/slack-reconcile-ambiguous.log"
+  fi
+fi
+
 if [ "$DECISION" = "wake" ]; then
   log "new slack messages" "$PAYLOAD"
   wake "$REASON" "$PAYLOAD"
