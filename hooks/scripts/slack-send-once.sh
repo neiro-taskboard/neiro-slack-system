@@ -301,16 +301,25 @@ PYEOF
 # の ambiguous_post_outcome、2026-11-12）。送信の応答が失われ、読み直し
 # でも履歴が一度も読めなかったときに使う。履歴が読めて投稿が無いことが
 # 確認できた場合は明確な失敗なので記録しない。
+# 送ろうとした文面も一緒に残す（Yanayana さんの送信記録への文面追加、
+# 2026-11-14 を取り入れ）。通常送信は record_send が文面を残しているが、
+# ambiguous 側だけ文面が無く、後から「何を送ろうとしたか」が分からな
+# かったため。文面が読めなくても記録自体は残す。
 #   引数: 理由の文字列。
 record_ambiguous() {
   local reason="$1"
   mkdir -p "$(dirname "$AMBIGUOUS_FILE")" 2>/dev/null || return 0
-  python3 - "$reason" "$CHANNEL" "$THREAD_TS" "$AMBIGUOUS_FILE" <<'PYEOF' 2>/dev/null || true
+  python3 - "$reason" "$CHANNEL" "$THREAD_TS" "$AMBIGUOUS_FILE" "$TMP_MSG" <<'PYEOF' 2>/dev/null || true
 import json, sys, time
-reason, channel, thread_ts, path = sys.argv[1:5]
+reason, channel, thread_ts, path, msg_path = sys.argv[1:6]
+try:
+    with open(msg_path, encoding='utf-8') as f:
+        text = f.read()
+except OSError:
+    text = ''
 rec = {'time': time.strftime('%Y-%m-%dT%H:%M:%S%z'), 'channel': channel,
        'thread_ts': thread_ts or '', 'outcome': 'ambiguous_post_outcome',
-       'reason': reason}
+       'reason': reason, 'text': text}
 with open(path, 'a', encoding='utf-8') as f:
     f.write(json.dumps(rec, ensure_ascii=False) + '\n')
 PYEOF
