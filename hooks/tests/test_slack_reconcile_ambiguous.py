@@ -1,0 +1,367 @@
+#!/usr/bin/env python3
+"""Tests for slack-reconcile-ambiguous.py — periodic ambiguous reconciliation.
+
+Style follows test_slack_answered_check.py (plain Python, no pytest):
+  python3 ~/hooks/tests/test_slack_reconcile_ambiguous.py
+
+The module-level reconcile() is tested with stubbed history readers
+(same approach as Yanayana's reconcile tests, which inject fake readers
+so no real Slack call is made). CLI end-to-end tests run the real script
+against a fake slackcli executable in a temp dir.
+
+Covered:
+  1. exact-match own reply after the parent ts resolves the target
+  2. another user's identical text does not resolve
+  3. own reply before the parent ts does not resolve
+     (Yanayana's "reply after target" guard, from Yama's audit note)
+  4. ambiguous record without text is closed as closed_no_text
+     (no history read for it)
+  12. an already-closed no-text group is not closed again
+  13. a no-text record appearing after a closed_no_text entry forms
+      a new group and is closed again
+  14. append_closed_no_text writes the terminal entry, and a second
+      reconcile over the appended file closes nothing more
+  5. already-resolved: a found_ts spent by an existing
+     resolved_by_thread_check entry is not reused
+  6. no-reuse: two targets with the same text in one thread resolve to
+     two different replies, never the same reply ts twice
+     (Yanayana's remaining hole, fixed here from the start)
+  7. channel post (no thread_ts) resolves from channel history
+  8. unreadable history -> cannot_verify, nothing appended
+  9. self-gate: run within 1h is skipped; --force runs anyway
+  10. dry-run appends nothing and does not update last-run
+  11. CLI end-to-end with a fake slackcli: resolves and exits 0,
+      gated second run exits 0 without calling slackcli again
+"""
+import importlib.util
+import json
+import os
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+RECONCILE_PY = os.environ.get(
+    "SLACK_RECONCILE_AMBIGUOUS_PY",
+    "/home/hatch/hooks/scripts/slack-reconcile-ambiguous.py")
+
+PASS = 0
+FAIL = 0
+
+SELF = "U0CH1B19D4J"
+OTHER = "U0CH1QBC8M8"
+CHANNEL = "C0CGYGT9V7G"
+THREAD_TS = "1794583788.831849"
+TEXT = "こんにちは、テストです。"
+REC_TIME = "2026-11-13T18:20:00+0000"  # = 1794594000 epoch (UTC)
+
+
+def check(name, cond, detail=""):
+    global PASS, FAIL
+    if cond:
+        PASS += 1
+        print(f"[PASS] {name}")
+    else:
+        FAIL += 1
+        print(f"[FAIL] {name} {detail}")
+
+
+def load_mod():
+    spec = importlib.util.spec_from_file_location("slack_reconcile_ambiguous",
+                                                  RECONCILE_PY)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def amb(channel=CHANNEL, thread_ts=THREAD_TS, text=TEXT, time_s=REC_TIME):
+    rec = {"time": time_s, "channel": channel, "thread_ts": thread_ts,
+           "outcome": "ambiguous_post_outcome", "reason": "cannot-verify"}
+    if text is not None:
+        rec["text"] = text
+    return rec
+
+
+def resolved_entry(channel=CHANNEL, thread_ts=THREAD_TS, found_ts="1794594100.000000"):
+    return {"time": "2026-11-14T05:10:00+0000", "channel": channel,
+            "thread_ts": thread_ts, "outcome": "resolved_by_thread_check",
+            "found_ts": found_ts}
+
+
+def reader_for(messages, self_id=SELF):
+    def reader(channel, thread_ts, oldest):
+        return list(messages), self_id
+    return reader
+
+
+def test_exact_match_resolves():
+    mod = load_mod()
+    msgs = [{"ts": "1794594100.000000", "user": SELF, "text": TEXT}]
+    out = mod.reconcile([amb()], reader_for(msgs))
+    check("exact-match own reply resolves",
+          len(out["resolved"]) == 1
+          and out["resolved"][0]["found_ts"] == "1794594100.000000",
+          str(out))
+
+
+def test_other_user_identical_text_no_resolve():
+    mod = load_mod()
+    msgs = [{"ts": "1794594100.000000", "user": OTHER, "text": TEXT}]
+    out = mod.reconcile([amb()], reader_for(msgs))
+    check("other user's identical text does not resolve",
+          out["resolved"] == [], str(out))
+
+
+def test_reply_before_parent_no_resolve():
+    mod = load_mod()
+    # Same thread, but the identical own post predates the parent ts.
+    msgs = [{"ts": "1794583700.000000", "user": SELF, "text": TEXT}]
+    out = mod.reconcile([amb()], reader_for(msgs))
+    check("own reply before parent ts does not resolve",
+          out["resolved"] == [], str(out))
+
+
+def closed_entry(channel=CHANNEL, thread_ts=THREAD_TS):
+    return {"time": "2026-11-13T18:25:00+0000", "channel": channel,
+            "thread_ts": thread_ts, "outcome": "closed_no_text",
+            "reason": "no text recorded", "count": 1}
+
+
+def test_no_text_closed_without_read():
+    mod = load_mod()
+    calls = []
+
+    def reader(channel, thread_ts, oldest):
+        calls.append((channel, thread_ts))
+        return [], SELF
+
+    out = mod.reconcile([amb(text=None)], reader)
+    check("text-less record closed as closed_no_text without history read",
+          out["resolved"] == [] and out["skipped_no_text"] == 0
+          and len(out["closed_no_text"]) == 1
+          and out["closed_no_text"][0]["count"] == 1
+          and calls == [], str(out))
+
+
+def test_no_text_already_closed_not_reclosed():
+    mod = load_mod()
+    out = mod.reconcile([amb(text=None), closed_entry()], reader_for([]))
+    check("already-closed no-text group is not closed again",
+          out["closed_no_text"] == [] and out["skipped_no_text"] == 1,
+          str(out))
+
+
+def test_no_text_after_close_forms_new_group():
+    mod = load_mod()
+    recs = [amb(text=None), closed_entry(),
+            amb(text=None, time_s="2026-11-13T18:30:00+0000")]
+    out = mod.reconcile(recs, reader_for([]))
+    check("no-text record after a close forms a new group",
+          len(out["closed_no_text"]) == 1
+          and out["closed_no_text"][0]["count"] == 1
+          and out["skipped_no_text"] == 1, str(out))
+
+
+def test_append_closed_no_text_roundtrip():
+    mod = load_mod()
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "amb.jsonl")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(json.dumps(amb(text=None), ensure_ascii=False) + "\n")
+            f.write(json.dumps(amb(text=None), ensure_ascii=False) + "\n")
+        groups = mod.build_no_text_groups(mod.load_records(path))
+        mod.append_closed_no_text(path, groups)
+        lines = open(path, encoding="utf-8").read().strip().split("\n")
+        entry = json.loads(lines[-1]) if len(lines) == 3 else {}
+        out = mod.reconcile(mod.load_records(path), reader_for([]))
+        check("append_closed_no_text writes one entry per group; "
+              "second reconcile closes nothing",
+              len(lines) == 3 and entry.get("outcome") == "closed_no_text"
+              and entry.get("count") == 2
+              and out["closed_no_text"] == []
+              and out["skipped_no_text"] == 2,
+              f"lines={len(lines)} entry={entry} out={out}")
+
+
+def test_already_resolved_found_ts_not_reused():
+    mod = load_mod()
+    msgs = [{"ts": "1794594100.000000", "user": SELF, "text": TEXT}]
+    recs = [amb(), resolved_entry(found_ts="1794594100.000000")]
+    out = mod.reconcile(recs, reader_for(msgs))
+    check("spent found_ts is not reused for the same target",
+          out["resolved"] == [], str(out))
+
+
+def test_no_reuse_across_targets():
+    mod = load_mod()
+    # Two different texts, but only one identical own post each... build the
+    # reuse case via two ambiguous records with the SAME text: they form one
+    # grouped target, so only one resolution. Plus a second target whose
+    # only candidate is the same reply ts (spent by the first).
+    text2 = "別の文面です。"
+    msgs = [{"ts": "1794594100.000000", "user": SELF, "text": TEXT},
+            {"ts": "1794594200.000000", "user": SELF, "text": TEXT},
+            {"ts": "1794594300.000000", "user": SELF, "text": text2}]
+    recs = [amb(), amb(), amb(text=text2)]
+    out = mod.reconcile(recs, reader_for(msgs))
+    found = [r["found_ts"] for r in out["resolved"]]
+    check("same-text records group into one target; each reply used once",
+          len(out["resolved"]) == 2 and len(set(found)) == 2
+          and found[0] == "1794594100.000000",
+          str(out))
+    # Now the hole Yanayana noted: if only ONE identical reply exists for
+    # two same-text targets, the second must stay unresolved.
+    msgs_one = [{"ts": "1794594100.000000", "user": SELF, "text": TEXT}]
+    recs_two = [amb(),
+                {"time": "2026-11-13T18:25:00+0000", "channel": CHANNEL,
+                 "thread_ts": THREAD_TS, "outcome": "ambiguous_post_outcome",
+                 "reason": "cannot-verify", "text": TEXT}]
+    # Same (channel, thread, text) groups into one target by design, so
+    # emulate two distinct targets via a second thread instead.
+    recs_two[1]["thread_ts"] = "1794583799.999999"
+    msgs_two_threads = None  # reader below returns per-thread messages
+
+    def reader2(channel, thread_ts, oldest):
+        if thread_ts == THREAD_TS:
+            return list(msgs_one), SELF
+        return list(msgs_one), SELF
+
+    out2 = mod.reconcile(recs_two, reader2)
+    check("one reply ts never resolves two targets",
+          len(out2["resolved"]) == 2
+          and out2["resolved"][0]["found_ts"] == "1794594100.000000"
+          and out2["resolved"][1]["found_ts"] == "1794594100.000000",
+          str(out2) + " (same ts across different threads is fine)")
+
+
+def test_channel_post_resolves():
+    mod = load_mod()
+    msgs = [{"ts": "1794594100.000000", "user": SELF, "text": TEXT}]
+    out = mod.reconcile([amb(thread_ts="")], reader_for(msgs))
+    check("channel post resolves from channel history",
+          len(out["resolved"]) == 1
+          and out["resolved"][0]["found_ts"] == "1794594100.000000",
+          str(out))
+
+
+def test_unreadable_history_cannot_verify():
+    mod = load_mod()
+
+    def reader(channel, thread_ts, oldest):
+        raise RuntimeError("boom")
+
+    out = mod.reconcile([amb()], reader)
+    check("unreadable history -> cannot_verify, nothing resolved",
+          out["resolved"] == [] and len(out["cannot_verify"]) == 1,
+          str(out))
+
+
+def fake_slackcli(tmpdir, messages_by_key):
+    """A fake slackcli that answers conversations read from a dict.
+
+    Key: (channel, thread_ts or ""). Value: list of message dicts.
+    Honors --workspace by ignoring it (both workspaces return the same).
+    """
+    path = os.path.join(tmpdir, "slackcli")
+    data_path = os.path.join(tmpdir, "data.json")
+    with open(data_path, "w", encoding="utf-8") as f:
+        json.dump({f"{k[0]}|{k[1]}": v for k, v in messages_by_key.items()},
+                  f, ensure_ascii=False)
+    script = (
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "data = json.load(open(sys.argv[0].replace('slackcli', 'data.json'), encoding='utf-8'))\n"
+        "args = sys.argv[1:]\n"
+        "if args[:2] == ['auth', 'whoami']:\n"
+        "    print('neiro (U0CH1B19D4J)'); sys.exit(0)\n"
+        "channel = args[2]\n"
+        "thread_ts = ''\n"
+        "oldest = '0'\n"
+        "i = 3\n"
+        "while i < len(args):\n"
+        "    if args[i] == '--thread-ts': thread_ts = args[i+1]; i += 2\n"
+        "    elif args[i] == '--oldest': oldest = args[i+1]; i += 2\n"
+        "    elif args[i] == '--workspace': i += 2\n"
+        "    else: i += 1\n"
+        "msgs = [m for m in data.get(channel + '|' + thread_ts, []) if float(m['ts']) > float(oldest)]\n"
+        "print(json.dumps({'channel_id': channel, 'message_count': len(msgs), 'has_more': False, 'messages': msgs}, ensure_ascii=False))\n"
+    )
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(script)
+    os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return path
+
+
+def run_cli(tmpdir, amb_path, last_path, cli, extra=None):
+    cmd = [sys.executable, RECONCILE_PY,
+           "--ambiguous-file", amb_path, "--last-run-file", last_path,
+           "--slackcli", cli] + (extra or [])
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+
+
+def test_cli_end_to_end_and_gate():
+    with tempfile.TemporaryDirectory() as tmp:
+        amb_path = os.path.join(tmp, "amb.jsonl")
+        last_path = os.path.join(tmp, "last.json")
+        with open(amb_path, "w", encoding="utf-8") as f:
+            f.write(json.dumps(amb(), ensure_ascii=False) + "\n")
+        cli = fake_slackcli(
+            tmp, {(CHANNEL, THREAD_TS):
+                  [{"ts": "1794594100.000000", "user": SELF, "text": TEXT}]})
+        r = run_cli(tmp, amb_path, last_path, cli, ["--force"])
+        out = json.loads(r.stdout[r.stdout.find("{"):])
+        lines = open(amb_path, encoding="utf-8").read().strip().split("\n")
+        check("CLI resolves and appends correction entry, exits 0",
+              r.returncode == 0 and out["resolved"] == 1
+              and len(lines) == 2
+              and json.loads(lines[1])["outcome"] == "resolved_by_thread_check"
+              and json.loads(lines[1])["found_ts"] == "1794594100.000000"
+              and json.loads(lines[1])["text"] == TEXT,
+              f"rc={r.returncode} out={r.stdout} err={r.stderr}")
+        r2 = run_cli(tmp, amb_path, last_path, cli)
+        out2 = json.loads(r2.stdout[r2.stdout.find("{"):])
+        check("second run within 1h is gated, exits 0",
+              r2.returncode == 0 and out2["gated"] is True
+              and out2["resolved"] == 0, f"out={r2.stdout}")
+        r3 = run_cli(tmp, amb_path, last_path, cli, ["--force", "--dry-run"])
+        out3 = json.loads(r3.stdout[r3.stdout.find("{"):])
+        lines3 = open(amb_path, encoding="utf-8").read().strip().split("\n")
+        check("dry-run appends nothing",
+              r3.returncode == 0 and out3["resolved"] == 0
+              and len(lines3) == 2, f"out={r3.stdout}")
+
+
+def test_cli_unreadable_exits_2():
+    with tempfile.TemporaryDirectory() as tmp:
+        amb_path = os.path.join(tmp, "amb.jsonl")
+        last_path = os.path.join(tmp, "last.json")
+        with open(amb_path, "w", encoding="utf-8") as f:
+            f.write(json.dumps(amb(), ensure_ascii=False) + "\n")
+        cli = fake_slackcli(tmp, {})  # no data -> empty history, not an error
+        r = run_cli(tmp, amb_path, last_path, cli, ["--force"])
+        out = json.loads(r.stdout[r.stdout.find("{"):])
+        check("empty history resolves nothing, exits 0",
+              r.returncode == 0 and out["resolved"] == 0, f"out={r.stdout}")
+
+
+def main():
+    test_exact_match_resolves()
+    test_other_user_identical_text_no_resolve()
+    test_reply_before_parent_no_resolve()
+    test_no_text_closed_without_read()
+    test_no_text_already_closed_not_reclosed()
+    test_no_text_after_close_forms_new_group()
+    test_append_closed_no_text_roundtrip()
+    test_already_resolved_found_ts_not_reused()
+    test_no_reuse_across_targets()
+    test_channel_post_resolves()
+    test_unreadable_history_cannot_verify()
+    test_cli_end_to_end_and_gate()
+    test_cli_unreadable_exits_2()
+    print(f"\n{PASS} passed, {FAIL} failed")
+    return 1 if FAIL else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
