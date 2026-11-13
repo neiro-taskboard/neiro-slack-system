@@ -15,6 +15,8 @@ Covered:
   3. time ordering: a reply before the event ts does not count
      (Yanayana's _is_reply_after_event, adopted 2026-11-14 from Yama)
   4. questioner / self posts do not count; empty-text posts do not count
+  4b. bot posts and short (<=10 chars) posts do not count as answered
+      (narrowed condition from Yama, 2026-11-14; Yanayana adopted the same)
   5. parent missing from channel history -> parent_deleted
   6. unreadable thread / channel -> cannot_verify
   7. paging: an answering post on page 2 is found (next_oldest walk)
@@ -111,7 +113,7 @@ def test_answered_by_other():
     mod = load_check()
     msgs = [
         {"ts": "1794583868.235619", "user": QUESTIONER, "text": "質問の続き"},
-        {"ts": "1794585000.000000", "user": OTHER, "text": "こっちで答えますね"},
+        {"ts": "1794585000.000000", "user": OTHER, "text": "こっちで答えますね、確認しました"},
     ]
     out = run_check(mod, msgs)
     check("third-party text reply after event -> answered_by_other",
@@ -150,6 +152,33 @@ def test_empty_text_does_not_count():
           out["verdict"] == "ok_to_resend", out)
 
 
+def test_bot_and_short_posts_do_not_count():
+    mod = load_check()
+    # 他の bot の自動応答（本文が長くても）は答え済みにしない。
+    msgs = [
+        {"ts": "1794585000.000000", "user": OTHER, "bot_id": "B0CH1QBBNUA",
+         "text": "こっちで答えますね、確認しました"},
+    ]
+    out = run_check(mod, msgs)
+    check("bot post does not count as answered",
+          out["verdict"] == "ok_to_resend", out)
+    # 人の投稿でも本文が 10 文字以下なら答え済みにしない（短い相槌）。
+    msgs = [
+        {"ts": "1794585000.000000", "user": OTHER, "text": "ありがとう"},
+        {"ts": "1794585100.000000", "user": OTHER, "text": "あいうえおかきくけこ"},
+    ]
+    out = run_check(mod, msgs)
+    check("short posts (<=10 chars) do not count as answered",
+          out["verdict"] == "ok_to_resend", out)
+    # 境界：11 文字なら答え済みになる。
+    msgs = [
+        {"ts": "1794585000.000000", "user": OTHER, "text": "あいうえおかきくけこさ"},
+    ]
+    out = run_check(mod, msgs)
+    check("11-char post counts as answered",
+          out["verdict"] == "answered_by_other", out)
+
+
 def test_parent_deleted():
     mod = load_check()
     out = run_check(mod, [], channel_reader=channel_without_parent())
@@ -177,7 +206,7 @@ def test_paging_finds_answer_on_page2():
                       "text": "質問の続き"}],
                     has_more=True, next_oldest="1794584000.000000"),
         thread_page([{"ts": "1794585000.000000", "user": OTHER,
-                      "text": "こっちで答えますね"}]),
+                      "text": "こっちで答えますね、確認しました"}]),
     ]
     calls = {"n": 0}
 
@@ -221,7 +250,7 @@ def test_cli_end_to_end():
                 {"ts": "1794583868.235619", "user": QUESTIONER,
                  "text": "質問の続き"},
                 {"ts": "1794585000.000000", "user": OTHER,
-                 "text": "こっちで答えますね"}],
+                 "text": "こっちで答えますね、確認しました"}],
                 "has_more": False, "next_oldest": None}, f)
         with open(channel_path, "w", encoding="utf-8") as f:
             json.dump({"messages": [{"ts": THREAD_TS, "user": QUESTIONER,
@@ -265,6 +294,7 @@ def main():
              test_answered_by_other,
              test_time_ordering,
              test_empty_text_does_not_count,
+             test_bot_and_short_posts_do_not_count,
              test_parent_deleted,
              test_cannot_verify,
              test_paging_finds_answer_on_page2,

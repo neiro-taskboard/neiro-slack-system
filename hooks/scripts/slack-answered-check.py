@@ -8,8 +8,10 @@ Yanayana の reconcile_ambiguous.py の reconcile_pending_resends の判定を�
 
 判定（スレッドの親 ts を起点に全ページ走査する。時刻順序つき）:
   1. parent_deleted — チャンネル履歴に親投稿がない。送り先がないので再送しない。
-  2. answered_by_other — 元の投稿より後に、質問者と自分（ねいろ）以外による
-     本文のあるテキスト投稿が 1 件でもあれば答え済み。再送しない。
+  2. answered_by_other — 元の投稿より後に、質問者と自分（ねいろ）以外による、
+     bot ではなく、本文が 10 文字を超えるテキスト投稿が 1 件でもあれば
+     答え済み。再送しない。bot の自動応答や短い相槌で誤って黙らないための
+     絞り込み（Yama さんの設計、2026-11-14。Yanayana さんも同じ条件を採用）。
   3. どちらでもなければ ok_to_resend。
 
 順序の注意（2026-11-14、Yanayana の実装へのねいろのレビュー指摘と同じ考え）:
@@ -128,6 +130,7 @@ def read_thread_all(page_reader, channel, thread_ts):
     for _ in range(MAX_PAGES):
         data = page_reader(channel, thread_ts, oldest)
         messages.extend({"ts": m.get("ts"), "user": m.get("user"),
+                         "bot_id": m.get("bot_id"),
                          "text": m.get("text") or ""}
                         for m in data.get("messages", []))
         if not data.get("has_more"):
@@ -167,7 +170,8 @@ def check(channel, event_ts, thread_ts, questioner, self_id,
         (m for m in replies
          if is_reply_after_event(m.get("ts"), event_ts)
          and m.get("user") not in (questioner, self_id)
-         and (m.get("text") or "").strip()),
+         and not m.get("bot_id")
+         and len((m.get("text") or "").strip()) > 10),
         None)
     if answered_by:
         return {"verdict": "answered_by_other",
