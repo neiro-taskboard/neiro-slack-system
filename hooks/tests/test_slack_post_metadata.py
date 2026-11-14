@@ -11,6 +11,7 @@ import json
 import os
 import tempfile
 import unittest
+import urllib.error
 from contextlib import redirect_stdout
 
 SCRIPT_PATH = os.path.expanduser(
@@ -173,7 +174,74 @@ class PostMetadataTest(unittest.TestCase):
         self.assertEqual(result["ts"], "1794660000.000002")
         self.assertEqual(len(self.calls), 2)
 
-    # 9. main --dry-run は送らず、payload を出す。トークンは出力に出ない
+    # 9. ネットワークエラー（応答ロスト）は再送しない：投稿が届いた
+    # かどうか不明のため。2026-11-15 の3重投稿の再現ケース。
+    # 盲目的な再送をすると、届いていた投稿が重複する。
+    def test_post_network_error_no_retry(self):
+        def _open(req, timeout=30):
+            self.calls.append(req)
+            raise urllib.error.URLError("connection reset by peer")
+
+        payload = self.mod.build_payload("C0CGYGT9V7G", "hello",
+                                         event_id="T0CGV6V7161:C0CGYGT9V7G:1.1")
+        ok, err = self.mod.post(payload, FAKE_TOKEN_BOARD, urlopen=_open,
+                                sleep=lambda s: None)
+        self.assertFalse(ok)
+        self.assertIn("network", err)
+        self.assertEqual(len(self.calls), 1)
+
+    # 10. タイムアウトも応答ロストなので再送しない
+    def test_post_timeout_no_retry(self):
+        def _open(req, timeout=30):
+            self.calls.append(req)
+            raise TimeoutError("timed out")
+
+        payload = self.mod.build_payload("C0CGYGT9V7G", "hello",
+                                         event_id="T0CGV6V7161:C0CGYGT9V7G:1.1")
+        ok, err = self.mod.post(payload, FAKE_TOKEN_BOARD, urlopen=_open,
+                                sleep=lambda s: None)
+        self.assertFalse(ok)
+        self.assertEqual(len(self.calls), 1)
+
+    # 11. HTTP 500 も書き込みの有無が曖昧なため再送しない
+    def test_post_http_500_no_retry(self):
+        def _open(req, timeout=30):
+            self.calls.append(req)
+            raise urllib.error.HTTPError(
+                req.full_url, 500, "Internal Server Error", {},
+                io.BytesIO(b""))
+
+        payload = self.mod.build_payload("C0CGYGT9V7G", "hello",
+                                         event_id="T0CGV6V7161:C0CGYGT9V7G:1.1")
+        ok, err = self.mod.post(payload, FAKE_TOKEN_BOARD, urlopen=_open,
+                                sleep=lambda s: None)
+        self.assertFalse(ok)
+        self.assertIn("http_500", err)
+        self.assertEqual(len(self.calls), 1)
+
+    # 12. HTTP 429 は未投稿の確定なので、従来通りリトライして成功する
+    def test_post_http_429_retries_once(self):
+        seq = {"i": 0}
+
+        def _open(req, timeout=30):
+            self.calls.append(req)
+            seq["i"] += 1
+            if seq["i"] == 1:
+                raise urllib.error.HTTPError(
+                    req.full_url, 429, "Too Many Requests", {},
+                    io.BytesIO(b""))
+            return FakeResponse({"ok": True, "ts": "1794660000.000004",
+                                 "channel": "C0CGYGT9V7G"})
+
+        payload = self.mod.build_payload("C0CGYGT9V7G", "hello",
+                                         event_id="T0CGV6V7161:C0CGYGT9V7G:1.1")
+        ok, result = self.mod.post(payload, FAKE_TOKEN_BOARD, urlopen=_open,
+                                   sleep=lambda s: None)
+        self.assertTrue(ok)
+        self.assertEqual(result["ts"], "1794660000.000004")
+        self.assertEqual(len(self.calls), 2)
+
+    # 13. main --dry-run は送らず、payload を出す。トークンは出力に出ない
     def test_main_dry_run(self):
         buf = io.StringIO()
         with redirect_stdout(buf):
@@ -191,7 +259,7 @@ class PostMetadataTest(unittest.TestCase):
         self.assertNotIn(FAKE_TOKEN_DEFAULT, buf.getvalue())
         self.assertEqual(len(self.calls), 0)
 
-    # 10. main 成功時の出力にトークンは出ない
+    # 14. main 成功時の出力にトークンは出ない
     def test_main_success_output_has_no_token(self):
         orig = self.mod.post
 
@@ -216,7 +284,7 @@ class PostMetadataTest(unittest.TestCase):
         finally:
             self.mod.post = orig
 
-    # 11. トークンが見つからないワークスペースは失敗（送らない）
+    # 15. トークンが見つからないワークスペースは失敗（送らない）
     def test_main_token_not_found(self):
         buf = io.StringIO()
         with redirect_stdout(buf):

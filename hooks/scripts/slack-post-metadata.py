@@ -104,9 +104,19 @@ def build_payload(channel, text, thread_ts=None, event_id=None,
 def post(payload, token, urlopen=urllib.request.urlopen, sleep=time.sleep):
     """chat.postMessage を叩く。成功時は (True, 応答)、失敗時は (False, 理由)。
 
-    ネットワークエラー・429（ratelimited）・5xx は最大 MAX_ATTEMPTS 回まで
-    リトライする（429 は Retry-After を尊重）。Slack の ok:false（チャンネル
-    不明など）はリトライしない。
+    リトライするのは Slack が受信前に却下したことが確定している
+    場合だけ（429 / ok:false の ratelimited）。ネットワークエラー・
+    タイムアウト・5xx は「投稿が届いたかどうか」が曖昧なため、
+    盲目的な再送はしない。到達確認は呼び出し側
+    （slack-send-once.sh の step 3：履歴・metadata での照合）が行い、
+    届いていなければ DLQ の再送で拾う。
+
+    背景（2026-11-15）：このリトライが 3 回連続の同一文面投稿を
+    起こした。1 回目の応答が失われた（投稿自体は届いていた）のに
+    1 秒・2 秒のバックオフで再送し、同じ返信が約 5 秒の間に
+    3 件並んだ。送信台帳に残ったのは最後の 1 件だけで、最初の
+    2 件の ts は応答と一緒に失われていた。429 だけが「未投稿の
+    確定」なので、リトライ対象はそこに絞る。
     """
     body = json.dumps(payload).encode("utf-8")
     for attempt in range(1, MAX_ATTEMPTS + 1):
@@ -124,7 +134,10 @@ def post(payload, token, urlopen=urllib.request.urlopen, sleep=time.sleep):
                 except AttributeError:
                     pass
         except urllib.error.HTTPError as e:
-            if e.code == 429 or e.code >= 500:
+            # 429 は Slack が受信前に却下した確定なので再送してよい。
+            # 5xx は応答こそ受け取ったが書き込みの有無が曖昧なため
+            # 再送しない（呼び出し側の到達確認に任せる）。
+            if e.code == 429:
                 if attempt < MAX_ATTEMPTS:
                     wait = BACKOFF_SECS[attempt - 1]
                     try:
@@ -133,12 +146,10 @@ def post(payload, token, urlopen=urllib.request.urlopen, sleep=time.sleep):
                         pass
                     sleep(wait)
                     continue
-                return False, "http_%d" % e.code
             return False, "http_%d" % e.code
         except (urllib.error.URLError, TimeoutError, OSError) as e:
-            if attempt < MAX_ATTEMPTS:
-                sleep(BACKOFF_SECS[attempt - 1])
-                continue
+            # 応答ロスト：投稿が届いたかどうか不明。届いている
+            # 可能性を消せないため再送しない。呼び出し側の到達確認に任せる。
             return False, "network: %s" % e
         try:
             result = json.loads(raw.decode("utf-8"))
