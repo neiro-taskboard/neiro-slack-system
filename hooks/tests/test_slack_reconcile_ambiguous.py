@@ -42,6 +42,11 @@ Covered:
       update the last-run gate file
   18. run-log write failure is swallowed: runs file as a directory
       still exits 0 and resolves (the main body never stops for logs)
+  19. whitespace/newline difference resolves after normalize_text
+      (Yama's share 2026-11-14, also adopted by Yanayana)
+  20. HTML entity difference (& vs &amp;) resolves after normalize_text
+  21. genuinely different text still does not resolve after normalize
+      (no over-matching)
 """
 import importlib.util
 import json
@@ -113,6 +118,42 @@ def test_exact_match_resolves():
           len(out["resolved"]) == 1
           and out["resolved"][0]["found_ts"] == "1794594100.000000",
           str(out))
+
+
+def test_normalized_whitespace_match_resolves():
+    mod = load_mod()
+    # 記録は改行つき、履歴は空白つき・末尾に空白：正規化で一致して解決する
+    # （Yama さんの共有 2026-11-14、Yanayana さんも採用）。
+    recorded = "こんにちは、\nテストです。"
+    history_text = "こんにちは、  テストです。 "
+    msgs = [{"ts": "1794594100.000000", "user": SELF, "text": history_text}]
+    out = mod.reconcile([amb(text=recorded)], reader_for(msgs))
+    check("whitespace/newline difference still resolves after normalize",
+          len(out["resolved"]) == 1
+          and out["resolved"][0]["found_ts"] == "1794594100.000000",
+          str(out))
+
+
+def test_normalized_entity_match_resolves():
+    mod = load_mod()
+    # 記録は &、履歴は &amp;：エスケープ違いを吸収して解決する。
+    msgs = [{"ts": "1794594100.000000", "user": SELF,
+             "text": "A &amp; B です"}]
+    out = mod.reconcile([amb(text="A & B です")], reader_for(msgs))
+    check("HTML entity difference still resolves after normalize",
+          len(out["resolved"]) == 1
+          and out["resolved"][0]["found_ts"] == "1794594100.000000",
+          str(out))
+
+
+def test_different_text_no_resolve_after_normalize():
+    mod = load_mod()
+    # 正規化しても別文面は解決しない（過剰な一致の防止）。
+    msgs = [{"ts": "1794594100.000000", "user": SELF,
+             "text": "こんにちは、別の文面です。"}]
+    out = mod.reconcile([amb()], reader_for(msgs))
+    check("different text still does not resolve after normalize",
+          out["resolved"] == [], str(out))
 
 
 def test_other_user_identical_text_no_resolve():
@@ -470,6 +511,9 @@ def test_cli_run_log_write_failure_swallowed():
 
 def main():
     test_exact_match_resolves()
+    test_normalized_whitespace_match_resolves()
+    test_normalized_entity_match_resolves()
+    test_different_text_no_resolve_after_normalize()
     test_other_user_identical_text_no_resolve()
     test_reply_before_parent_no_resolve()
     test_no_text_closed_without_read()

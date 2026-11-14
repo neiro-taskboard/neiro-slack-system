@@ -23,8 +23,12 @@ ambiguous 記録へ resolved_by_thread_check の訂正を入れる「発見時�
     グループとして改めて閉じる。
   - 同じ (channel, thread_ts, text) は1つの対象としてまとめる。
     元の記録は履歴として残し、消さない。
-  - 一致は完全一致（==、前後の空白を除かない）。Slack から返される
-    text が送信した文面そのままのため。
+  - 一致は正規化して比べる。Slack から返される text は HTML エスケープ
+    （&amp; など）されていたり、送信時と改行・空白の入り方が違ったり
+    することがあるため、比較の前に揃える（Yama さんの共有 2026-11-14、
+    Yanayana さんも採用）。完全一致（==）のままだと、届いているのに
+    照合できない取りこぼしになる。グルーピングのキーには使わず、
+    比較のときだけ使う。
   - 照合対象は自分（ねいろ）の投稿だけ。他者の同一文面は拾わない。
   - 見つかった返信の ts は、対象スレッドの親 ts より後、かつ記録時刻の
     1時間前より後であること。対象より前に出た同一文面は誤照合しない
@@ -67,8 +71,10 @@ ambiguous 記録へ resolved_by_thread_check の訂正を入れる「発見時�
   全部の対象の履歴が読めなかった（cannot_verify）。訂正は送らないので
   安全に再実行できる。
 """
+import html
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -90,6 +96,21 @@ AMBIGUOUS_FILE = "/home/hatch/hooks/state/slack-ambiguous-posts.jsonl"
 LAST_RUN_FILE = "/home/hatch/hooks/state/slack-reconcile-ambiguous-last.json"
 RUNS_FILE = "/home/hatch/hooks/state/slack-reconcile-ambiguous-runs.jsonl"
 LAST_SUMMARY_FILE = "/home/hatch/hooks/state/slack-reconcile-ambiguous-last-run.json"
+
+
+def normalize_text(t):
+    """照合用の文面正規化（Yama さんの共有 2026-11-14、Yanayana さんも採用）。
+
+    空白・改行・エスケープ違いを吸収する。HTML エンティティを戻し、
+    改行を \n に揃え、空白の連続を1文字にまとめて前後を除く。
+    グルーピングのキーには使わず、比較のときだけ使う。
+    """
+    if not t:
+        return ""
+    s = html.unescape(t)
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
 
 
 def parse_slack_json(raw):
@@ -337,9 +358,10 @@ def reconcile(records, history_reader):
             cannot_verify.append((channel, thread_ts, str(exc)[:200]))
             continue
         spent = used.setdefault((channel, thread_ts), set())
+        target_norm = normalize_text(text)
         candidates = [m for m in messages
                       if m.get("user") == self_id
-                      and (m.get("text") or "") == text
+                      and normalize_text(m.get("text") or "") == target_norm
                       and m.get("ts") not in spent
                       and (lower is None
                            or is_reply_after(m.get("ts"), lower))]
