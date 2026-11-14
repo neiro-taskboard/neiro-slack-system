@@ -47,6 +47,21 @@ ambiguous 記録へ resolved_by_thread_check の訂正を入れる「発見時�
   - 履歴が読めなかった対象は訂正しない（fail-closed）。次の定期実行で
     拾い直す。
 
+flock（Yanayana さんの形、2026-11-14 の取り込み）:
+  - 照合スクリプト自体が slack-reconcile-ambiguous.lock に
+    LOCK_EX|LOCK_NB の flock を取り、スイープ全体を直列化する。
+    ポーリングフック全体の flock（slack-events.lock）の中から呼ばれる
+    通常の経路ではそもそも重ならないが、手動で直接走らせた場合は
+    その flock の外になる。スクリプト側にも flock を入れることで、
+    手動実行の経路もカバーする（Yanayana さんの整理）。
+  - ロックが取れなければ gated として抜ける（終了コード 0、実行ログの
+    開始・終了も残さない）。自己ゲートのスキップと同じ扱いで、
+    ポーリングフック側は '"gated": true' を見てログに残さない。
+  - ロックはプロセス終了まで保持し、終了時に OS が解放する。
+    last_run の読み書き（チェックと書き込みの間）もロックの中に
+    入るので、手動実行とポール経由の実行が同時に走っても
+    ゲートのレースは起きない。
+
 実行ログ（Yama さんの形、2026-11-14 の取り込み）:
   - 実行のたびに、開始1行と終了1行（終了コード付き）を
     slack-reconcile-ambiguous-runs.jsonl へ追記する。途中で切られた
@@ -64,7 +79,8 @@ ambiguous 記録へ resolved_by_thread_check の訂正を入れる「発見時�
 使い方:
   slack-reconcile-ambiguous.py [--ambiguous-file PATH]
       [--last-run-file PATH] [--runs-file PATH]
-      [--last-summary-file PATH] [--force] [--dry-run] [--slackcli PATH]
+      [--last-summary-file PATH] [--lock-file PATH]
+      [--force] [--dry-run] [--slackcli PATH]
 出力: JSON 1行 {"resolved": N, "targets": N, "closed_no_text": N,
   "skipped_no_text": N, "cannot_verify": [...], "gated": false}
 終了コード: 0 = 照合できた（解決なし・スキップも含む）。2 = 一部または
@@ -79,6 +95,11 @@ import subprocess
 import sys
 import time
 from datetime import datetime, timezone
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - POSIX 環境では常に使える
+    fcntl = None
 
 SLACKCLI = "/home/hatch/workspace/bin/slackcli"
 SELF_IDS = {"muse-board": "U0CH1B19D4J", "T0CGV6V7161": "U0CH1B19D4J"}
@@ -96,6 +117,37 @@ AMBIGUOUS_FILE = "/home/hatch/hooks/state/slack-ambiguous-posts.jsonl"
 LAST_RUN_FILE = "/home/hatch/hooks/state/slack-reconcile-ambiguous-last.json"
 RUNS_FILE = "/home/hatch/hooks/state/slack-reconcile-ambiguous-runs.jsonl"
 LAST_SUMMARY_FILE = "/home/hatch/hooks/state/slack-reconcile-ambiguous-last-run.json"
+LOCK_FILE = "/home/hatch/hooks/state/slack-reconcile-ambiguous.lock"
+
+
+class LockBusy(Exception):
+    """別の照合プロセスがロックを持っている（2つ目は gated で抜ける）。"""
+
+
+_LOCK_FP = None  # プロセス終了まで保持し、flock を維持する
+
+
+def acquire_lock(path):
+    """照合スクリプト専用の flock を取る。取れなければ LockBusy。
+
+    LOCK_EX|LOCK_NB でスイープ全体を直列化する（Yanayana さんの
+    reconcile_ambiguous.py と同じ形）。ファイルはプロセス終了まで
+    開いたままにし、終了時に OS がロックを解放する。fcntl が無い環境
+    ではロックを取れないので OSError とする（fail-closed：直列化
+    できないまま走らせない）。
+    """
+    global _LOCK_FP
+    if fcntl is None:
+        raise OSError("fcntl is not available; cannot serialize runs")
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    fp = open(path, "a+", encoding="utf-8")
+    try:
+        fcntl.flock(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fp.close()
+        raise LockBusy(path)
+    _LOCK_FP = fp
+    return fp
 
 
 def normalize_text(t):
@@ -470,7 +522,7 @@ def main(argv):
     while i < len(argv):
         a = argv[i]
         if a in ("--ambiguous-file", "--last-run-file", "--runs-file",
-                 "--last-summary-file", "--slackcli") \
+                 "--last-summary-file", "--lock-file", "--slackcli") \
                 and i + 1 < len(argv):
             opts[a[2:]] = argv[i + 1]
             i += 2
@@ -484,9 +536,26 @@ def main(argv):
     last_run_file = opts.get("last-run-file") or LAST_RUN_FILE
     runs_file = opts.get("runs-file") or RUNS_FILE
     last_summary_file = opts.get("last-summary-file") or LAST_SUMMARY_FILE
+    lock_file = opts.get("lock-file") or LOCK_FILE
     slackcli = opts.get("slackcli") or SLACKCLI
     force = bool(opts.get("force"))
     dry_run = bool(opts.get("dry-run"))
+
+    # スクリプト側の flock を先に取る。ゲートの読み書きもロックの中に
+    # 入るので、手動実行とポール経由の実行のレースを防ぐ。取れなければ
+    # gated として抜け、実行ログも残さない（自己ゲートと同じ扱い）。
+    try:
+        acquire_lock(lock_file)
+    except LockBusy:
+        print(json.dumps({"resolved": 0, "targets": 0,
+                          "closed_no_text": 0,
+                          "skipped_no_text": 0, "cannot_verify": [],
+                          "gated": True, "lock_busy": True},
+                         ensure_ascii=False))
+        return 0
+    except OSError as exc:
+        print(f"cannot acquire reconcile lock: {exc}", file=sys.stderr)
+        return 2
 
     now = time.time()
     if not force:

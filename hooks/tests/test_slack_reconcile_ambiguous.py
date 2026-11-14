@@ -47,6 +47,11 @@ Covered:
   20. HTML entity difference (& vs &amp;) resolves after normalize_text
   21. genuinely different text still does not resolve after normalize
       (no over-matching)
+  22. script-side flock (Yanayana's shape, 2026-11-14): a second run
+      while the lock is held exits gated (lock_busy) without appending
+      or writing run-log lines
+  23. the lock is released when the process exits: two sequential
+      --force runs both run (the second is not lock-gated)
 """
 import importlib.util
 import json
@@ -368,13 +373,16 @@ def fake_slackcli(tmpdir, messages_by_key):
 
 
 def run_cli(tmpdir, amb_path, last_path, cli, extra=None):
-    # --runs-file / --last-summary-file も常に一時ファイルにする。
+    # --runs-file / --last-summary-file / --lock-file も常に一時ファイルにする。
     # 入れ忘れると既定の実ファイルにテストの実行ログが残ってしまう
     # （2026-11-14、最初の実装で実際に混入したため）。
+    # ロックも一時ファイルにしないと、実運用の照合とテストがロックを
+    # 取り合ってしまう。
     cmd = [sys.executable, RECONCILE_PY,
            "--ambiguous-file", amb_path, "--last-run-file", last_path,
            "--runs-file", os.path.join(tmpdir, "runs.jsonl"),
            "--last-summary-file", os.path.join(tmpdir, "last-run.json"),
+           "--lock-file", os.path.join(tmpdir, "reconcile.lock"),
            "--slackcli", cli] + (extra or [])
     return subprocess.run(cmd, capture_output=True, text=True, timeout=60)
 
@@ -509,6 +517,58 @@ def test_cli_run_log_write_failure_swallowed():
               f"rc={r.returncode} out={r.stdout} err={r.stderr}")
 
 
+def test_cli_lock_busy_gated():
+    import fcntl
+    with tempfile.TemporaryDirectory() as tmp:
+        amb_path = os.path.join(tmp, "amb.jsonl")
+        last_path = os.path.join(tmp, "last.json")
+        runs_path = os.path.join(tmp, "runs.jsonl")
+        lock_path = os.path.join(tmp, "reconcile.lock")
+        with open(amb_path, "w", encoding="utf-8") as f:
+            f.write(json.dumps(amb(), ensure_ascii=False) + "\n")
+        cli = fake_slackcli(
+            tmp, {(CHANNEL, THREAD_TS):
+                  [{"ts": "1794594100.000000", "user": SELF, "text": TEXT}]})
+        # このテストプロセスがロックを握ったまま、CLI を --force で走らせる。
+        holder = open(lock_path, "a+", encoding="utf-8")
+        fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            r = run_cli(tmp, amb_path, last_path, cli, ["--force"])
+        finally:
+            fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
+            holder.close()
+        out = json.loads(r.stdout[r.stdout.find("{"):])
+        lines = open(amb_path, encoding="utf-8").read().strip().split("\n")
+        check("lock held by another process: run exits gated "
+              "(lock_busy), appends nothing, writes no run-log lines",
+              r.returncode == 0 and out["gated"] is True
+              and out.get("lock_busy") is True
+              and len(lines) == 1 and not os.path.exists(runs_path)
+              and not os.path.exists(last_path),
+              f"rc={r.returncode} out={r.stdout} err={r.stderr}")
+
+
+def test_cli_lock_released_after_run():
+    with tempfile.TemporaryDirectory() as tmp:
+        amb_path = os.path.join(tmp, "amb.jsonl")
+        last_path = os.path.join(tmp, "last.json")
+        with open(amb_path, "w", encoding="utf-8") as f:
+            f.write(json.dumps(amb(), ensure_ascii=False) + "\n")
+        cli = fake_slackcli(
+            tmp, {(CHANNEL, THREAD_TS):
+                  [{"ts": "1794594100.000000", "user": SELF, "text": TEXT}]})
+        r1 = run_cli(tmp, amb_path, last_path, cli, ["--force"])
+        out1 = json.loads(r1.stdout[r1.stdout.find("{"):])
+        r2 = run_cli(tmp, amb_path, last_path, cli, ["--force"])
+        out2 = json.loads(r2.stdout[r2.stdout.find("{"):])
+        check("sequential --force runs both run: lock is released "
+              "on process exit (second run is not lock-gated)",
+              r1.returncode == 0 and out1["gated"] is False
+              and r2.returncode == 0 and out2["gated"] is False
+              and out2.get("lock_busy") is None,
+              f"r1={r1.stdout} r2={r2.stdout}")
+
+
 def main():
     test_exact_match_resolves()
     test_normalized_whitespace_match_resolves()
@@ -530,6 +590,8 @@ def main():
     test_cli_run_log_start_end_and_last_summary()
     test_cli_dry_run_logs_with_flag()
     test_cli_run_log_write_failure_swallowed()
+    test_cli_lock_busy_gated()
+    test_cli_lock_released_after_run()
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 
