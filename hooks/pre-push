@@ -34,7 +34,11 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   [ -n "$bad_mail" ] && note "non-noreply email in commits being pushed: $bad_mail"
 
   # Secret and personal-info patterns in file contents (all pushed commits).
-  hits=$(git grep -nIE 'xox[baprs]-[A-Za-z0-9-]{10,}|xapp-[A-Za-z0-9-]{10,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|BEGIN [A-Z ]*PRIVATE KEY|AKIA[0-9A-Z]{16}' $commits -- . 2>/dev/null | head -5)
+  # Placeholder tokens are allowlisted: a dummy like xoxb-REPLACE-ME in a
+  # config.example.json would otherwise trip this very check and block its
+  # own commit (same trap Yanayana hit 2026-11-14 -- a detection pattern
+  # matching its own placeholder). Real-looking tokens still block.
+  hits=$(git grep -nIE 'xox[baprs]-[A-Za-z0-9-]{10,}|xapp-[A-Za-z0-9-]{10,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|BEGIN [A-Z ]*PRIVATE KEY|AKIA[0-9A-Z]{16}' $commits -- . 2>/dev/null | grep -v 'REPLACE-ME' | head -5)
   [ -n "$hits" ] && note "possible secret found:\n$hits"
 
   # Real names: read from .git/hooks/pre-push-names (one per line, fixed

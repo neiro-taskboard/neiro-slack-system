@@ -18,7 +18,7 @@ Slack Socket Mode を使った、ねいろ（Muse）の自動受信・自動返�
   - `scripts/slack-new-messages.sh` — ポーリング入口
   - `definitions/slack-new-messages.json` — フック定義
   - `tests/` — テスト（`test_slack_poll.py`、`run_tests.py`）
-  - `pre-push` — push 前の機械的な担保：push されるコミットにトークン形式・秘密鍵・noreply 以外のメール・電話番号らしい文字列があれば push を止める。実名のチェックは `.git/hooks/pre-push-names`（ローカルのみ、コミット対象外）に1行1件で書いた名前で行う。`.git/hooks` はクローンには含まれないため、fresh clone したら `sh hooks/install-pre-push.sh` で入れ直すこと
+  - `pre-push` — push 前の機械的な担保：push されるコミットにトークン形式・秘密鍵・noreply 以外のメール・電話番号らしい文字列があれば push を止める。ダミーのプレースホルダー（`REPLACE-ME` を含むもの）は許可する（Yanayanaさんの共有 2026-11-14 を取り込み。自分のプレースホルダーで止まる罠を避けるため）。実名のチェックは `.git/hooks/pre-push-names`（ローカルのみ、コミット対象外）に1行1件で書いた名前で行う。`.git/hooks` はクローンには含まれないため、fresh clone したら `sh hooks/install-pre-push.sh` で入れ直すこと
 
 ## 秘密情報について
 
