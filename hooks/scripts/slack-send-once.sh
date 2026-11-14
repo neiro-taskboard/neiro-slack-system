@@ -126,10 +126,25 @@
 #      --limit 100 で読むと「親＋直近100件」が1回で取れる（返信
 #      180件近い実スレッドで検証済み）。割り切り：直近100件より古い
 #      同一文面は履歴チェックでは拾わない。自分の送信は送信台帳の
-#      確認（6）が別にあり、他者との一字一句一致の事故は同時刻の
+#      確認（6・11）が別にあり、他者との一字一句一致の事故は同時刻の
 #      投稿同士で起きるため直近で足りる、という判断。チャンネル側の
 #      bounded（直近50件）と同じ考え方で、対象がスレッドかどうかの
 #      違いだけ。
+#
+#   11. parroting防止の台帳照合（2026-11-14、Yamaさんの提案を取り入れ、
+#       Yanayanaさん・Yamaさんと実装済み）。スレッド返信の送信前には、
+#       履歴（直近100件）を読む前に送信台帳も照合する。台帳は手元に
+#       あるので API を叩かない。範囲は同一スレッド内のみで、照合は
+#       再送ヘッダー除去＋空白・改行の正規化のうえでの完全一致。一致
+#       したら送らずに成功扱い（既存の重複スキップと同じ）。台帳に
+#       文面が記録されていない過去の投稿は対象外。チャンネルへの直投
+#       稿は対象外（従来の15分窓＋直近50件のまま）。これまでは台帳照
+#       合が cannot-verify 時のフォールバックでしかなく、直近100件よ
+#       り古い自分の同一文面は通常フローで検知できない穴があった。
+#       Groq gpt-oss-120b に設計を確認し、「台帳→履歴」の順序は妥当
+#       との助言を得た。ただし「台帳が読めないときは履歴だけで判定し
+#       て送ってよい」という部分は採用せず、三者で合意済みの
+#       fail-closed（送らない・DLQで後から拾う）を維持する。
 #
 # 使い方:
 #   slack-send-once.sh --channel C0CGYGT9V7G --message '...' [--workspace muse-board]
@@ -424,6 +439,9 @@ PYEOF
 
 # 送信台帳に同じチャンネル・スレッド・文面の送信記録があるか確認する。
 #   0 = 見つかった（その ts を出す）、1 = なし、2 = 台帳が読めなかった。
+# 照合は再送ヘッダー除去＋空白・改行の正規化のうえでの完全一致
+# （parroting防止、2026-11-14、Yamaさんの提案）。スレッド返信の
+# 送信前チェック（11）でも、cannot-verify 時のフォールバックでも使う。
 check_ledger() {
   python3 - "$CHANNEL" "$THREAD_TS" "$TMP_MSG" "$LEDGER_FILE" <<'PYEOF' 2>/dev/null
 import json, re, sys
@@ -432,11 +450,14 @@ channel, thread_ts, msg_path, ledger_path = sys.argv[1:5]
 # 比較する（2026-11-14、再送ヘッダーの文言統一。旧文言で送られた再送が
 # あっても、新文言の再送が重複と判定される）。
 _RESEND_HEAD = re.compile(r'^遅れての再送（(?:元の失敗時刻|最初の試行)：\d{4}-\d{2}-\d{2} \d{2}:\d{2} JST）\n(?=.)')
-def _norm_resend(t):
-    return _RESEND_HEAD.sub('', t.strip(), count=1)
+def _norm(t):
+    # ヘッダー除去のうえ、全ての空白類（空白・改行・タブ・全角空白など）
+    # を1スペースに畳んで比較する。改行や空白の入れ方の違いだけの同一
+    # 文面も一致として扱う（parroting防止、2026-11-14）。
+    return re.sub(r'\s+', ' ', _RESEND_HEAD.sub('', t.strip(), count=1)).strip()
 try:
     with open(msg_path, encoding='utf-8') as f:
-        target = _norm_resend(f.read())
+        target = _norm(f.read())
 except OSError:
     sys.exit(2)
 try:
@@ -454,7 +475,7 @@ with f:
             continue
         if (rec.get('thread_ts') or '') != (thread_ts or ''):
             continue
-        if _norm_resend(rec.get('text') or '') == target:
+        if _norm(rec.get('text') or '') == target:
             found = rec.get('ts')
             break
 if found:
@@ -750,6 +771,30 @@ sys.exit(1)
   done
   return 2
 }
+
+# --- 0. parroting防止：送信台帳との照合（同一スレッド内のみ） ---
+# Yamaさんの提案（2026-11-14、ヘッダーの 11）。履歴の直近100件だけ
+# では、それより古い自分の同一文面を検知できない穴があったので、
+# 履歴を読む前に台帳も照合する。台帳は手元にあるので API を叩かない。
+# 一致したら送らずに成功扱い（履歴で重複を見つけたときと同じ扱い）。
+# 台帳が読めなければ fail-closed で送らない（終了コード3）。
+# チャンネルへの直投稿は対象外（15分窓＋直近50件のまま）。
+if [ -n "$THREAD_TS" ]; then
+  ledger_ts=$(check_ledger 2>/dev/null)
+  ledger_rc=$?
+  if [ "$ledger_rc" -eq 0 ]; then
+    FOUND_TS="$ledger_ts"
+    [ -n "$FOUND_TS" ] && record_send "$FOUND_TS"
+    [ -n "$FOUND_TS" ] && resolve_ambiguous "$FOUND_TS"
+    echo "already posted in this thread (found in local send log), skipping send" >&2
+    exit 0
+  elif [ "$ledger_rc" -eq 2 ]; then
+    record_ambiguous "send log unreadable (cannot-verify); not sending"
+    echo "cannot verify send log, not sending (fail-closed; exit 3 = pre-check failure, not a send failure)" >&2
+    exit 3
+  fi
+  # ledger_rc == 1: 台帳に無し。履歴チェックへ進む。
+fi
 
 # --- 1. 送信前の履歴確認 ---
 check_duplicate

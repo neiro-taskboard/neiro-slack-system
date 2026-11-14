@@ -13,9 +13,13 @@ Covered (2026-11-14, thread checks bounded to the newest 100):
   now read the newest THREAD_CHECK_N=100 messages in a single call
   (no --oldest: slackcli returns parent + newest N). Trade-off, taken
   knowingly: an identical post older than the newest 100 is no longer
-  caught by the history check. Own sends are still covered by the
-  local send ledger, and exact-match parroting accidents happen
-  between near-simultaneous posts, i.e. inside the newest window.
+  caught by the history check. Since 2026-11-14 the local send ledger
+  check (parroting prevention) runs first in the normal flow and covers
+  own posts older than the cap when they are recorded in the ledger;
+  the history cap itself is unchanged. To keep these cases about the
+  history check alone, every run starts with an empty ledger (the
+  check-only path records a found duplicate into the ledger, so a
+  shared ledger would leak between cases).
 
 The stub slackcli emulates the real read semantics measured on a
 live thread (2026-11-14):
@@ -27,7 +31,12 @@ live thread (2026-11-14):
 Cases (thread with 150 replies unless noted):
   1. own identical post inside newest 100 -> duplicate (check-only 0)
   2. own identical post older than newest 100 -> NOT a duplicate
-     (check-only 1) -- documents the cap trade-off
+     (check-only 1) -- documents the cap trade-off of the *history*
+     check alone. Each run starts with an empty send ledger, so the
+     ledger check (2026-11-14, parroting prevention, which runs first
+     in normal flow) does not interfere; see
+     test_slack_send_once_ledger_parroting.py for the ledger covering
+     exactly this gap.
   3. other user's identical post inside newest 100 -> exit 4, no send
   4. other user's identical post older than newest 100 -> sends (0)
   5. small thread (10 replies), own identical post -> duplicate (0)
@@ -138,6 +147,8 @@ class Env:
                     exist_ok=True)
         self.log = os.path.join(self.home, "slackcli.log")
         self.history_path = os.path.join(self.home, "history.json")
+        self.ledger_path = os.path.join(
+            self.home, "hooks", "state", "slack-send-log.jsonl")
         stub = os.path.join(bindir, "slackcli")
         with open(stub, "w", encoding="utf-8") as f:
             f.write(STUB)
@@ -149,6 +160,11 @@ class Env:
     def run(self, history, check_only=True):
         with open(self.history_path, "w", encoding="utf-8") as f:
             json.dump(history, f, ensure_ascii=False)
+        # Fresh ledger per run: the check-only path records a found
+        # duplicate into the ledger, which would otherwise leak into
+        # later cases (the ledger check now runs first, 2026-11-14).
+        if os.path.exists(self.ledger_path):
+            os.remove(self.ledger_path)
         if os.path.exists(self.log):
             os.remove(self.log)
         argv = ["bash", SCRIPT, "--channel", "C0CGYGT9V7G",
