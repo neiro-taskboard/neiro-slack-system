@@ -54,6 +54,12 @@ event, OTHER_EVENT_ID / OTHER_REQUEST_ID are different marks):
       (metadata read failure falls back to the text check)
   T8. unmarked send: dump is never called, the slackcli thread read
       is used, own post same text -> duplicate (0)
+  R1. record_ambiguous keeps the event_id (2026-11-15): a marked
+      send that fails closed (dump unreadable, actually sending)
+      writes an ambiguous record carrying its event_id, so the
+      periodic reconcile can apply the same guard later
+  R2. same with --request-id: the record carries request_id and
+      no event_id
 """
 import json
 import os
@@ -409,6 +415,42 @@ def main():
               r["rc"] == 3, f"rc={r['rc']} {r['stderr']}")
         check("T6b dump unreadable, sending: nothing sent",
               len(r["sends"]) == 0, f"sends={r['sends']}")
+
+        # R1. the ambiguous record of a failed-closed marked send
+        # keeps the event_id (2026-11-15, reconcile mark guard).
+        # T6b already wrote one; clear it first.
+        amb_path = os.path.join(env.home, "hooks", "state",
+                                "slack-ambiguous-posts.jsonl")
+        if os.path.exists(amb_path):
+            os.remove(amb_path)
+        r = env.run(empty, event_id=EVENT_ID, dump_fail=True,
+                    check_only=False)
+        recs = []
+        if os.path.exists(amb_path):
+            with open(amb_path, encoding="utf-8") as f:
+                recs = [json.loads(ln) for ln in f if ln.strip()]
+        check("R1 ambiguous record keeps event_id (and no request_id)",
+              r["rc"] == 3 and len(recs) == 1
+              and recs[0].get("outcome") == "ambiguous_post_outcome"
+              and recs[0].get("event_id") == EVENT_ID
+              and "request_id" not in recs[0]
+              and recs[0].get("text") == CANDIDATE,
+              f"rc={r['rc']} recs={recs}")
+        # R2. same with --request-id.
+        os.remove(amb_path)
+        r = env.run(empty, request_id=REQUEST_ID, dump_fail=True,
+                    check_only=False)
+        recs = []
+        if os.path.exists(amb_path):
+            with open(amb_path, encoding="utf-8") as f:
+                recs = [json.loads(ln) for ln in f if ln.strip()]
+        check("R2 ambiguous record keeps request_id (and no event_id)",
+              r["rc"] == 3 and len(recs) == 1
+              and recs[0].get("outcome") == "ambiguous_post_outcome"
+              and recs[0].get("request_id") == REQUEST_ID
+              and "event_id" not in recs[0]
+              and recs[0].get("text") == CANDIDATE,
+              f"rc={r['rc']} recs={recs}")
 
         # T7. find fails, dump own post same text, no mark -> duplicate
         r = env.run(empty, event_id=EVENT_ID, find_fail=True, dump=[

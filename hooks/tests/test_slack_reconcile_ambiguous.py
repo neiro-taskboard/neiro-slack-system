@@ -54,6 +54,21 @@ Covered:
       fix, 2026-11-14)
   23. the lock is released when the process exits: two sequential
       --force runs both run (the second is not lock-gated)
+  24. mark guard (2026-11-15): a marked record does not resolve to
+      a text-matching reply carrying a different mark
+  25. mark guard: a marked record resolves to a reply with the same mark
+  26. mark guard: a marked record resolves when the candidate's mark
+      is unknown (not in the dump window) — text match as before
+  27. mark guard: an unmarked record resolves without consulting
+      the mark lookup at all (backward compatible)
+  28. mark guard: two same-text records with different marks are
+      separate targets; only the one whose mark matches the reply
+      resolves (the other stays unresolved, not mis-attributed)
+  29. mark guard: a failing mark lookup -> cannot_verify (fail-closed),
+      nothing resolved
+  30. CLI end-to-end with a fake read-meta: a marked record resolves
+      when the dump says the same mark (and the resolved entry keeps
+      the mark), and does not resolve when the dump says a different mark
 """
 import importlib.util
 import json
@@ -580,6 +595,184 @@ def test_cli_lock_released_after_run():
               f"r1={r1.stdout} r2={r2.stdout}")
 
 
+# --- 印ガード（2026-11-15）のテスト ---
+
+EVENT_ID = "T0CGV6V7161:C0CGYGT9V7G:1794652249.960829"
+OTHER_EVENT_ID = "T0CGV6V7161:C0CGYGT9V7G:1794650000.000000"
+REQUEST_ID = "123e4567-e89b-12d3-a456-426614174000"
+
+
+def amb_marked(event_id=None, request_id=None, **kw):
+    rec = amb(**kw)
+    if event_id is not None:
+        rec["event_id"] = event_id
+    if request_id is not None:
+        rec["request_id"] = request_id
+    return rec
+
+
+def lookup_for(marks):
+    """{ts: (kind, value) | None} を返すスタブの mark_lookup。"""
+    def lookup(channel, thread_ts):
+        return dict(marks)
+    return lookup
+
+
+def test_mark_different_no_resolve():
+    mod = load_mod()
+    msgs = [{"ts": "1794594100.000000", "user": SELF, "text": TEXT}]
+    marks = {"1794594100.000000": ("event_id", OTHER_EVENT_ID)}
+    out = mod.reconcile([amb_marked(event_id=EVENT_ID)],
+                        reader_for(msgs), lookup_for(marks))
+    check("marked record, candidate with different mark: no resolve",
+          out["resolved"] == [] and out["cannot_verify"] == [], str(out))
+
+
+def test_mark_same_resolves():
+    mod = load_mod()
+    msgs = [{"ts": "1794594100.000000", "user": SELF, "text": TEXT}]
+    marks = {"1794594100.000000": ("event_id", EVENT_ID)}
+    out = mod.reconcile([amb_marked(event_id=EVENT_ID)],
+                        reader_for(msgs), lookup_for(marks))
+    check("marked record, candidate with same mark: resolves",
+          len(out["resolved"]) == 1
+          and out["resolved"][0]["found_ts"] == "1794594100.000000"
+          and out["resolved"][0]["mark"] == ("event_id", EVENT_ID),
+          str(out))
+
+
+def test_mark_unknown_resolves():
+    mod = load_mod()
+    # 候補が dump の窓に入らず印が分からない（辞書に無い）場合は、
+    # 従来どおり文面で拾う。
+    msgs = [{"ts": "1794594100.000000", "user": SELF, "text": TEXT}]
+    out = mod.reconcile([amb_marked(event_id=EVENT_ID)],
+                        reader_for(msgs), lookup_for({}))
+    check("marked record, candidate mark unknown: resolves by text",
+          len(out["resolved"]) == 1
+          and out["resolved"][0]["found_ts"] == "1794594100.000000",
+          str(out))
+
+
+def test_unmarked_record_never_consults_lookup():
+    mod = load_mod()
+    calls = []
+
+    def lookup(channel, thread_ts):
+        calls.append((channel, thread_ts))
+        return {}
+
+    msgs = [{"ts": "1794594100.000000", "user": SELF, "text": TEXT}]
+    out = mod.reconcile([amb()], reader_for(msgs), lookup)
+    check("unmarked record: resolves without calling mark lookup",
+          len(out["resolved"]) == 1 and calls == [], str(out))
+
+
+def test_same_text_different_marks_are_separate_targets():
+    mod = load_mod()
+    # 同じ文面の2記録（印 E1 / E2）。履歴には E2 の印の返信が1件だけ。
+    # E1 の対象は誤って解決せず、E2 の対象だけがその返信に解決する。
+    msgs = [{"ts": "1794594100.000000", "user": SELF, "text": TEXT}]
+    marks = {"1794594100.000000": ("event_id", OTHER_EVENT_ID)}
+    recs = [amb_marked(event_id=EVENT_ID),
+            amb_marked(event_id=OTHER_EVENT_ID)]
+    out = mod.reconcile(recs, reader_for(msgs), lookup_for(marks))
+    check("same text, different marks: separate targets, only the "
+          "matching mark resolves",
+          out["targets"] == 2 and len(out["resolved"]) == 1
+          and out["resolved"][0]["found_ts"] == "1794594100.000000"
+          and out["resolved"][0]["mark"] == ("event_id", OTHER_EVENT_ID),
+          str(out))
+
+
+def test_mark_lookup_failure_is_cannot_verify():
+    mod = load_mod()
+
+    def lookup(channel, thread_ts):
+        raise RuntimeError("boom")
+
+    msgs = [{"ts": "1794594100.000000", "user": SELF, "text": TEXT}]
+    out = mod.reconcile([amb_marked(event_id=EVENT_ID)],
+                        reader_for(msgs), lookup)
+    check("mark lookup failure: cannot_verify, nothing resolved",
+          out["resolved"] == [] and len(out["cannot_verify"]) == 1,
+          str(out))
+
+
+def fake_read_meta(tmpdir, messages_by_key):
+    """A fake slack-read-metadata.py answering --dump from a dict.
+
+    Key: (channel, thread_ts or ""). Value: list of message dicts
+    (each with ts/user/text/mark). Ignores --workspace.
+    """
+    path = os.path.join(tmpdir, "read-meta")
+    data_path = os.path.join(tmpdir, "meta-data.json")
+    with open(data_path, "w", encoding="utf-8") as f:
+        json.dump({f"{k[0]}|{k[1]}": v for k, v in messages_by_key.items()},
+                  f, ensure_ascii=False)
+    script = (
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "data = json.load(open(sys.argv[0].replace('read-meta', 'meta-data.json'), encoding='utf-8'))\n"
+        "args = sys.argv[1:]\n"
+        "channel = args[args.index('--channel') + 1]\n"
+        "thread_ts = args[args.index('--thread-ts') + 1] if '--thread-ts' in args else ''\n"
+        "msgs = data.get(channel + '|' + thread_ts, [])\n"
+        "print(json.dumps({'ok': True, 'messages': msgs, 'checked': len(msgs)}, ensure_ascii=False))\n"
+    )
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(script)
+    os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return path
+
+
+def run_cli_with_meta(tmpdir, amb_path, last_path, cli, meta, extra=None):
+    return run_cli(tmpdir, amb_path, last_path, cli,
+                   (extra or []) + ["--read-meta", meta])
+
+
+def test_cli_mark_guard_end_to_end():
+    with tempfile.TemporaryDirectory() as tmp:
+        amb_path = os.path.join(tmp, "amb.jsonl")
+        last_path = os.path.join(tmp, "last.json")
+        msg = {"ts": "1794594100.000000", "user": SELF, "text": TEXT}
+        cli = fake_slackcli(tmp, {(CHANNEL, THREAD_TS): [msg]})
+        # 同じ印 -> 解決し、訂正エントリに印が残る。
+        with open(amb_path, "w", encoding="utf-8") as f:
+            f.write(json.dumps(amb_marked(event_id=EVENT_ID),
+                               ensure_ascii=False) + "\n")
+        meta = fake_read_meta(tmp, {(CHANNEL, THREAD_TS): [
+            {"ts": "1794594100.000000", "user": SELF, "text": TEXT,
+             "mark": {"kind": "event_id", "value": EVENT_ID}}]})
+        r = run_cli_with_meta(tmp, amb_path, last_path, cli, meta,
+                              ["--force"])
+        out = json.loads(r.stdout[r.stdout.find("{"):])
+        lines = open(amb_path, encoding="utf-8").read().strip().split("\n")
+        entry = json.loads(lines[1]) if len(lines) == 2 else {}
+        check("CLI marked record, dump same mark: resolves; resolved "
+              "entry keeps the event_id",
+              r.returncode == 0 and out["resolved"] == 1
+              and entry.get("outcome") == "resolved_by_thread_check"
+              and entry.get("found_ts") == "1794594100.000000"
+              and entry.get("event_id") == EVENT_ID,
+              f"rc={r.returncode} out={r.stdout} err={r.stderr}")
+        # 違う印 -> 解決しない。
+        with open(amb_path, "w", encoding="utf-8") as f:
+            f.write(json.dumps(amb_marked(event_id=EVENT_ID),
+                               ensure_ascii=False) + "\n")
+        meta2 = fake_read_meta(tmp, {(CHANNEL, THREAD_TS): [
+            {"ts": "1794594100.000000", "user": SELF, "text": TEXT,
+             "mark": {"kind": "event_id", "value": OTHER_EVENT_ID}}]})
+        r2 = run_cli_with_meta(tmp, amb_path, last_path, cli, meta2,
+                               ["--force"])
+        out2 = json.loads(r2.stdout[r2.stdout.find("{"):])
+        lines2 = open(amb_path, encoding="utf-8").read().strip().split("\n")
+        check("CLI marked record, dump different mark: does not resolve",
+              r2.returncode == 0 and out2["resolved"] == 0
+              and len(lines2) == 1,
+              f"rc={r2.returncode} out={r2.stdout} err={r2.stderr}")
+
+
 def main():
     test_exact_match_resolves()
     test_normalized_whitespace_match_resolves()
@@ -603,6 +796,13 @@ def main():
     test_cli_run_log_write_failure_swallowed()
     test_cli_lock_busy_gated()
     test_cli_lock_released_after_run()
+    test_mark_different_no_resolve()
+    test_mark_same_resolves()
+    test_mark_unknown_resolves()
+    test_unmarked_record_never_consults_lookup()
+    test_same_text_different_marks_are_separate_targets()
+    test_mark_lookup_failure_is_cannot_verify()
+    test_cli_mark_guard_end_to_end()
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 

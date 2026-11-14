@@ -21,14 +21,33 @@ ambiguous 記録へ resolved_by_thread_check の訂正を入れる「発見時�
     別途つく（終端は未解決のまま放置しないためのもので、記録自体は
     消えない）。closed_no_text より後に出た文面なし記録は、新しい
     グループとして改めて閉じる。
-  - 同じ (channel, thread_ts, text) は1つの対象としてまとめる。
-    元の記録は履歴として残し、消さない。
+  - 同じ (channel, thread_ts, text, 印) は1つの対象としてまとめる。
+    元の記録は履歴として残し、消さない。印（event_id / request_id）
+    が違う記録は文面が同じでも別の対象にする（同じ文面の別イベント
+    の送信を1つにまとめてしまうと、印ガードの意味がなくなるため）。
+    印のない記録は従来どおり (channel, thread_ts, text) でまとまる。
   - 一致は正規化して比べる。Slack から返される text は HTML エスケープ
     （&amp; など）されていたり、送信時と改行・空白の入り方が違ったり
     することがあるため、比較の前に揃える（Yama さんの共有 2026-11-14、
     Yanayana さんも採用）。完全一致（==）のままだと、届いているのに
     照合できない取りこぼしになる。グルーピングのキーには使わず、
     比較のときだけ使う。
+  - 印ガード（2026-11-15、muse取締役会 #slack-へようこそ
+    1794621025.648949）。送信時経路（slack-send-once.sh の台帳照合と
+    スレッド文面チェック）に入れたのと同じ形を、定期照合にも入れる。
+    照合対象の記録と履歴の投稿の両方に印（event_id / request_id）が
+    あり、かつ違う場合は、その投稿を文面一致の候補から外す。どちらか
+    に印がなければ従来どおり文面で照合する（後方互換：既存の印なし
+    記録も壊さない）。記録の印は record_ambiguous() が残すもの
+    （2026-11-15 から。印のない送信の記録は従来どおり印なし）。
+    履歴の印は slack-read-metadata.py --dump（include_all_metadata
+    付き）で取る。slackcli の conversations read では metadata が
+    返ってこないため、印の違いが見えない。dump の窓は直近100件
+    （スレッドは親＋直近100件）で、窓に入らない古い候補は印が
+    分からないので文面で拾う（従来どおり）。dump が読めなければ
+    その対象は cannot_verify（fail-closed：次の定期実行で拾い直す）。
+    印ガードで外れた候補の ts は使用済みにしない（解決に使って
+    いないため）。
   - 照合対象は自分（ねいろ）の投稿だけ。他者の同一文面は拾わない。
   - 見つかった返信の ts は、対象スレッドの親 ts より後、かつ記録時刻の
     1時間前より後であること。対象より前に出た同一文面は誤照合しない
@@ -88,7 +107,7 @@ flock（Yanayana さんの形、2026-11-14 の取り込み）:
   slack-reconcile-ambiguous.py [--ambiguous-file PATH]
       [--last-run-file PATH] [--runs-file PATH]
       [--last-summary-file PATH] [--lock-file PATH]
-      [--force] [--dry-run] [--slackcli PATH]
+      [--force] [--dry-run] [--slackcli PATH] [--read-meta PATH]
 出力: JSON 1行 {"resolved": N, "targets": N, "closed_no_text": N,
   "skipped_no_text": N, "cannot_verify": [...], "gated": false}
 終了コード: 0 = 照合できた（解決なし・スキップも含む）。2 = 一部または
@@ -110,6 +129,7 @@ except ImportError:  # pragma: no cover - POSIX 環境では常に使える
     fcntl = None
 
 SLACKCLI = "/home/hatch/workspace/bin/slackcli"
+READ_META = "/home/hatch/hooks/scripts/slack-read-metadata.py"
 SELF_IDS = {"muse-board": "U0CH1B19D4J", "T0CGV6V7161": "U0CH1B19D4J"}
 DEFAULT_SELF_ID = "U0CH32D1P5F"  # Neiro Task Board
 WORKSPACES = ("muse-board", "")  # チャンネルIDはワークスペースごとに
@@ -199,6 +219,21 @@ def self_user_id(workspace, slackcli=SLACKCLI):
     except Exception:
         pass
     return SELF_IDS.get(workspace or "", DEFAULT_SELF_ID)
+
+
+def record_mark(rec):
+    """ambiguous 記録の印を (kind, value) で取る。無ければ None。
+
+    event_id と request_id は送信時に相互排他（slack-send-once.sh が
+    両方指定を拒否する）なので、両方載っている記録は event_id を優先
+    する。印ガードの比較はこのタプル同士で行う（台帳照合・スレッド
+    文面チェックと同じ形）。
+    """
+    if rec.get("event_id"):
+        return ("event_id", str(rec["event_id"]))
+    if rec.get("request_id"):
+        return ("request_id", str(rec["request_id"]))
+    return None
 
 
 def parse_record_time(value):
@@ -292,10 +327,14 @@ def load_records(path):
 def build_targets(records):
     """照合対象を作る。
 
-    (channel, thread_ts, text) ごとに1対象。文面のない記録は飛ばす
-    （空白だけの文面も文面なし扱い）。
+    (channel, thread_ts, text, 印) ごとに1対象。文面のない記録は飛ばす
+    （空白だけの文面も文面なし扱い）。印が違う記録は文面が同じでも
+    別の対象にする（同じ文面の別イベントの送信を1つにまとめると、
+    印ガードの意味がなくなるため）。印のない記録は従来どおり
+    (channel, thread_ts, text) でまとまる。
     戻り値: (targets, used_found_ts)
-      targets: [{channel, thread_ts, text, earliest_time}]
+      targets: [{channel, thread_ts, text, mark, earliest_time}]
+        mark は ("event_id"|"request_id", 値) か None。
       used_found_ts: {(channel, thread_ts): {found_ts, ...}} — 既存の
         resolved_by_thread_check の found_ts は使用済みとして扱う。
     """
@@ -317,11 +356,13 @@ def build_targets(records):
             # 空白だけの文面も文面なし扱い（Yamaさんの指摘 2026-11-14：
             # " " は not text では弾かれずキーになりうる）。
             continue
-        key = (channel, thread_ts, text)
+        mark = record_mark(rec)
+        key = (channel, thread_ts, text, mark)
         rec_time = parse_record_time(rec.get("time"))
         if key not in targets:
             targets[key] = {"channel": channel, "thread_ts": thread_ts,
-                            "text": text, "earliest_time": rec_time}
+                            "text": text, "mark": mark,
+                            "earliest_time": rec_time}
         elif rec_time is not None:
             cur = targets[key]["earliest_time"]
             if cur is None or rec_time < cur:
@@ -369,15 +410,21 @@ def build_no_text_groups(records):
     return [groups[k] for k in order if groups[k]["count"] > 0]
 
 
-def reconcile(records, history_reader):
+def reconcile(records, history_reader, mark_lookup=None):
     """照合の本体。history_reader はテストで差し替えられる。
 
     history_reader(channel, thread_ts, oldest) -> (messages, self_id)
     読めなければ例外を投げる。
+    mark_lookup(channel, thread_ts) -> {ts: (kind, value) | None}：
+    そのチャンネル／スレッドの投稿の印を返す。None のときは印が
+    分からないものとして従来どおり文面で照合する（後方互換）。
+    対象に印があり、文面一致の候補があるときだけ呼ぶ。読めなければ
+    例外を投げ、その対象は cannot_verify（fail-closed）。
     戻り値: {"resolved": [...], "closed_no_text": [...],
              "skipped_no_text": N,
              "cannot_verify": [(channel, thread_ts, reason)], "targets": N}
-    resolved の各要素は {"channel", "thread_ts", "text", "found_ts"}。
+    resolved の各要素は {"channel", "thread_ts", "text", "found_ts",
+    "mark"}（mark は対象の印か None）。
     closed_no_text の各要素は build_no_text_groups のグループで、
     今回 closed_no_text として閉じる対象。skipped_no_text は文面なし
     記録のうち終端済み（過去に閉じた）ものの件数。
@@ -395,6 +442,7 @@ def reconcile(records, history_reader):
         channel = target["channel"]
         thread_ts = target["thread_ts"]
         text = target["text"]
+        mark = target["mark"]
         rec_time = target["earliest_time"]
         # 照合の下限: スレッドなら親 ts、かつ記録時刻の1時間前より後。
         # チャンネル投稿なら記録時刻の1時間前より後（親がないため）。
@@ -428,17 +476,41 @@ def reconcile(records, history_reader):
         candidates.sort(key=lambda m: (m.get("ts") is None, m.get("ts") or ""))
         if not candidates:
             continue
+        if mark is not None and mark_lookup is not None:
+            # 印ガード：対象の印と違う印の付いた候補を外す。印のない
+            # 候補・dump の窓に入らず印が分からない候補は従来どおり
+            # 文面で拾う。dump が読めなければこの対象は cannot_verify
+            # （fail-closed：次の定期実行で拾い直す）。
+            try:
+                marks = mark_lookup(channel, thread_ts)
+            except Exception as exc:  # noqa: BLE001 - 読めない対象は飛ばして次へ
+                cannot_verify.append((channel, thread_ts, str(exc)[:200]))
+                continue
+            kept = []
+            for m in candidates:
+                m_mark = marks.get(m.get("ts"))
+                if m_mark is not None and tuple(m_mark) != tuple(mark):
+                    continue
+                kept.append(m)
+            candidates = kept
+            if not candidates:
+                continue
         found_ts = candidates[0].get("ts")
         spent.add(found_ts)
         resolved.append({"channel": channel, "thread_ts": thread_ts,
-                         "text": text, "found_ts": found_ts})
+                         "text": text, "found_ts": found_ts,
+                         "mark": mark})
     return {"resolved": resolved, "closed_no_text": no_text_groups,
             "skipped_no_text": skipped_no_text,
             "cannot_verify": cannot_verify, "targets": len(targets)}
 
 
 def append_resolved(path, resolved, now=None):
-    """訂正エントリを ambiguous ファイルへ追加する（元の記録は残す）。"""
+    """訂正エントリを ambiguous ファイルへ追加する（元の記録は残す）。
+
+    対象に印があった場合は訂正エントリにも印を残す（どの印の送信が
+    届いたと確認したか、後から分かるように）。
+    """
     if not resolved:
         return
     stamp = (now or datetime.now(timezone.utc)).strftime("%Y-%m-%dT%H:%M:%S%z")
@@ -449,6 +521,9 @@ def append_resolved(path, resolved, now=None):
                    "thread_ts": r["thread_ts"],
                    "outcome": "resolved_by_thread_check",
                    "found_ts": r["found_ts"], "text": r["text"]}
+            mark = r.get("mark")
+            if mark:
+                rec[mark[0]] = mark[1]
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
@@ -524,13 +599,65 @@ def write_last_summary(path, summary):
         pass
 
 
+def make_mark_lookup(read_meta, workspaces=WORKSPACES):
+    """--dump で投稿の印を取る照会を作る。
+
+    slack-read-metadata.py --dump（include_all_metadata 付き）を
+    ワークスペースごとに試し、読めた方の結果を使う（history_reader
+    のフォールバックと同じ形。チャンネルIDはワークスペースごとに
+    一意なので、誤ったワークスペースの結果が混ざることはない）。
+    呼び出しは (channel, thread_ts) -> {ts: (kind, value) | None}。
+    dump の窓（直近100件）に入らない投稿は辞書に出てこないので、
+    呼び出し側は .get(ts) が None のものを「印が分からない」として
+    文面で拾う。同じ (channel, thread_ts) は1回の照合で何度も
+    呼ばれないようキャッシュする（同じスレッドに複数の対象がある
+    場合のため）。どのワークスペースでも読めなければ RuntimeError。
+    """
+    cache = {}
+
+    def lookup(channel, thread_ts):
+        key = (channel, thread_ts)
+        if key in cache:
+            return cache[key]
+        last_exc = None
+        for workspace in workspaces:
+            args = [sys.executable, read_meta, "--channel", channel,
+                    "--dump"]
+            if thread_ts:
+                args += ["--thread-ts", thread_ts]
+            if workspace:
+                args += ["--workspace", workspace]
+            try:
+                r = subprocess.run(args, capture_output=True, text=True,
+                                   timeout=60)
+                data = parse_slack_json(r.stdout or "")
+            except Exception as exc:  # noqa: BLE001 - 次のワークスペースを試す
+                last_exc = exc
+                continue
+            if not data or not data.get("ok"):
+                last_exc = RuntimeError(
+                    "dump unreadable: %s" % (data or {}).get("error", "no json"))
+                continue
+            marks = {}
+            for m in data.get("messages", []):
+                mk = m.get("mark")
+                marks[str(m.get("ts", ""))] = (
+                    (mk.get("kind"), mk.get("value")) if mk else None)
+            cache[key] = marks
+            return marks
+        raise RuntimeError(f"dump unreadable in all workspaces: {last_exc}")
+
+    return lookup
+
+
 def main(argv):
     opts = {}
     i = 0
     while i < len(argv):
         a = argv[i]
         if a in ("--ambiguous-file", "--last-run-file", "--runs-file",
-                 "--last-summary-file", "--lock-file", "--slackcli") \
+                 "--last-summary-file", "--lock-file", "--slackcli",
+                 "--read-meta") \
                 and i + 1 < len(argv):
             opts[a[2:]] = argv[i + 1]
             i += 2
@@ -546,6 +673,7 @@ def main(argv):
     last_summary_file = opts.get("last-summary-file") or LAST_SUMMARY_FILE
     lock_file = opts.get("lock-file") or LOCK_FILE
     slackcli = opts.get("slackcli") or SLACKCLI
+    read_meta = opts.get("read-meta") or READ_META
     force = bool(opts.get("force"))
     dry_run = bool(opts.get("dry-run"))
 
@@ -600,7 +728,8 @@ def main(argv):
         raise RuntimeError(f"history unreadable in all workspaces: {last_exc}")
 
     try:
-        result = reconcile(records, history_reader)
+        result = reconcile(records, history_reader,
+                           make_mark_lookup(read_meta))
         if not dry_run:
             append_resolved(ambiguous_file, result["resolved"])
             append_closed_no_text(ambiguous_file, result["closed_no_text"])

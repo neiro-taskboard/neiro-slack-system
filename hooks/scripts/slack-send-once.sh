@@ -183,6 +183,22 @@
 #       fail-closed で送らない（Yanayana さんの「metadata を単一障害点に
 #       しない」使い分けと同じ）。
 #
+#   14. 定期照合側の印ガード（2026-11-15、同じスレッド 1794621025.648949）。
+#       13 で「同じ形の穴はない」と言ったのは送信時経路（台帳照合と
+#       スレッド文面チェック）についての話で、定期照合
+#       slack-reconcile-ambiguous.py の文面一致には同じ穴が残っていた。
+#       しかも record_ambiguous() の記録には印が載っておらず、
+#       ガード以前に記録側が追いついていなかった。こちらも直す：
+#       record_ambiguous() は送信に --event-id / --request-id が付いて
+#       いれば記録にも event_id / request_id を残す（record_send と
+#       同じ形。印のない送信の記録は従来どおり印なし）。照合側は
+#       記録と履歴の投稿の両方に印があり、かつ違う場合だけ文面一致の
+#       候補から外す。どちらかに印がなければ従来どおり文面で照合する
+#       （後方互換：既存の印なし記録も壊さない）。履歴の印は
+#       slack-read-metadata.py --dump で取る（slackcli では metadata
+#       が返ってこないため）。dump の窓（直近100件）に入らない古い
+#       候補は印が分からないので文面で拾う（従来どおり）。
+#
 # 使い方:
 #   slack-send-once.sh --channel C0CGYGT9V7G --message '...' [--workspace muse-board]
 #   slack-send-once.sh --permalink <url> --message '...' [--workspace muse-board]
@@ -425,13 +441,16 @@ PYEOF
 # 2026-11-14 を取り入れ）。通常送信は record_send が文面を残しているが、
 # ambiguous 側だけ文面が無く、後から「何を送ろうとしたか」が分からな
 # かったため。文面が読めなくても記録自体は残す。
+# 送信に --event-id / --request-id が付いていれば、印も一緒に残す
+# （2026-11-15、定期照合の印ガード用。record_send と同じ形。印の
+# ない送信の記録は従来どおり印なし）。
 #   引数: 理由の文字列。
 record_ambiguous() {
   local reason="$1"
   mkdir -p "$(dirname "$AMBIGUOUS_FILE")" 2>/dev/null || return 0
-  python3 - "$reason" "$CHANNEL" "$THREAD_TS" "$AMBIGUOUS_FILE" "$TMP_MSG" <<'PYEOF' 2>/dev/null || true
+  python3 - "$reason" "$CHANNEL" "$THREAD_TS" "$AMBIGUOUS_FILE" "$TMP_MSG" "$EVENT_ID" "$REQUEST_ID" <<'PYEOF' 2>/dev/null || true
 import json, sys, time
-reason, channel, thread_ts, path, msg_path = sys.argv[1:6]
+reason, channel, thread_ts, path, msg_path, event_id, request_id = sys.argv[1:8]
 try:
     with open(msg_path, encoding='utf-8') as f:
         text = f.read()
@@ -440,6 +459,10 @@ except OSError:
 rec = {'time': time.strftime('%Y-%m-%dT%H:%M:%S%z'), 'channel': channel,
        'thread_ts': thread_ts or '', 'outcome': 'ambiguous_post_outcome',
        'reason': reason, 'text': text}
+if event_id:
+    rec['event_id'] = event_id
+if request_id:
+    rec['request_id'] = request_id
 with open(path, 'a', encoding='utf-8') as f:
     f.write(json.dumps(rec, ensure_ascii=False) + '\n')
 PYEOF
