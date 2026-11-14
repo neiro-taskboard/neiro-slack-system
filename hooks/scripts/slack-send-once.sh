@@ -196,11 +196,24 @@ PYEOF
 fi
 
 # --permalink からチャンネルとスレッド親 ts を取り出す。
+# スレッド内返信のパーマリンクには ?thread_ts=<親ts> が付くので、
+# スレッド親はまず thread_ts から取る。p<ts> はその返信自身の ts
+# なので、親にするのは誤り（2026-11-14 のバグ：返信自体を親とする
+# 誤ったスレッド指定になっていた）。親投稿のパーマリンクには
+# thread_ts が無いので、その場合だけ p<ts>（その投稿自身の ts）が親になる。
 if [ -n "$PERMALINK" ]; then
   CHANNEL=$(printf '%s' "$PERMALINK" | sed -n 's#.*/archives/\([A-Z0-9]*\)/p\([0-9]*\).*#\1#p')
-  PTS=$(printf '%s' "$PERMALINK" | sed -n 's#.*/archives/[A-Z0-9]*/p\([0-9]*\).*#\1#p')
-  if [ -n "$PTS" ]; then
-    THREAD_TS="${PTS:0:10}.${PTS:10}"
+  TTS=$(printf '%s' "$PERMALINK" | sed -n 's#.*[?&]thread_ts=\([0-9A-Za-z%.]*\).*#\1#p')
+  # URL エンコードされたドット（%2E）も戻す。cid 等の他パラメータは無視。
+  TTS=$(printf '%s' "$TTS" | sed 's/%2[Ee]/./g')
+  case "$TTS" in
+    *.*) THREAD_TS="$TTS" ;;
+  esac
+  if [ -z "$THREAD_TS" ]; then
+    PTS=$(printf '%s' "$PERMALINK" | sed -n 's#.*/archives/[A-Z0-9]*/p\([0-9]*\).*#\1#p')
+    if [ -n "$PTS" ]; then
+      THREAD_TS="${PTS:0:10}.${PTS:10}"
+    fi
   fi
 fi
 
