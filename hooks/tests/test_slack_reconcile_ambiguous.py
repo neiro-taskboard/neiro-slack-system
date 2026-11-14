@@ -37,7 +37,7 @@ Covered:
   16. run log (Yama's shape, 2026-11-14): a forced run writes a start
       line and an end line (ok, exit 0) to the runs file and overwrites
       the last-summary file with the same summary; a gated run writes
-      nothing more
+      a single gated line (reason interval_gate) instead of start/end
   17. dry-run writes start/end lines with dry_run true and does not
       update the last-run gate file
   18. run-log write failure is swallowed: runs file as a directory
@@ -49,7 +49,9 @@ Covered:
       (no over-matching)
   22. script-side flock (Yanayana's shape, 2026-11-14): a second run
       while the lock is held exits gated (lock_busy) without appending
-      or writing run-log lines
+      to the ambiguous file, but writes a single gated line
+      (reason lock_busy) to the runs file (Yanayana's gated-logging
+      fix, 2026-11-14)
   23. the lock is released when the process exits: two sequential
       --force runs both run (the second is not lock-gated)
 """
@@ -469,10 +471,14 @@ def test_cli_run_log_start_end_and_last_summary():
               f"rc={r.returncode} lines={lines} summary={summary}")
         r2 = run_cli(tmp, amb_path, last_path, cli, [])
         out2 = json.loads(r2.stdout[r2.stdout.find("{"):])
-        check("gated run writes no run-log lines",
+        lines2 = run_log_lines(runs_path)
+        check("gated run writes a single gated line (interval_gate), "
+              "no start/end",
               r2.returncode == 0 and out2["gated"] is True
-              and len(run_log_lines(runs_path)) == 2,
-              f"out={r2.stdout} lines={run_log_lines(runs_path)}")
+              and len(lines2) == 3
+              and lines2[2]["event"] == "gated"
+              and lines2[2]["reason"] == "interval_gate",
+              f"out={r2.stdout} lines={lines2}")
 
 
 def test_cli_dry_run_logs_with_flag():
@@ -539,13 +545,18 @@ def test_cli_lock_busy_gated():
             holder.close()
         out = json.loads(r.stdout[r.stdout.find("{"):])
         lines = open(amb_path, encoding="utf-8").read().strip().split("\n")
+        run_lines = run_log_lines(runs_path)
         check("lock held by another process: run exits gated "
-              "(lock_busy), appends nothing, writes no run-log lines",
+              "(lock_busy), appends nothing, writes a single gated "
+              "line (reason lock_busy)",
               r.returncode == 0 and out["gated"] is True
               and out.get("lock_busy") is True
-              and len(lines) == 1 and not os.path.exists(runs_path)
+              and len(lines) == 1 and len(run_lines) == 1
+              and run_lines[0]["event"] == "gated"
+              and run_lines[0]["reason"] == "lock_busy"
               and not os.path.exists(last_path),
-              f"rc={r.returncode} out={r.stdout} err={r.stderr}")
+              f"rc={r.returncode} out={r.stdout} err={r.stderr} "
+              f"runs={run_lines}")
 
 
 def test_cli_lock_released_after_run():

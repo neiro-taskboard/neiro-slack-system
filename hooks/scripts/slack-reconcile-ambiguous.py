@@ -54,9 +54,12 @@ flock（Yanayana さんの形、2026-11-14 の取り込み）:
     通常の経路ではそもそも重ならないが、手動で直接走らせた場合は
     その flock の外になる。スクリプト側にも flock を入れることで、
     手動実行の経路もカバーする（Yanayana さんの整理）。
-  - ロックが取れなければ gated として抜ける（終了コード 0、実行ログの
-    開始・終了も残さない）。自己ゲートのスキップと同じ扱いで、
-    ポーリングフック側は '"gated": true' を見てログに残さない。
+  - ロックが取れなければ gated として抜ける（終了コード 0）。
+    自己ゲートのスキップと同じ扱いで、ポーリングフック側は
+    '"gated": true' を見てログに残さないが、実行ログには
+    {"event": "gated", "reason": "lock_busy"} の1行を残す
+    （Yanayana さんの修正 2026-11-14 の取り込み。gated の回が
+    痕跡なしだと、走らなかった回と区別がつかないため）。
   - ロックはプロセス終了まで保持し、終了時に OS が解放する。
     last_run の読み書き（チェックと書き込みの間）もロックの中に
     入るので、手動実行とポール経由の実行が同時に走っても
@@ -74,7 +77,12 @@ flock（Yanayana さんの形、2026-11-14 の取り込み）:
     書かれているので、ログでも持つと二重管理になる（Yama さんの
     検討と同じ結論）。
   - ログ書き込みの失敗で本体が止まらないよう、失敗しても飲み込む。
-  - ゲートでスキップされた回は実行ではないので、開始・終了とも残さない。
+  - ゲートでスキップされた回は実行ではないので、開始・終了は残さない
+    が、{"event": "gated", "reason": ...} の1行だけ残す（Yanayana さんの
+    修正 2026-11-14 の取り込み）。理由は interval_gate（前回から1時間
+    以内）と lock_busy（別の照合プロセスがロックを持っている）の2種。
+    ポーリングフックは gated の出力を破棄するので、この1行が唯一の
+    痕跡になる。
 
 使い方:
   slack-reconcile-ambiguous.py [--ambiguous-file PATH]
@@ -547,6 +555,11 @@ def main(argv):
     try:
         acquire_lock(lock_file)
     except LockBusy:
+        # gated の回も実行ログに1行だけ残す（Yanayana さんの修正の
+        # 取り込み）。ポーリングフックは gated の stdout を破棄するので、
+        # この行が唯一の痕跡になる。書き込み失敗は飲み込む。
+        append_run_line(runs_file, "gated",
+                        {"reason": "lock_busy", "ts": time.time()})
         print(json.dumps({"resolved": 0, "targets": 0,
                           "closed_no_text": 0,
                           "skipped_no_text": 0, "cannot_verify": [],
@@ -561,6 +574,9 @@ def main(argv):
     if not force:
         last = read_last_run(last_run_file)
         if last is not None and now - last < GATE_SECS:
+            append_run_line(runs_file, "gated",
+                            {"reason": "interval_gate", "ts": now,
+                             "last_run": last})
             print(json.dumps({"resolved": 0, "targets": 0,
                               "closed_no_text": 0,
                               "skipped_no_text": 0, "cannot_verify": [],
