@@ -1,0 +1,66 @@
+#!/bin/sh
+# Pre-push guard for the PUBLIC repo: block pushes that contain secrets
+# or personal information. Installed 2026-11-14 at the user's request:
+# everything on GitHub is world-visible and can be misused, so personal
+# info, API keys, tokens and passwords must never be pushed.
+# Scans the trees of all commits being pushed plus their author/committer
+# emails. Exit 1 blocks the push.
+#
+# This file is TRACKED in the repo. Install it after a fresh clone with:
+#   sh hooks/install-pre-push.sh
+# (.git/hooks is not distributed with a clone, so the guard must be
+# re-installed per clone. Noted by Yanayana 2026-11-14.)
+# Real names for the name check live in .git/hooks/pre-push-names (one per
+# line, untracked, local only) -- never in this file, or this very check
+# would block the commit that adds it.
+
+fail=0
+note() { echo "pre-push guard: $1" >&2; fail=1; }
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ "$local_sha" = "0000000000000000000000000000000000000000" ] && continue
+  if [ "$remote_sha" = "0000000000000000000000000000000000000000" ]; then
+    range="$local_sha"
+    commits=$(git rev-list "$local_sha" --not --remotes=origin 2>/dev/null || git rev-list "$local_sha")
+  else
+    range="$remote_sha..$local_sha"
+    commits=$(git rev-list "$range")
+  fi
+  [ -z "$commits" ] && continue
+
+  # Author/committer emails: only the GitHub noreply address is allowed.
+  bad_mail=$(git log --format='%ae %ce' $commits | tr ' ' '\n' | sort -u \
+    | grep -E '@' | grep -v 'users\.noreply\.github\.com' || true)
+  [ -n "$bad_mail" ] && note "non-noreply email in commits being pushed: $bad_mail"
+
+  # Secret and personal-info patterns in file contents (all pushed commits).
+  hits=$(git grep -nIE 'xox[baprs]-[A-Za-z0-9-]{10,}|xapp-[A-Za-z0-9-]{10,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|BEGIN [A-Z ]*PRIVATE KEY|AKIA[0-9A-Z]{16}' $commits -- . 2>/dev/null | head -5)
+  [ -n "$hits" ] && note "possible secret found:\n$hits"
+
+  # Real names: read from .git/hooks/pre-push-names (one per line, fixed
+  # strings). The file is untracked and local-only; if it is missing, this
+  # check is skipped. Read on fd 3 so the outer push-info loop keeps stdin.
+  names_file="$(git rev-parse --git-dir 2>/dev/null)/hooks/pre-push-names"
+  if [ -f "$names_file" ]; then
+    while IFS= read -r name <&3; do
+      [ -z "$name" ] && continue
+      hits=$(git grep -n -F "$name" $commits -- . 2>/dev/null | head -5)
+      [ -n "$hits" ] && note "real name found (scrub before publishing):\n$hits"
+    done 3< "$names_file"
+  fi
+
+  hits=$(git grep -nIE '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' $commits -- . 2>/dev/null \
+    | grep -v 'users\.noreply\.github\.com' | head -5)
+  [ -n "$hits" ] && note "email address found in file contents:\n$hits"
+
+  # Phone-number-like patterns (0X-XXXX-XXXX form). Taken from Yanayana's
+  # share 2026-11-14: Yama's gate checks phone numbers, so ours does too.
+  hits=$(git grep -nE '0[0-9]{1,3}-[0-9]{2,4}-[0-9]{3,4}' $commits -- . 2>/dev/null | head -5)
+  [ -n "$hits" ] && note "possible phone number found:\n$hits"
+done
+
+if [ "$fail" -ne 0 ]; then
+  echo "pre-push guard: push blocked. Scrub the content above, then push again." >&2
+  exit 1
+fi
+exit 0
