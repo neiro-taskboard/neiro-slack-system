@@ -27,7 +27,9 @@ Covered:
      unchanged and attempts untouched; past 24h -> dead + dead-letter line
      once, never re-woken (Yama's test 26 boundary pattern: 23h59m vs 24h01m)
  11. waiting re-wake -> payload event carries resend annotation
-     (first_wait_at + JST) for the "遅れての再送" prefix; new events don't
+     (first_wait_at + JST + prefix) for the "遅れての再送" prefix;
+     new events don't. prefix はコード側で固定した
+     「遅れての再送（最初の試行：YYYY-MM-DD HH:MM JST）」（2026-11-14 の3者合意）
 """
 import json
 import os
@@ -314,7 +316,8 @@ def test_waiting_boundary_24h():
 def test_waiting_rewake_annotates_resend():
     # DLQ再送の最終形（2026-11-14、Yanayana の reconcile_ambiguous.py 参考）:
     # waiting で起こし直されるとき、ペイロードのイベントに resend が付き、
-    # first_wait_at（元の失敗時刻）と JST 表示が入る。新規イベントには付かない。
+    # first_wait_at（最初の試行の失敗時刻）と JST 表示と、コード側で固定した
+    # 接頭辞 prefix（「遅れての再送（最初の試行：…）」）が入る。新規イベントには付かない。
     env = Env()
     ev = make_event()
     ev_new = make_event(ts="1794476893.695469")
@@ -339,6 +342,8 @@ def test_waiting_rewake_annotates_resend():
     expected_jst = first.astimezone(ZoneInfo("Asia/Tokyo")).strftime("%Y-%m-%d %H:%M JST")
     check("resend.first_wait_at_jst is JST for the prefix",
           resend and resend.get("first_wait_at_jst") == expected_jst, resend)
+    check("resend.prefix is the agreed wording",
+          resend and resend.get("prefix") == f"遅れての再送（最初の試行：{expected_jst}）", resend)
     check("new event has no resend annotation",
           "resend" not in by_ts[ev_new["ts"]], by_ts[ev_new["ts"]])
     rec = env.read_state()[eid(ev)]

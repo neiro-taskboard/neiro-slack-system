@@ -20,9 +20,10 @@ Rules:
   ではなく API 待ちなので、attempts（retry_count）に数えない。1時間ごとに
   起こし直し、24時間以内に履歴が読めるようになれば通常通り返信する。
   24時間を過ぎても読めなければ諦めとして dead にし、デッドレターに記録する。
-  起こし直しのペイロードには resend（元の失敗時刻つき）を付け、ワーカーが
+  起こし直しのペイロードには resend（最初の試行の時刻つき・接頭辞つき）を付け、ワーカーが
   再送前に答え済み確認をしてから「遅れての再送」の接頭辞つきで送る
   （2026-11-14、Yanayana の reconcile_ambiguous.py を参考に取り込み）。
+  接頭辞の文言は 2026-11-14 の3者合意で「遅れての再送（最初の試行：…）」に揃えた。
 - Newly dead events are reported in the payload so the owner can be notified.
 
 Output: JSON {"decision": "wake"|"silent", "reason": str, "payload": {...}}
@@ -77,7 +78,7 @@ def format_jst(dt):
     """datetime -> '2026-11-13 23:42 JST'。
 
     Yanayana の reconcile_ambiguous.py の format_failed_at_jst と同じ形。
-    再送文の接頭辞「遅れての再送（元の失敗時刻：…）」に入れる。
+    再送文の接頭辞（resend_prefix）に入れる。
     zoneinfo が使えなければ ISO 時刻をそのまま返す。
     """
     try:
@@ -85,6 +86,20 @@ def format_jst(dt):
         return dt.astimezone(ZoneInfo("Asia/Tokyo")).strftime("%Y-%m-%d %H:%M JST")
     except Exception:
         return dt.isoformat()
+
+
+def resend_prefix(first_wait_jst):
+    """再送文の先頭に付ける1行を返す（コード側で固定）。
+
+    2026-11-14 の3者合意で「遅れての再送（最初の試行：YYYY-MM-DD HH:MM JST）」
+    に揃えた。年・JSTあり＋「最初の試行」の組み合わせが3者のいいとこ取り。
+    「元の失敗時刻」だとリトライ後に最後の失敗と読める余地があるため
+    「最初の試行」に寄せた。Yama さんの指摘で、文言と判定はプロンプト側でなく
+    コード側に置く（Yanayana の resend_prefix と同じ考え方）。
+    なお旧文言で送られた再送はまだ1件もない（送信台帳で確認済み）ため、
+    旧文言を認識対象に残す必要はない。
+    """
+    return f"遅れての再送（最初の試行：{first_wait_jst}）"
 
 
 def load_state():
@@ -224,13 +239,15 @@ def main():
                 rec["next_wake_at"] = (now + timedelta(seconds=WAIT_WAKE_INTERVAL_SECS)).isoformat()
                 # DLQ再送の最終形（2026-11-14、Yanayana の reconcile_ambiguous.py
                 # を参考に取り込み）：再 wake であることをペイロードに明示し、
-                # 元の失敗時刻を添える。ワーカーは送る前に
+                # 最初の試行の時刻を添える。ワーカーは送る前に
                 # slack-answered-check.py で答え済み確認をし、再送文の先頭に
-                # 「遅れての再送（元の失敗時刻：…JST）」を付けて送る。
+                # resend_prefix() の1行（「遅れての再送（最初の試行：…JST）」）
+                # を付けて送る。
                 resend_ev = dict(ev)
                 resend_ev["resend"] = {
                     "first_wait_at": first_wait.isoformat(),
                     "first_wait_at_jst": format_jst(first_wait),
+                    "prefix": resend_prefix(format_jst(first_wait)),
                 }
                 due.append(resend_ev)
                 changed = True
