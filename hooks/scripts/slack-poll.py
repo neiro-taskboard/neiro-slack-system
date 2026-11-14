@@ -24,10 +24,13 @@ Rules:
   ではなく API 待ちなので、attempts（retry_count）に数えない。1時間ごとに
   起こし直し、24時間以内に履歴が読めるようになれば通常通り返信する。
   24時間を過ぎても読めなければ諦めとして dead にし、デッドレターに記録する。
-  起こし直しのペイロードには resend（最初の試行の時刻つき・接頭辞つき）を付け、ワーカーが
+  起こし直しのペイロードには resend（元の失敗時刻つき・接頭辞つき）を付け、ワーカーが
   再送前に答え済み確認をしてから「遅れての再送」の接頭辞つきで送る
   （2026-11-14、Yanayana の reconcile_ambiguous.py を参考に取り込み）。
-  接頭辞の文言は 2026-11-14 の3者合意で「遅れての再送（最初の試行：…）」に揃えた。
+  接頭辞の文言は 2026-11-14 の3者合意で「遅れての再送（元の失敗時刻：…）」に揃えた。
+  一時は「最初の試行」に寄せる合意だったが、同日のレビューで「一見そろって
+  いるのに微妙に違う状態が一番分かりにくい」と指摘があり、Neiro・Yanayana
+  の元の文言「元の失敗時刻」に戻すことで3者統一した（Yama さんの共有 2026-11-14）。
 - Newly dead events are reported in the payload so the owner can be notified.
 
 Output: JSON {"decision": "wake"|"silent", "reason": str, "payload": {...}}
@@ -106,15 +109,19 @@ def format_jst(dt):
 def resend_prefix(first_wait_jst):
     """再送文の先頭に付ける1行を返す（コード側で固定）。
 
-    2026-11-14 の3者合意で「遅れての再送（最初の試行：YYYY-MM-DD HH:MM JST）」
-    に揃えた。年・JSTあり＋「最初の試行」の組み合わせが3者のいいとこ取り。
-    「元の失敗時刻」だとリトライ後に最後の失敗と読める余地があるため
-    「最初の試行」に寄せた。Yama さんの指摘で、文言と判定はプロンプト側でなく
-    コード側に置く（Yanayana の resend_prefix と同じ考え方）。
-    なお旧文言で送られた再送はまだ1件もない（送信台帳で確認済み）ため、
-    旧文言を認識対象に残す必要はない。
+    2026-11-14 の3者合意で「遅れての再送（元の失敗時刻：YYYY-MM-DD HH:MM JST）」
+    に揃えた。一時は Yama さんの提案で「最初の試行」に寄せる合意だったが、
+    同日のレビューで「一見そろっているのに微妙に違う状態が一番分かりにくい」
+    と指摘があり、Neiro・Yanayana の元の文言「元の失敗時刻」に戻すことで
+    3者統一した（Yama さんの共有 2026-11-14）。時刻は「最初に止まった時刻」
+    （first_wait）なので「元の失敗時刻」が実態にも合う。
+    Yama さんの指摘で、文言と判定はプロンプト側でなくコード側に置く
+    （Yanayana の resend_prefix と同じ考え方）。
+    なお「最初の試行」で送られた再送はまだ1件もない（送信台帳で 2026-11-14
+    に確認済み）が、Yama・Yanayana と同じく新旧両方の文言を認識対象に残す。
+    認識は slack-send-once.sh の重複チェックで行う（接頭辞の新旧を同一視）。
     """
-    return f"遅れての再送（最初の試行：{first_wait_jst}）"
+    return f"遅れての再送（元の失敗時刻：{first_wait_jst}）"
 
 
 def load_state():
@@ -255,9 +262,9 @@ def main():
                 rec["next_wake_at"] = (now + timedelta(seconds=WAIT_WAKE_INTERVAL_SECS)).isoformat()
                 # DLQ再送の最終形（2026-11-14、Yanayana の reconcile_ambiguous.py
                 # を参考に取り込み）：再 wake であることをペイロードに明示し、
-                # 最初の試行の時刻を添える。ワーカーは送る前に
+                # 元の失敗時刻を添える。ワーカーは送る前に
                 # slack-answered-check.py で答え済み確認をし、再送文の先頭に
-                # resend_prefix() の1行（「遅れての再送（最初の試行：…JST）」）
+                # resend_prefix() の1行（「遅れての再送（元の失敗時刻：…JST）」）
                 # を付けて送る。
                 resend_ev = dict(ev)
                 resend_ev["resend"] = {

@@ -99,6 +99,18 @@
 #      側のチェックとは別に読む（1回の送信で計3回の読み取りになるが、
 #      チャンネル投稿は頻度が低く、既存の check_bounded と分けておく
 #      方が変更が局所的で安全）。
+#   9. 再送ヘッダーの新旧同一視（2026-11-14、再送ヘッダーの文言統一）。
+#      自分の投稿との重複チェック（台帳・bounded・窓）では、文頭の再送
+#      ヘッダー1行を除いて比較する。ヘッダーは新文言「遅れての再送
+#      （元の失敗時刻：YYYY-MM-DD HH:MM JST）」と旧文言「遅れての再送
+#      （最初の試行：YYYY-MM-DD HH:MM JST）」の両方を認識し、どちらも
+#      同じものとして扱う（Yama さん・Yanayana さんと同じ考え方）。
+#      文言切替の途中で旧文言の再送が送られていても、再 wake した新文言
+#      の再送が重複と判定されて二重送信にならない。なお旧文言で送られた
+#      再送は実際には1件もない（送信台帳で 2026-11-14 に確認済み）が、
+#      念のため両方残す。他者の同一文面チェックには適用しない（他者の
+#      投稿にうちの再送ヘッダーは付かないし、付いていたらそれは一字一句
+#      の一致として止めるべき事故のため）。
 #
 # 使い方:
 #   slack-send-once.sh --channel C0CGYGT9V7G --message '...' [--workspace muse-board]
@@ -394,11 +406,17 @@ PYEOF
 #   0 = 見つかった（その ts を出す）、1 = なし、2 = 台帳が読めなかった。
 check_ledger() {
   python3 - "$CHANNEL" "$THREAD_TS" "$TMP_MSG" "$LEDGER_FILE" <<'PYEOF' 2>/dev/null
-import json, sys
+import json, re, sys
 channel, thread_ts, msg_path, ledger_path = sys.argv[1:5]
+# 再送ヘッダー（新旧どちらの文言でも）で始まる文面は、ヘッダー1行を除いて
+# 比較する（2026-11-14、再送ヘッダーの文言統一。旧文言で送られた再送が
+# あっても、新文言の再送が重複と判定される）。
+_RESEND_HEAD = re.compile(r'^遅れての再送（(?:元の失敗時刻|最初の試行)：\d{4}-\d{2}-\d{2} \d{2}:\d{2} JST）\n(?=.)')
+def _norm_resend(t):
+    return _RESEND_HEAD.sub('', t.strip(), count=1)
 try:
     with open(msg_path, encoding='utf-8') as f:
-        target = f.read().strip()
+        target = _norm_resend(f.read())
 except OSError:
     sys.exit(2)
 try:
@@ -416,7 +434,7 @@ with f:
             continue
         if (rec.get('thread_ts') or '') != (thread_ts or ''):
             continue
-        if (rec.get('text') or '').strip() == target:
+        if _norm_resend(rec.get('text') or '') == target:
             found = rec.get('ts')
             break
 if found:
@@ -441,7 +459,7 @@ check_bounded() {
     attempt=$((attempt + 1))
     raw=$("$SLACKCLI" conversations read "$CHANNEL" --limit "$BOUNDED_N" --json "${WS_ARGS[@]}" 2>/dev/null || true)
     found=$(printf '%s' "$raw" | python3 -c "
-import sys, json
+import sys, json, re
 raw = sys.stdin.read()
 i = raw.find('{')
 if i < 0:
@@ -450,9 +468,14 @@ try:
     d = json.loads(raw[i:])
 except Exception:
     sys.exit(2)
-target = open('$TMP_MSG', encoding='utf-8').read().strip()
+# 再送ヘッダー（新旧どちらの文言でも）で始まる文面は、ヘッダー1行を除いて
+# 比較する（2026-11-14、再送ヘッダーの文言統一）。
+_RESEND_HEAD = re.compile(r'^遅れての再送（(?:元の失敗時刻|最初の試行)：\d{4}-\d{2}-\d{2} \d{2}:\d{2} JST）\n(?=.)')
+def _norm_resend(t):
+    return _RESEND_HEAD.sub('', t.strip(), count=1)
+target = _norm_resend(open('$TMP_MSG', encoding='utf-8').read())
 for m in d.get('messages', []):
-    if m.get('user') == '$SELF_ID' and (m.get('text') or '').strip() == target:
+    if m.get('user') == '$SELF_ID' and _norm_resend(m.get('text') or '') == target:
         print('FOUND ' + str(m.get('ts', '')))
         sys.exit(0)
 sys.exit(1)
@@ -508,7 +531,7 @@ check_duplicate() {
       if [ -n "$THREAD_TS" ]; then read_args+=(--thread-ts "$THREAD_TS"); fi
       raw=$("$SLACKCLI" conversations read "${read_args[@]}" "${WS_ARGS[@]}" 2>/dev/null || true)
       page_out=$(printf '%s' "$raw" | python3 -c "
-import sys, json, time
+import sys, json, re, time
 raw = sys.stdin.read()
 i = raw.find('{')
 if i < 0:
@@ -517,7 +540,12 @@ try:
     d = json.loads(raw[i:])
 except Exception:
     sys.exit(2)
-target = open('$TMP_MSG', encoding='utf-8').read().strip()
+# 再送ヘッダー（新旧どちらの文言でも）で始まる文面は、ヘッダー1行を除いて
+# 比較する（2026-11-14、再送ヘッダーの文言統一）。
+_RESEND_HEAD = re.compile(r'^遅れての再送（(?:元の失敗時刻|最初の試行)：\d{4}-\d{2}-\d{2} \d{2}:\d{2} JST）\n(?=.)')
+def _norm_resend(t):
+    return _RESEND_HEAD.sub('', t.strip(), count=1)
+target = _norm_resend(open('$TMP_MSG', encoding='utf-8').read())
 cutoff = $cutoff
 for m in d.get('messages', []):
     if m.get('user') != '$SELF_ID':
@@ -526,7 +554,7 @@ for m in d.get('messages', []):
         ts = float(m.get('ts', '0'))
     except ValueError:
         continue
-    if ts >= cutoff and (m.get('text') or '').strip() == target:
+    if ts >= cutoff and _norm_resend(m.get('text') or '') == target:
         print('FOUND ' + m.get('ts', ''))
         sys.exit(0)
 if d.get('has_more') and d.get('next_oldest'):
