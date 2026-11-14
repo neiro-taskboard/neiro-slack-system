@@ -63,7 +63,17 @@ while read -r local_ref local_sha remote_ref remote_sha; do
 
   # Phone-number-like patterns (0X-XXXX-XXXX form). Taken from Yanayana's
   # share 2026-11-14: Yama's gate checks phone numbers, so ours does too.
-  hits=$(git grep -nE '0[0-9]{1,3}-[0-9]{2,4}-[0-9]{3,4}' $commits -- . 2>/dev/null | head -5)
+  # Dummies are allowlisted by TOKEN STRING, not by line -- the same rule
+  # as the token check above (Yama's review 2026-11-14): the literal
+  # string REPLACE-ME is stripped from each matching line and the pattern
+  # is re-checked, so a dummy like 090-REPLACE-ME-0000 passes, while a
+  # real-looking number sharing a line with REPLACE-ME still blocks.
+  # (A line-wide grep -v would have the same hole Yama pointed out for
+  # tokens.) All-digit example numbers (e.g. a number filled with zeros)
+  # are indistinguishable from real numbers, so they still block -- the
+  # same line Yanayana and Yama take. X-filled dummies (090-XXXX-XXXX)
+  # never match the digit pattern in the first place, so they pass as-is.
+  hits=$(git grep -nE '0[0-9]{1,3}-[0-9]{2,4}-[0-9]{3,4}' $commits -- . 2>/dev/null | sed 's/REPLACE-ME//g' | grep -E '0[0-9]{1,3}-[0-9]{2,4}-[0-9]{3,4}' | head -5)
   [ -n "$hits" ] && note "possible phone number found:\n$hits"
 done
 
