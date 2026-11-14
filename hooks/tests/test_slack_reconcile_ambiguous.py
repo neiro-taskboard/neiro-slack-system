@@ -34,6 +34,14 @@ Covered:
       gated second run exits 0 without calling slackcli again
   15. whitespace-only text is treated as no-text: closed as
       closed_no_text, never a grouping key (Yama's note 2026-11-14)
+  16. run log (Yama's shape, 2026-11-14): a forced run writes a start
+      line and an end line (ok, exit 0) to the runs file and overwrites
+      the last-summary file with the same summary; a gated run writes
+      nothing more
+  17. dry-run writes start/end lines with dry_run true and does not
+      update the last-run gate file
+  18. run-log write failure is swallowed: runs file as a directory
+      still exits 0 and resolves (the main body never stops for logs)
 """
 import importlib.util
 import json
@@ -319,8 +327,13 @@ def fake_slackcli(tmpdir, messages_by_key):
 
 
 def run_cli(tmpdir, amb_path, last_path, cli, extra=None):
+    # --runs-file / --last-summary-file も常に一時ファイルにする。
+    # 入れ忘れると既定の実ファイルにテストの実行ログが残ってしまう
+    # （2026-11-14、最初の実装で実際に混入したため）。
     cmd = [sys.executable, RECONCILE_PY,
            "--ambiguous-file", amb_path, "--last-run-file", last_path,
+           "--runs-file", os.path.join(tmpdir, "runs.jsonl"),
+           "--last-summary-file", os.path.join(tmpdir, "last-run.json"),
            "--slackcli", cli] + (extra or [])
     return subprocess.run(cmd, capture_output=True, text=True, timeout=60)
 
@@ -370,6 +383,91 @@ def test_cli_unreadable_exits_2():
               r.returncode == 0 and out["resolved"] == 0, f"out={r.stdout}")
 
 
+def run_log_lines(path):
+    if not os.path.exists(path):
+        return []
+    with open(path, encoding="utf-8") as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+def test_cli_run_log_start_end_and_last_summary():
+    with tempfile.TemporaryDirectory() as tmp:
+        amb_path = os.path.join(tmp, "amb.jsonl")
+        last_path = os.path.join(tmp, "last.json")
+        runs_path = os.path.join(tmp, "runs.jsonl")
+        summary_path = os.path.join(tmp, "last-run.json")
+        with open(amb_path, "w", encoding="utf-8") as f:
+            f.write(json.dumps(amb(), ensure_ascii=False) + "\n")
+        cli = fake_slackcli(
+            tmp, {(CHANNEL, THREAD_TS):
+                  [{"ts": "1794594100.000000", "user": SELF, "text": TEXT}]})
+        extra = ["--force"]
+        r = run_cli(tmp, amb_path, last_path, cli, extra)
+        out = json.loads(r.stdout[r.stdout.find("{"):])
+        lines = run_log_lines(runs_path)
+        summary = json.load(open(summary_path, encoding="utf-8"))
+        check("run writes start then end lines (ok, exit 0); "
+              "last summary matches printed output",
+              r.returncode == 0 and len(lines) == 2
+              and lines[0]["event"] == "start"
+              and lines[1]["event"] == "end"
+              and lines[1]["ok"] is True and lines[1]["exit"] == 0
+              and lines[1]["resolved"] == 1
+              and lines[0]["dry_run"] is False
+              and lines[1]["dry_run"] is False
+              and summary["resolved"] == out["resolved"]
+              and summary["targets"] == out["targets"],
+              f"rc={r.returncode} lines={lines} summary={summary}")
+        r2 = run_cli(tmp, amb_path, last_path, cli, [])
+        out2 = json.loads(r2.stdout[r2.stdout.find("{"):])
+        check("gated run writes no run-log lines",
+              r2.returncode == 0 and out2["gated"] is True
+              and len(run_log_lines(runs_path)) == 2,
+              f"out={r2.stdout} lines={run_log_lines(runs_path)}")
+
+
+def test_cli_dry_run_logs_with_flag():
+    with tempfile.TemporaryDirectory() as tmp:
+        amb_path = os.path.join(tmp, "amb.jsonl")
+        last_path = os.path.join(tmp, "last.json")
+        runs_path = os.path.join(tmp, "runs.jsonl")
+        summary_path = os.path.join(tmp, "last-run.json")
+        with open(amb_path, "w", encoding="utf-8") as f:
+            f.write(json.dumps(amb(), ensure_ascii=False) + "\n")
+        cli = fake_slackcli(tmp, {(CHANNEL, THREAD_TS): []})
+        extra = ["--force", "--dry-run"]
+        r = run_cli(tmp, amb_path, last_path, cli, extra)
+        lines = run_log_lines(runs_path)
+        check("dry-run writes start/end with dry_run true; "
+              "gate file untouched",
+              r.returncode == 0 and len(lines) == 2
+              and lines[0]["event"] == "start"
+              and lines[1]["event"] == "end"
+              and lines[0]["dry_run"] is True
+              and lines[1]["dry_run"] is True
+              and not os.path.exists(last_path),
+              f"rc={r.returncode} lines={lines}")
+
+
+def test_cli_run_log_write_failure_swallowed():
+    with tempfile.TemporaryDirectory() as tmp:
+        amb_path = os.path.join(tmp, "amb.jsonl")
+        last_path = os.path.join(tmp, "last.json")
+        runs_dir = os.path.join(tmp, "runs-dir")
+        os.makedirs(runs_dir)
+        with open(amb_path, "w", encoding="utf-8") as f:
+            f.write(json.dumps(amb(), ensure_ascii=False) + "\n")
+        cli = fake_slackcli(
+            tmp, {(CHANNEL, THREAD_TS):
+                  [{"ts": "1794594100.000000", "user": SELF, "text": TEXT}]})
+        extra = ["--force", "--runs-file", runs_dir]
+        r = run_cli(tmp, amb_path, last_path, cli, extra)
+        out = json.loads(r.stdout[r.stdout.find("{"):])
+        check("runs file unwritable: run still exits 0 and resolves",
+              r.returncode == 0 and out["resolved"] == 1,
+              f"rc={r.returncode} out={r.stdout} err={r.stderr}")
+
+
 def main():
     test_exact_match_resolves()
     test_other_user_identical_text_no_resolve()
@@ -385,6 +483,9 @@ def main():
     test_unreadable_history_cannot_verify()
     test_cli_end_to_end_and_gate()
     test_cli_unreadable_exits_2()
+    test_cli_run_log_start_end_and_last_summary()
+    test_cli_dry_run_logs_with_flag()
+    test_cli_run_log_write_failure_swallowed()
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 

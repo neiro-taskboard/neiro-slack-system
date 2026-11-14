@@ -43,9 +43,24 @@ ambiguous 記録へ resolved_by_thread_check の訂正を入れる「発見時�
   - 履歴が読めなかった対象は訂正しない（fail-closed）。次の定期実行で
     拾い直す。
 
+実行ログ（Yama さんの形、2026-11-14 の取り込み）:
+  - 実行のたびに、開始1行と終了1行（終了コード付き）を
+    slack-reconcile-ambiguous-runs.jsonl へ追記する。途中で切られた
+    回は「開始だけあって終了がない」形で残るので、切れたことが後から
+    分かる。ポーリングフックからの呼び出しは 120秒の timeout 付きで、
+    切られた回はそれまで何も残らない形だった。
+  - その回のサマリ（標準出力と同じ JSON）は
+    slack-reconcile-ambiguous-last-run.json に上書き保存する。
+  - 対象ごとの進捗追記は入れない。結果は元々 ambiguous 台帳に
+    書かれているので、ログでも持つと二重管理になる（Yama さんの
+    検討と同じ結論）。
+  - ログ書き込みの失敗で本体が止まらないよう、失敗しても飲み込む。
+  - ゲートでスキップされた回は実行ではないので、開始・終了とも残さない。
+
 使い方:
   slack-reconcile-ambiguous.py [--ambiguous-file PATH]
-      [--last-run-file PATH] [--force] [--dry-run] [--slackcli PATH]
+      [--last-run-file PATH] [--runs-file PATH]
+      [--last-summary-file PATH] [--force] [--dry-run] [--slackcli PATH]
 出力: JSON 1行 {"resolved": N, "targets": N, "closed_no_text": N,
   "skipped_no_text": N, "cannot_verify": [...], "gated": false}
 終了コード: 0 = 照合できた（解決なし・スキップも含む）。2 = 一部または
@@ -73,6 +88,8 @@ GRACE_SECS = 3600  # 記録時刻の1時間前までを照合の下限とする�
 
 AMBIGUOUS_FILE = "/home/hatch/hooks/state/slack-ambiguous-posts.jsonl"
 LAST_RUN_FILE = "/home/hatch/hooks/state/slack-reconcile-ambiguous-last.json"
+RUNS_FILE = "/home/hatch/hooks/state/slack-reconcile-ambiguous-runs.jsonl"
+LAST_SUMMARY_FILE = "/home/hatch/hooks/state/slack-reconcile-ambiguous-last-run.json"
 
 
 def parse_slack_json(raw):
@@ -391,12 +408,47 @@ def write_last_run(path, epoch):
     os.replace(tmp, path)
 
 
+def utc_stamp(epoch=None):
+    """UTC の ISO 時刻（例 2026-11-14T07:30:00+0000）。"""
+    return datetime.fromtimestamp(
+        time.time() if epoch is None else epoch,
+        timezone.utc).strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def append_run_line(path, event, fields):
+    """実行ログへ開始・終了の1行を追記する。
+
+    失敗しても飲み込んで本体を止めない（Yama さんの形と同じ）。
+    """
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        rec = {"event": event, "time": utc_stamp()}
+        rec.update(fields)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def write_last_summary(path, summary):
+    """その回のサマリを上書き保存する。失敗しても飲み込む。"""
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
 def main(argv):
     opts = {}
     i = 0
     while i < len(argv):
         a = argv[i]
-        if a in ("--ambiguous-file", "--last-run-file", "--slackcli") \
+        if a in ("--ambiguous-file", "--last-run-file", "--runs-file",
+                 "--last-summary-file", "--slackcli") \
                 and i + 1 < len(argv):
             opts[a[2:]] = argv[i + 1]
             i += 2
@@ -408,6 +460,8 @@ def main(argv):
             return 2
     ambiguous_file = opts.get("ambiguous-file") or AMBIGUOUS_FILE
     last_run_file = opts.get("last-run-file") or LAST_RUN_FILE
+    runs_file = opts.get("runs-file") or RUNS_FILE
+    last_summary_file = opts.get("last-summary-file") or LAST_SUMMARY_FILE
     slackcli = opts.get("slackcli") or SLACKCLI
     force = bool(opts.get("force"))
     dry_run = bool(opts.get("dry-run"))
@@ -424,6 +478,7 @@ def main(argv):
             return 0
 
     records = load_records(ambiguous_file)
+    append_run_line(runs_file, "start", {"ts": now, "dry_run": dry_run})
 
     def history_reader(channel, thread_ts, oldest):
         last_exc = None
@@ -437,11 +492,18 @@ def main(argv):
                 last_exc = exc
         raise RuntimeError(f"history unreadable in all workspaces: {last_exc}")
 
-    result = reconcile(records, history_reader)
-    if not dry_run:
-        append_resolved(ambiguous_file, result["resolved"])
-        append_closed_no_text(ambiguous_file, result["closed_no_text"])
-        write_last_run(last_run_file, now)
+    try:
+        result = reconcile(records, history_reader)
+        if not dry_run:
+            append_resolved(ambiguous_file, result["resolved"])
+            append_closed_no_text(ambiguous_file, result["closed_no_text"])
+            write_last_run(last_run_file, now)
+    except Exception as exc:  # noqa: BLE001 - 予期せぬ失敗も終了行に残す
+        print(f"reconcile failed: {exc}", file=sys.stderr)
+        append_run_line(runs_file, "end",
+                        {"ts": time.time(), "ok": False, "exit": 2,
+                         "error": str(exc)[:200], "dry_run": dry_run})
+        return 2
     out = {"resolved": len(result["resolved"]),
            "resolved_detail": result["resolved"],
            "targets": result["targets"],
@@ -451,8 +513,17 @@ def main(argv):
            "cannot_verify": [{"channel": c, "thread_ts": t, "reason": r}
                              for c, t, r in result["cannot_verify"]],
            "gated": False, "dry_run": dry_run}
+    exit_code = 0 if not result["cannot_verify"] else 2
+    append_run_line(runs_file, "end",
+                    {"ts": time.time(), "ok": exit_code == 0,
+                     "exit": exit_code, "resolved": out["resolved"],
+                     "targets": out["targets"],
+                     "closed_no_text": out["closed_no_text"],
+                     "cannot_verify": len(out["cannot_verify"]),
+                     "dry_run": dry_run})
+    write_last_summary(last_summary_file, out)
     print(json.dumps(out, ensure_ascii=False))
-    return 0 if not result["cannot_verify"] else 2
+    return exit_code
 
 
 if __name__ == "__main__":
