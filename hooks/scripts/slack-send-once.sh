@@ -18,9 +18,12 @@
 #   1. 送信前に履歴を確認し、直近 --window-mins 分以内に自分の同一文面が
 #      既にあれば送らずに成功扱いにする（台帳未記録でも止まる）。
 #      ただしスレッド返信（--thread-ts / --permalink）の場合は時間の窓
-#      なしでスレッド全体を確認する（Yama さんの指摘 2026-11-12：15分を
-#      超えて遅れた再実行の同一文面にも強くする。Yanayana さんも同じ指摘）。
-#      スレッド内では同一文面の再送はほぼ再実行による重複のため。
+#      なしで確認する。当初はスレッド全体を見ていた（Yama さんの指摘
+#      2026-11-12：15分を超えて遅れた再実行の同一文面にも強くする。
+#      Yanayana さんも同じ指摘）が、2026-11-14 に直近 THREAD_CHECK_N
+#      件（100件）へ絞った（オーナーの指摘：スレッドが伸びるほど読み直し
+#      の負担が増える。詳細は下の 10）。スレッド内では同一文面の再送
+#      はほぼ再実行による重複のため。
 #   2. 送信コマンドが失敗しても、履歴に自分の投稿が見つかれば
 #      「届いていた」と扱い、盲目的な再送はしない（最大3回まで再確認）。
 #      読み直しでも履歴が一度も読めず、到達の有無が不明なときは
@@ -50,6 +53,9 @@
 #      2026-11-12：--oldest なし／0 だと初回が「親＋最新N件」になり、
 #      next_oldest が最新メッセージを指して2ページ目が空になり、
 #      古い返信が一生見えない。実スレッドで --limit 3 で検証済み）。
+#      なお、この全ページ確認はチャンネル履歴の窓チェックの話で、
+#      スレッド返信側は 2026-11-14 に直近100件の単発読みへ変更した
+#      （下の 10）。
 #   5. チャンネルへの通常送信は、15分窓に加えて直近 BOUNDED_N 件の
 #      bounded チェックも行う（Yanayana さんの提案 2026-11-12、Yama さん
 #      も賛同）。15分を超えて遅れた再実行でも、直近50件に同一文面が
@@ -111,6 +117,19 @@
 #      念のため両方残す。他者の同一文面チェックには適用しない（他者の
 #      投稿にうちの再送ヘッダーは付かないし、付いていたらそれは一字一句
 #      の一致として止めるべき事故のため）。
+#   10. スレッド返信の重複チェックは直近 THREAD_CHECK_N 件（100件）
+#      に絞る（2026-11-14、オーナーの判断）。それまでは自分の同一文面
+#      チェック（check_duplicate）も他者の同一文面チェック
+#      （check_other_duplicate）も、スレッドを --oldest=親ts から
+#      ページングして全件読み直していたため、スレッドが伸びるほど
+#      1回の送信あたりの読み直しが際限なく増えた。--oldest を付けず
+#      --limit 100 で読むと「親＋直近100件」が1回で取れる（返信
+#      180件近い実スレッドで検証済み）。割り切り：直近100件より古い
+#      同一文面は履歴チェックでは拾わない。自分の送信は送信台帳の
+#      確認（6）が別にあり、他者との一字一句一致の事故は同時刻の
+#      投稿同士で起きるため直近で足りる、という判断。チャンネル側の
+#      bounded（直近50件）と同じ考え方で、対象がスレッドかどうかの
+#      違いだけ。
 #
 # 使い方:
 #   slack-send-once.sh --channel C0CGYGT9V7G --message '...' [--workspace muse-board]
@@ -122,7 +141,7 @@
 # 終了コード: 0 = 送信済み（または既に投稿ありでスキップ）、1 = 送信失敗（送信を試みたが履歴にもなし）。
 #   --check-only のときは 0 = 重複あり、1 = 重複なし、2 = 確認できず。
 #   3 = 送信前の履歴確認ができず送らなかった（cannot-verify / pre-check失敗）。
-#   4 = 送る文面がスレッド内／チャンネル直近50件の他者の既存投稿と
+#   4 = 送る文面がスレッド直近100件／チャンネル直近50件の他者の既存投稿と
 #       一字一句一致していたので送らなかった（Yanayana さんの
 #       reply_once.py / channel_send_once.py の再発防止チェック、
 #       2026-11-14）。呼び出し側は文面を変えて送り直すか、送らない判断をする。
@@ -138,6 +157,7 @@ WINDOW_MINS=15
 VERIFY_ATTEMPTS=3
 HISTORY_ATTEMPTS=5
 BOUNDED_N=50
+THREAD_CHECK_N=100
 LEDGER_FILE="$HOME/hooks/state/slack-send-log.jsonl"
 LEDGER_ARCHIVE_FILE="$HOME/hooks/state/slack-send-log-archive.jsonl"
 AMBIGUOUS_FILE="$HOME/hooks/state/slack-ambiguous-posts.jsonl"
@@ -499,36 +519,71 @@ sys.exit(1)
   return 2
 }
 
-# 履歴に自分の同一文面があるか確認する。
+# スレッド返信の自分の同一文面チェック（直近 THREAD_CHECK_N 件）。
+#   0 = 見つかった（その ts を出す）、1 = なし、2 = 履歴が読めなかった。
+# --oldest を付けず --limit THREAD_CHECK_N で読むと「親＋直近N件」が
+# 1回で取れる（実スレッド検証済み）。経緯と割り切りはヘッダーの 10。
+# 再送ヘッダーの同一視は窓チェックと共通（ヘッダーの 9）。
+check_duplicate_thread() {
+  local attempt=0 raw found rc
+  while [ "$attempt" -lt "$HISTORY_ATTEMPTS" ]; do
+    attempt=$((attempt + 1))
+    raw=$("$SLACKCLI" conversations read "$CHANNEL" --limit "$THREAD_CHECK_N" --json --thread-ts "$THREAD_TS" "${WS_ARGS[@]}" 2>/dev/null || true)
+    found=$(printf '%s' "$raw" | python3 -c "
+import sys, json, re
+raw = sys.stdin.read()
+i = raw.find('{')
+if i < 0:
+    sys.exit(2)
+try:
+    d = json.loads(raw[i:])
+except Exception:
+    sys.exit(2)
+_RESEND_HEAD = re.compile(r'^遅れての再送（(?:元の失敗時刻|最初の試行)：\d{4}-\d{2}-\d{2} \d{2}:\d{2} JST）\n(?=.)')
+def _norm_resend(t):
+    return _RESEND_HEAD.sub('', t.strip(), count=1)
+target = _norm_resend(open('$TMP_MSG', encoding='utf-8').read())
+for m in d.get('messages', []):
+    if m.get('user') == '$SELF_ID' and _norm_resend(m.get('text') or '') == target:
+        print('FOUND ' + str(m.get('ts', '')))
+        sys.exit(0)
+sys.exit(1)
+" 2>/dev/null)
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+      echo "duplicate found: ${found#FOUND }"
+      CHECK_VIA="thread-bounded"
+      FOUND_TS="${found#FOUND }"
+      return 0
+    elif [ "$rc" -eq 1 ]; then
+      return 1
+    fi
+    # rc == 2: 読めなかった。指数バックオフで再試行（他と同じ間隔）。
+    if [ "$attempt" -lt "$HISTORY_ATTEMPTS" ]; then sleep $((1 << (attempt - 1))); fi
+  done
+  return 2
+}
+
+# 履歴に自分の同一文面があるか確認する（チャンネル投稿用）。
 #   0 = 見つかった（その ts を出す）、1 = なし、2 = 履歴が読めなかった。
 # ページング: --oldest に window の切り捨て時刻を渡し、next_oldest を
-# 辿って全ページを確認する。1ページ目だけでは長いスレッドの直近分が
-# 範囲外になるため（oldest-first の先頭50件問題）。
-# チャンネル投稿で窓内に重複がなければ、続けて bounded チェックを行う。
+# 辿って全ページを確認する。1ページ目だけでは直近分が範囲外になる
+# ため（oldest-first の先頭50件問題）。
+# 窓内に重複がなければ、続けて bounded チェックを行う。
+# スレッド返信は check_duplicate_thread へ委譲する。
 check_duplicate() {
+  if [ -n "$THREAD_TS" ]; then
+    check_duplicate_thread
+    return $?
+  fi
   local attempt=0 raw page_out window_rc=2
   local cutoff
-  if [ -n "$THREAD_TS" ]; then
-    # スレッド返信は時間の窓なしでスレッド全体を確認する。
-    # Yama さんの指摘（2026-11-12）：15分を超えて遅れた再実行の同一文面
-    # にも強くする。Yanayana さんも同じ指摘。
-    cutoff=0
-  else
-    cutoff=$(python3 -c "import time; print(time.time() - $WINDOW_MINS * 60)")
-  fi
+  cutoff=$(python3 -c "import time; print(time.time() - $WINDOW_MINS * 60)")
   while [ "$attempt" -lt "$HISTORY_ATTEMPTS" ]; do
     attempt=$((attempt + 1))
     local oldest="$cutoff"
-    if [ -n "$THREAD_TS" ]; then
-      # スレッドは --oldest=親ts から古い順に辿る。--oldest=0 だと
-      # 付けないのと同じで初回が「親＋最新N件」になり、next_oldest が
-      # 最新メッセージを指して2ページ目が空になり、古い返信が見えない
-      # （Yanayana さんの指摘・実スレッド検証 2026-11-12）。
-      oldest="$THREAD_TS"
-    fi
     while :; do
       local read_args=("$CHANNEL" --limit 50 --json --oldest "$oldest")
-      if [ -n "$THREAD_TS" ]; then read_args+=(--thread-ts "$THREAD_TS"); fi
       raw=$("$SLACKCLI" conversations read "${read_args[@]}" "${WS_ARGS[@]}" 2>/dev/null || true)
       page_out=$(printf '%s' "$raw" | python3 -c "
 import sys, json, re, time
@@ -589,33 +644,31 @@ sys.exit(1)
   if [ "$window_rc" -ne 1 ]; then
     return 2
   fi
-  # スレッド返信は窓チェック（＝スレッド全体チェック）で確定。
-  if [ -n "$THREAD_TS" ]; then
-    return 1
-  fi
   # チャンネル投稿は bounded チェックへ。
   check_bounded
 }
 
 # 送信前の他者同一文面チェック（スレッド返信のみ）。
 #   0 = 他者の同一文面あり、1 = なし、2 = 履歴が読めなかった。
-# スレッド全件を読み直し、送る文面が他者の既存投稿と一字一句一致して
-# いないか確認する（Yanayana さんの reply_once.py の再発防止チェック、
-# 2026-11-14 を取り入れ。同日、Yanayana さんの返信の下書きを作る経路が
-# 直近の Yama さんの投稿文面を拾ってそのまま送ってしまい、2人の返信が
-# 一字一句同じになった事故の再発防止）。自分の返信との一致は
-# check_duplicate が見るので、ここでは他者の投稿だけを見る。
+# スレッドの直近 THREAD_CHECK_N 件を読み直し、送る文面が他者の既存
+# 投稿と一字一句一致していないか確認する（Yanayana さんの
+# reply_once.py の再発防止チェック、2026-11-14 を取り入れ。同日、
+# Yanayana さんの返信の下書きを作る経路が直近の Yama さんの投稿文面
+# を拾ってそのまま送ってしまい、2人の返信が一字一句同じになった事故
+# の再発防止）。自分の返信との一致は check_duplicate が見るので、
+# ここでは他者の投稿だけを見る。
+# 当初はスレッド全件をページングして読み直していたが、2026-11-14 に
+# 直近100件へ絞った（ヘッダーの 10。一字一句の一致事故は同時刻の
+# 投稿同士で起きるため、直近で足りるという割り切り）。
 # 読み直しは最大5回リトライし、それでも読めなければ cannot-verify
 # （fail-closed。呼び出し側は終了コード3として扱う）。
 check_other_duplicate() {
-  local attempt=0 raw page_out oldest
+  local attempt=0 raw found rc
   [ -n "$THREAD_TS" ] || return 1
   while [ "$attempt" -lt "$HISTORY_ATTEMPTS" ]; do
     attempt=$((attempt + 1))
-    oldest="$THREAD_TS"
-    while :; do
-      raw=$("$SLACKCLI" conversations read "$CHANNEL" --limit 50 --json --oldest "$oldest" --thread-ts "$THREAD_TS" "${WS_ARGS[@]}" 2>/dev/null || true)
-      page_out=$(printf '%s' "$raw" | python3 -c "
+    raw=$("$SLACKCLI" conversations read "$CHANNEL" --limit "$THREAD_CHECK_N" --json --thread-ts "$THREAD_TS" "${WS_ARGS[@]}" 2>/dev/null || true)
+    found=$(printf '%s' "$raw" | python3 -c "
 import sys, json
 raw = sys.stdin.read()
 i = raw.find('{')
@@ -632,24 +685,16 @@ for m in d.get('messages', []):
     if (m.get('text') or '').strip() == target:
         print('OTHER_DUP ' + str(m.get('ts', '')))
         sys.exit(0)
-if d.get('has_more') and d.get('next_oldest'):
-    print('MORE ' + str(d['next_oldest']))
-    sys.exit(3)
-print('DONE')
 sys.exit(1)
-")
-      local rc=$?
-      if [ "$rc" -eq 0 ]; then
-        echo "other user's identical post found: ${page_out#OTHER_DUP }"
-        return 0
-      elif [ "$rc" -eq 1 ]; then
-        return 1
-      elif [ "$rc" -eq 3 ]; then
-        oldest="${page_out#MORE }"
-        continue
-      fi
-      break
-    done
+" 2>/dev/null)
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+      echo "other user's identical post found: ${found#OTHER_DUP }"
+      return 0
+    elif [ "$rc" -eq 1 ]; then
+      return 1
+    fi
+    # rc == 2: 読めなかった。指数バックオフで再試行（他と同じ間隔）。
     if [ "$attempt" -lt "$HISTORY_ATTEMPTS" ]; then sleep $((1 << (attempt - 1))); fi
   done
   return 2
