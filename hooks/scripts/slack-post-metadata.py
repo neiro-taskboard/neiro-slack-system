@@ -24,10 +24,12 @@ Yama さんの metadata 照合の設計（2026-11-14、muse取締役会 #slack-�
   失敗時は {"ok": false, "error": ...} を出し、終了コード 1。
   --dry-run は送らずに送るはずの payload を出す（トークンは読まない）。
 
-注意: これは送信経路の第一歩。既存の返信フロー（slack-send-once.sh 経由）の
-  移行は、event_id の中身（ts か台帳側の独自IDか）が Yama さんの回答で
-  決まってから行う。読み取り側の include_all_metadata=True 対応と
-  metadata 優先の照合もそのときにあわせて入れる。
+注意: 既存の返信フロー（slack-send-once.sh 経由）への移行は 2026-11-14 に
+  済ませた。スレッドで event_id の中身が決まった（うちは台帳キー
+  「workspace:channel:ts」の形、Yama さんは Slack の event_id）ので、
+  slack-send-once.sh に --event-id / --request-id を付けるとこの
+  スクリプトで送り、読み取り側は slack-read-metadata.py
+  （include_all_metadata=True 付き）で metadata 優先の照合をする。
 """
 import argparse
 import json

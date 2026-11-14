@@ -146,10 +146,27 @@
 #       て送ってよい」という部分は採用せず、三者で合意済みの
 #       fail-closed（送らない・DLQで後から拾う）を維持する。
 #
+#   12. metadata 優先の照合（2026-11-14、Yama さんの設計を三者で採用。
+#       スレッドで event_id の中身が決まったので、既存の返信フローへ
+#       移行した）。--event-id / --request-id を付けて送ると、送信は
+#       slack-post-metadata.py で chat.postMessage を直接叩いて
+#       metadata（event_type: neiro_reply、event_payload に event_id
+#       または request_id）を付け、送信前チェックは slack-read-metadata.py
+#       で include_all_metadata=True 付きで読み直して印の一致を先に見る。
+#       印が見つかれば文面を見ずに重複として送らない。印が無い投稿や
+#       読み取り失敗時は従来の文面照合へ進む（フォールバック）。印を
+#       付けない送信は従来通り slackcli 経由。うちの event_id は
+#       「workspace:channel:ts」の形（Yama さんの Slack の event_id
+#       （Ev…の形）とは中身が違うが、元のイベントを一意に指す点では
+#       同じ役割、という整理で三者合意済み）。
+#
 # 使い方:
 #   slack-send-once.sh --channel C0CGYGT9V7G --message '...' [--workspace muse-board]
 #   slack-send-once.sh --permalink <url> --message '...' [--workspace muse-board]
 #   slack-send-once.sh --channel C... --thread-ts 1794477882.362889 --message-file note.txt
+#   slack-send-once.sh --channel C... --thread-ts <ts> --message '...' --event-id <workspace:channel:ts>
+#     印を付けて送るとき（イベント駆動の返信は --event-id、手動投稿は --request-id <UUID>）。
+#     送信は chat.postMessage 直接叩きになり、送信前チェックも metadata 優先になる.
 #   slack-send-once.sh --channel C... --message '...' --check-only   # 送信せず重複だけ確認
 #   slack-send-once.sh --prune-dry-run [--ledger <path>]              # 何件落ちるかだけ数える（削除しない）
 #
@@ -178,6 +195,11 @@ LEDGER_ARCHIVE_FILE="$HOME/hooks/state/slack-send-log-archive.jsonl"
 AMBIGUOUS_FILE="$HOME/hooks/state/slack-ambiguous-posts.jsonl"
 CHECK_VIA=""
 FOUND_TS=""
+EVENT_ID=""
+REQUEST_ID=""
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+READ_META="$SCRIPT_DIR/slack-read-metadata.py"
+POST_META="$SCRIPT_DIR/slack-post-metadata.py"
 
 WORKSPACE=""
 CHANNEL=""
@@ -196,6 +218,8 @@ while [ $# -gt 0 ]; do
     --thread-ts)   THREAD_TS="$2"; shift 2 ;;
     --message)     MESSAGE="$2"; shift 2 ;;
     --message-file) MESSAGE_FILE="$2"; shift 2 ;;
+    --event-id)    EVENT_ID="$2"; shift 2 ;;
+    --request-id)  REQUEST_ID="$2"; shift 2 ;;
     --window-mins) WINDOW_MINS="$2"; shift 2 ;;
     --check-only)  CHECK_ONLY=1; shift ;;
     --prune-dry-run) PRUNE_DRY_RUN=1; shift ;;
@@ -266,6 +290,7 @@ fi
 
 if [ -z "$CHANNEL" ]; then echo "channel is required (--channel or --permalink)" >&2; exit 2; fi
 if [ -z "$MESSAGE" ] && [ -z "$MESSAGE_FILE" ]; then echo "message is required (--message or --message-file)" >&2; exit 2; fi
+if [ -n "$EVENT_ID" ] && [ -n "$REQUEST_ID" ]; then echo "event-id and request-id are mutually exclusive" >&2; exit 2; fi
 
 TMP_MSG=$(mktemp)
 trap 'rm -f "$TMP_MSG"' EXIT
@@ -340,9 +365,9 @@ record_send() {
   [ -n "$ts" ] || return 0
   mkdir -p "$(dirname "$LEDGER_FILE")" 2>/dev/null || return 0
   prune_ledger
-  python3 - "$ts" "$CHANNEL" "$THREAD_TS" "$TMP_MSG" "$LEDGER_FILE" <<'PYEOF' 2>/dev/null || true
+  python3 - "$ts" "$CHANNEL" "$THREAD_TS" "$TMP_MSG" "$LEDGER_FILE" "$EVENT_ID" "$REQUEST_ID" <<'PYEOF' 2>/dev/null || true
 import json, sys
-ts, channel, thread_ts, msg_path, ledger_path = sys.argv[1:6]
+ts, channel, thread_ts, msg_path, ledger_path, event_id, request_id = sys.argv[1:8]
 try:
     with open(msg_path, encoding='utf-8') as f:
         text = f.read()
@@ -360,6 +385,10 @@ try:
 except OSError:
     pass
 rec = {'ts': ts, 'channel': channel, 'thread_ts': thread_ts or '', 'text': text}
+if event_id:
+    rec['event_id'] = event_id
+if request_id:
+    rec['request_id'] = request_id
 with open(ledger_path, 'a', encoding='utf-8') as f:
     f.write(json.dumps(rec, ensure_ascii=False) + '\n')
 PYEOF
@@ -442,10 +471,13 @@ PYEOF
 # 照合は再送ヘッダー除去＋空白・改行の正規化のうえでの完全一致
 # （parroting防止、2026-11-14、Yamaさんの提案）。スレッド返信の
 # 送信前チェック（11）でも、cannot-verify 時のフォールバックでも使う。
+# --event-id / --request-id があるときは印の一致を文面より先に見る
+# （metadata 優先、2026-11-14、ヘッダーの 12）。印が無い古い記録は
+# 対象外で、文面照合へ進む。
 check_ledger() {
-  python3 - "$CHANNEL" "$THREAD_TS" "$TMP_MSG" "$LEDGER_FILE" <<'PYEOF' 2>/dev/null
+  python3 - "$CHANNEL" "$THREAD_TS" "$TMP_MSG" "$LEDGER_FILE" "$EVENT_ID" "$REQUEST_ID" <<'PYEOF' 2>/dev/null
 import json, re, sys
-channel, thread_ts, msg_path, ledger_path = sys.argv[1:5]
+channel, thread_ts, msg_path, ledger_path, event_id, request_id = sys.argv[1:7]
 # 再送ヘッダー（新旧どちらの文言でも）で始まる文面は、ヘッダー1行を除いて
 # 比較する（2026-11-14、再送ヘッダーの文言統一。旧文言で送られた再送が
 # あっても、新文言の再送が重複と判定される）。
@@ -475,6 +507,12 @@ with f:
             continue
         if (rec.get('thread_ts') or '') != (thread_ts or ''):
             continue
+        if event_id and rec.get('event_id') == event_id:
+            found = rec.get('ts')
+            break
+        if request_id and rec.get('request_id') == request_id:
+            found = rec.get('ts')
+            break
         if _norm(rec.get('text') or '') == target:
             found = rec.get('ts')
             break
@@ -540,6 +578,47 @@ sys.exit(1)
   return 2
 }
 
+# metadata の印での重複チェック（Yama さんの設計、2026-11-14、ヘッダーの 12）。
+# slack-read-metadata.py で include_all_metadata 付きで読み直し、
+# 自分の投稿のうち metadata.event_payload.event_id / request_id が
+# 一致するものを探す。文面照合より先に行う（第1手段）。
+#   0 = 見つかった（その ts を出す）、1 = なし、2 = 読めなかった。
+# 読めなかったときは呼び出し側が文面照合へ進む（フォールバック）。
+# 印が無い（--event-id / --request-id 未指定）のときは呼ばない。
+check_metadata() {
+  local out found_ts rc
+  [ -x "$READ_META" ] || return 2
+  local meta_args=(--channel "$CHANNEL" --self-id "$SELF_ID")
+  if [ -n "$WORKSPACE" ]; then meta_args+=(--workspace "$WORKSPACE"); fi
+  if [ -n "$THREAD_TS" ]; then meta_args+=(--thread-ts "$THREAD_TS"); fi
+  if [ -n "$EVENT_ID" ]; then meta_args+=(--event-id "$EVENT_ID"); else meta_args+=(--request-id "$REQUEST_ID"); fi
+  out=$(python3 "$READ_META" "${meta_args[@]}" 2>/dev/null || true)
+  found_ts=$(printf '%s' "$out" | python3 -c "
+import sys, json
+raw = sys.stdin.read()
+try:
+    d = json.loads(raw)
+except Exception:
+    sys.exit(2)
+if not d.get('ok'):
+    sys.exit(2)
+if d.get('found'):
+    print('FOUND ' + str(d.get('ts', '')))
+    sys.exit(0)
+sys.exit(1)
+" 2>/dev/null)
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    echo "duplicate found by metadata: ${found_ts#FOUND }"
+    CHECK_VIA="metadata"
+    FOUND_TS="${found_ts#FOUND }"
+    return 0
+  elif [ "$rc" -eq 1 ]; then
+    return 1
+  fi
+  return 2
+}
+
 # スレッド返信の自分の同一文面チェック（直近 THREAD_CHECK_N 件）。
 #   0 = 見つかった（その ts を出す）、1 = なし、2 = 履歴が読めなかった。
 # --oldest を付けず --limit THREAD_CHECK_N で読むと「親＋直近N件」が
@@ -593,6 +672,15 @@ sys.exit(1)
 # 窓内に重複がなければ、続けて bounded チェックを行う。
 # スレッド返信は check_duplicate_thread へ委譲する。
 check_duplicate() {
+  if [ -n "$EVENT_ID" ] || [ -n "$REQUEST_ID" ]; then
+    check_metadata
+    local meta_rc=$?
+    if [ "$meta_rc" -eq 0 ]; then
+      return 0
+    fi
+    # 1（なし）・2（読めなかった）は文面照合へ進む。読めなかった
+    # 場合も文面照合が走るので、従来の fail-closed は変わらない。
+  fi
   if [ -n "$THREAD_TS" ]; then
     check_duplicate_thread
     return $?
@@ -875,10 +963,22 @@ else
 fi
 
 # --- 2. 送信 ---
-SEND_ARGS=(messages send --recipient-id "$CHANNEL" --message-file "$TMP_MSG" --json)
-if [ -n "$THREAD_TS" ]; then SEND_ARGS+=(--thread-ts "$THREAD_TS"); fi
-SEND_OUT=$("$SLACKCLI" "${SEND_ARGS[@]}" "${WS_ARGS[@]}" 2>&1)
-SEND_RC=$?
+# 印があるときは slack-post-metadata.py で直接 chat.postMessage を叩き、
+# 投稿に metadata を付ける（Yama さんの設計、2026-11-14、ヘッダーの 12）。
+# 印がないときは従来通り slackcli 経由（metadata なし）。
+if [ -n "$EVENT_ID" ] || [ -n "$REQUEST_ID" ]; then
+  META_ARGS=(--channel "$CHANNEL" --message-file "$TMP_MSG")
+  if [ -n "$THREAD_TS" ]; then META_ARGS+=(--thread-ts "$THREAD_TS"); fi
+  if [ -n "$WORKSPACE" ]; then META_ARGS+=(--workspace "$WORKSPACE"); fi
+  if [ -n "$EVENT_ID" ]; then META_ARGS+=(--event-id "$EVENT_ID"); else META_ARGS+=(--request-id "$REQUEST_ID"); fi
+  SEND_OUT=$(python3 "$POST_META" "${META_ARGS[@]}" 2>&1)
+  SEND_RC=$?
+else
+  SEND_ARGS=(messages send --recipient-id "$CHANNEL" --message-file "$TMP_MSG" --json)
+  if [ -n "$THREAD_TS" ]; then SEND_ARGS+=(--thread-ts "$THREAD_TS"); fi
+  SEND_OUT=$("$SLACKCLI" "${SEND_ARGS[@]}" "${WS_ARGS[@]}" 2>&1)
+  SEND_RC=$?
+fi
 if [ "$SEND_RC" -eq 0 ]; then
   printf '%s\n' "$SEND_OUT" | tail -5
   sent_ts=$(printf '%s' "$SEND_OUT" | python3 -c "

@@ -15,6 +15,7 @@ Slack Socket Mode を使った、ねいろ（Muse）の自動受信・自動返�
   - `scripts/slack-send-once.sh` — 重複ガード付き送信ラッパー（送信台帳、fail-closed、DLQ再送対応）
   - `scripts/slack-send-locked.sh` — slack-send-once.sh を flock 1つで直列化するラッパー（Yanayana さんの send_reply_locked.py の考え方を採用。並行ワーカーの二重送信を防ぐ）
   - `scripts/slack-post-metadata.py` — chat.postMessage を直接叩いて metadata 付きで投稿する（Yama さんの metadata 照合の設計を採用。slackcli の messages send には metadata を載せる指定がないため。トークンは slackcli の認証ストアから読む）
+  - `scripts/slack-read-metadata.py` — conversations.history / conversations.replies を直接叩き、include_all_metadata=True 付きで読んで metadata の印（event_id / request_id）に一致する投稿を探す（slackcli の conversations read は metadata を返さないため）
   - `scripts/slack-event-state.sh` — イベント完了/失敗の記録
   - `scripts/slack-reconcile-done.sh` — done レコードの古いエラー残りを掃除
   - `scripts/slack-new-messages.sh` — ポーリング入口
@@ -32,7 +33,7 @@ Slack Socket Mode を使った、ねいろ（Muse）の自動受信・自動返�
 
 - 送信前チェックができない場合は送らない（fail-closed）。議論型のチャンネル投稿では重複コストが欠落コストより重いため。
 - DLQ再送の最終形（2026-11-13の3者合意、2026-11-14に実装）：送信前チェックの失敗で送れなかった分だけを、失敗から24時間以内・毎時の起こし直しで再送する。ポーラーがペイロードに `resend`（元の失敗時刻つき・接頭辞つき）を付けて起こし直し、ワーカーが `slack-answered-check.py` で答え済み確認（元の投稿より後に質問者と自分以外による本文のある投稿があれば再送しない、時刻順序つき）をしてから送る。再送文の先頭には resend.prefix（コード側で固定した「遅れての再送（元の失敗時刻：YYYY-MM-DD HH:MM JST）」、2026-11-14の3者合意。一時は「最初の試行」に寄せる合意だったが、同日のレビューで元の文言に戻すことで3者統一）を付ける。重複チェックでは新旧両方の文言を同一視する（旧文言で送られた再送があっても二重送信しない）。送信自体の失敗は終端させる。参考：Yanayana の `reconcile_ambiguous.py`（https://github.com/yanayana-dev/slack-ata）。
-- 返信の照合は metadata 優先へ（2026-11-14、Yama さんの設計を採用。実装の第一歩として `scripts/slack-post-metadata.py` を追加）。照合の第1は metadata の event_id（イベント駆動の返信）／request_id（手動投稿）一致、第2が文面照合。metadata が付く前の投稿の照合には文面照合を使う。送信は chat.postMessage を直接叩く経路で、読み取り側は conversations.history / conversations.replies に include_all_metadata=True を付ける。目に見える印の「遅れての再送（元の失敗時刻：…）」は人が読むためのもので、照合には使わない。既存の返信フロー（slack-send-once.sh 経由）の移行は、event_id の中身が決まってから行う。
+- 返信の照合は metadata 優先へ（2026-11-14、Yama さんの設計を採用。送信側 `scripts/slack-post-metadata.py` と読み取り側 `scripts/slack-read-metadata.py` を追加し、同日 `scripts/slack-send-once.sh` へ移行済み）。照合の第1は metadata の event_id（イベント駆動の返信）／request_id（手動投稿）一致、第2が文面照合。metadata が付く前の投稿の照合には文面照合を使う。送信は chat.postMessage を直接叩く経路で、読み取り側は conversations.history / conversations.replies に include_all_metadata=True を付ける。目に見える印の「遅れての再送（元の失敗時刻：…）」は人が読むためのもので、照合には使わない。`slack-send-once.sh` に `--event-id <workspace:channel:ts>`／`--request-id <UUID>` を付けると metadata 付き送信＋ metadata 優先の照合になる。付けなければ従来通り slackcli 経由。うちの event_id は台帳キー「workspace:channel:ts」の形（Yama さんの Slack の event_id（Ev…の形）とは中身が違うが、元のイベントを一意に指す点では同じ役割、という整理で三者合意済み 2026-11-14）。
 - ワーカーの起動猶予（2026-11-14）：`processing` のイベントは、最初の wake から3時間の間は試行回数を消費しない。ワーカーの起動がポールから40分〜2時間遅れることがあり、従来の「10分陳腐化×3回で dead」では、ワーカーが起動する前に dead になる誤判定が頻発した（実測：dead-letter 165件全件がイベント発生から30〜37分で dead 化し、うち116件は遅れて起動したワーカーが後に done にしていた）。猶予を過ぎたら従来通り10分刻みでリトライし、3回で dead になる。`failed`（ワーカーが起動して失敗を報告した分）には猶予は無い。代償として、本当に起動したワーカーが応答しない場合の検知が最大で約3.5時間まで遅くなる。
 
 ## 公開版についての注意
