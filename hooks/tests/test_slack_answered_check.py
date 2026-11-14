@@ -19,8 +19,12 @@ Covered:
       (narrowed condition from Yama, 2026-11-14; Yanayana adopted the same)
   5. parent missing from channel history -> parent_deleted
   6. unreadable thread / channel -> cannot_verify
-  7. paging: an answering post on page 2 is found (next_oldest walk)
-  8. CLI end-to-end with a fake slackcli: ok_to_resend exits 0,
+  7. windowed read (Yama's method, adopted 2026-11-14): the thread read
+     starts 60s before the event and reads exactly one page
+  8. no answer inside the window but has_more -> cannot_verify
+     (fail-closed: the answer may be beyond the window)
+  9. an answer inside the window counts even when has_more
+ 10. CLI end-to-end with a fake slackcli: ok_to_resend exits 0,
      unreadable history exits 2; --self-id is honoured
 """
 import importlib.util
@@ -199,27 +203,60 @@ def test_cannot_verify():
           out2["verdict"] == "cannot_verify", out2)
 
 
-def test_paging_finds_answer_on_page2():
+def test_window_single_read_from_event_minus_60():
     mod = load_check()
-    pages = [
-        thread_page([{"ts": "1794583868.235619", "user": QUESTIONER,
-                      "text": "質問の続き"}],
-                    has_more=True, next_oldest="1794584000.000000"),
-        thread_page([{"ts": "1794585000.000000", "user": OTHER,
-                      "text": "こっちで答えますね、確認しました"}]),
-    ]
-    calls = {"n": 0}
+    calls = []
 
     def page_reader(ch, th, oldest):
-        page = pages[min(calls["n"], len(pages) - 1)]
-        calls["n"] += 1
-        return page
+        calls.append(oldest)
+        return thread_page([{"ts": "1794583868.235619", "user": QUESTIONER,
+                             "text": "質問の続き"}])
 
     out = mod.check(CHANNEL, EVENT_TS, THREAD_TS, QUESTIONER, SELF,
                     page_reader, channel_with_parent())
-    check("answering post on page 2 is found via next_oldest walk",
+    check("windowed read: no answer, no more pages -> ok_to_resend",
+          out["verdict"] == "ok_to_resend", out)
+    check("windowed read: thread is read exactly once",
+          len(calls) == 1, calls)
+    expected = float(EVENT_TS) - mod.SCAN_ORIGIN_LEAD_SECS
+    check("windowed read: origin is 60s before the event",
+          len(calls) == 1 and abs(float(calls[0]) - expected) < 1e-6,
+          calls)
+    check("windowed read: origin lead is 60 seconds",
+          mod.SCAN_ORIGIN_LEAD_SECS == 60, mod.SCAN_ORIGIN_LEAD_SECS)
+    check("windowed read: page limit is 100",
+          mod.SCAN_PAGE_LIMIT == 100, mod.SCAN_PAGE_LIMIT)
+
+
+def test_answer_beyond_window_is_fail_closed():
+    mod = load_check()
+    # 窓の中に答えはなく、まだ後続がある -> 断定できないので cannot_verify。
+    def page_reader(ch, th, oldest):
+        return thread_page([{"ts": "1794583868.235619", "user": QUESTIONER,
+                             "text": "質問の続き"}],
+                           has_more=True, next_oldest="1794584000.000000")
+
+    out = mod.check(CHANNEL, EVENT_TS, THREAD_TS, QUESTIONER, SELF,
+                    page_reader, channel_with_parent())
+    check("no answer in window + has_more -> cannot_verify (fail-closed)",
+          out["verdict"] == "cannot_verify", out)
+    check("fail-closed reason names the window",
+          out.get("reason") == "answer_may_be_beyond_window", out)
+
+
+def test_answer_within_window_counts_even_with_more():
+    mod = load_check()
+    # 窓の中に答えがあれば、後続があっても答え済みで確定できる。
+    def page_reader(ch, th, oldest):
+        return thread_page(
+            [{"ts": "1794585000.000000", "user": OTHER,
+              "text": "こっちで答えますね、確認しました"}],
+            has_more=True, next_oldest="1794586000.000000")
+
+    out = mod.check(CHANNEL, EVENT_TS, THREAD_TS, QUESTIONER, SELF,
+                    page_reader, channel_with_parent())
+    check("answer inside window + has_more -> answered_by_other",
           out["verdict"] == "answered_by_other", out)
-    check("paging walked both pages", calls["n"] == 2, calls)
 
 
 FAKE_SLACKCLI = """#!/usr/bin/env python3
@@ -297,7 +334,9 @@ def main():
              test_bot_and_short_posts_do_not_count,
              test_parent_deleted,
              test_cannot_verify,
-             test_paging_finds_answer_on_page2,
+             test_window_single_read_from_event_minus_60,
+             test_answer_beyond_window_is_fail_closed,
+             test_answer_within_window_counts_even_with_more,
              test_cli_end_to_end]
     for t in tests:
         try:

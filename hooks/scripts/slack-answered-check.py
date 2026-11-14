@@ -6,8 +6,15 @@ Yanayana の reconcile_ambiguous.py の reconcile_pending_resends の判定を�
 ねいろの構成（ワーカーが slack-send-once.sh で送る）に合わせて取り込んだ
 もの（2026-11-14）。
 
-判定（スレッドの親 ts を起点に全ページ走査する。時刻順序つき）:
+判定（時刻順序つき。スレッドの読み方は 2026-11-14 に Yama さんの提案方式へ
+変更し、オーナーが採用を決定。Yanayana さんも同方式を採用済み）:
+  読み方: 起点を対象イベントの 60 秒前に固定し、そこから後だけを
+  1 ページ（最大 100 件）読む。巨大スレッドでも読み取りはこの窓で頭打ちに
+  なる。窓の中に答えが見つからず、まだ後続がある（has_more）場合は
+  「答え済みでない」と断定できないので cannot_verify（fail-closed。再送
+  せず waiting に戻す）。
   1. parent_deleted — チャンネル履歴に親投稿がない。送り先がないので再送しない。
+     （親の存在確認は従来どおりチャンネル履歴の先頭 1 ページだけ。軽い。）
   2. answered_by_other — 元の投稿より後に、質問者と自分（ねいろ）以外による、
      bot ではなく、本文が 10 文字を超えるテキスト投稿が 1 件でもあれば
      答え済み。再送しない。bot の自動応答や短い相槌で誤って黙らないための
@@ -30,8 +37,9 @@ Yanayana の reconcile_ambiguous.py の reconcile_pending_resends の判定を�
 
 出力: JSON 1行 {"verdict": "ok_to_resend"|"answered_by_other"|"parent_deleted",
   "answered_by_ts": ..., "checked_messages": N, ...}
-終了コード: 0 = 判定できた（再送可・不可のいずれも）。2 = スレッド／履歴が
-  読めなかった（cannot_verify）。読めないときは送らず waiting に戻すこと。
+終了コード: 0 = 判定できた（再送可・不可のいずれも）。2 = 判定できなかった
+  （cannot_verify。履歴が読めなかった場合と、窓の外に答えがある可能性を
+  否定できない場合）。送らず waiting に戻すこと。
   判定できた場合は、理由つきで done にしてよい。
 """
 import json
@@ -45,8 +53,9 @@ SELF_IDS = {"muse-board": "U0CH1B19D4J", "T0CGV6V7161": "U0CH1B19D4J"}
 DEFAULT_SELF_ID = "U0CH32D1P5F"  # Neiro Task Board
 HISTORY_ATTEMPTS = 5  # slack-send-once.sh と同じ回数
 BACKOFF_SECS = (1, 2, 4, 8)  # 指数バックオフ（同上）
-MAX_PAGES = 20
-PAGE_LIMIT = 50
+PAGE_LIMIT = 50  # 親の存在確認（チャンネル履歴）のページサイズ
+SCAN_ORIGIN_LEAD_SECS = 60  # 答え探しの起点は対象イベントの 60 秒前
+SCAN_PAGE_LIMIT = 100  # 答え探しは 1 ページ最大 100 件まで（Yama さんの提案方式）
 
 
 def parse_slack_json(raw):
@@ -90,10 +99,11 @@ def is_reply_after_event(msg_ts, event_ts):
         return str(msg_ts) > str(event_ts)
 
 
-def read_page(slackcli, channel, oldest, thread_ts, workspace):
+def read_page(slackcli, channel, oldest, thread_ts, workspace,
+              limit=PAGE_LIMIT):
     """slackcli で履歴1ページを読む。読めなければ RuntimeError。"""
     args = [slackcli, "conversations", "read", channel,
-            "--limit", str(PAGE_LIMIT), "--json", "--oldest", str(oldest)]
+            "--limit", str(limit), "--json", "--oldest", str(oldest)]
     if thread_ts:
         args += ["--thread-ts", thread_ts]
     if workspace:
@@ -105,12 +115,14 @@ def read_page(slackcli, channel, oldest, thread_ts, workspace):
     return data
 
 
-def read_page_retry(slackcli, channel, oldest, thread_ts, workspace):
+def read_page_retry(slackcli, channel, oldest, thread_ts, workspace,
+                    limit=PAGE_LIMIT):
     """1ページの読み取りを最大5回リトライする（間隔 1・2・4・8 秒）。"""
     last_exc = None
     for attempt in range(HISTORY_ATTEMPTS):
         try:
-            return read_page(slackcli, channel, oldest, thread_ts, workspace)
+            return read_page(slackcli, channel, oldest, thread_ts, workspace,
+                             limit=limit)
         except Exception as exc:  # noqa: BLE001 - リトライ対象は広く取る
             last_exc = exc
             if attempt < HISTORY_ATTEMPTS - 1:
@@ -118,28 +130,18 @@ def read_page_retry(slackcli, channel, oldest, thread_ts, workspace):
     raise RuntimeError(f"history unreadable after retries: {last_exc}")
 
 
-def read_thread_all(page_reader, channel, thread_ts):
-    """スレッドの全メッセージを古い順に集める。
+def read_thread_window(page_reader, channel, thread_ts, oldest):
+    """スレッドを起点 oldest から 1 ページだけ読む（Yama さんの提案方式）。
 
-    --oldest=親ts からページングする（slack-send-once.sh と同じ流儀。
-    --oldest なしだと初回が「親＋最新N件」になり、next_oldest が最新を
-    指して古い返信が見えなくなる）。
+    戻り値は (messages, has_more)。has_more が True のとき、窓の外に
+    まだメッセージがある。ページングして全件は読まない。
     """
-    messages = []
-    oldest = thread_ts
-    for _ in range(MAX_PAGES):
-        data = page_reader(channel, thread_ts, oldest)
-        messages.extend({"ts": m.get("ts"), "user": m.get("user"),
-                         "bot_id": m.get("bot_id"),
-                         "text": m.get("text") or ""}
-                        for m in data.get("messages", []))
-        if not data.get("has_more"):
-            break
-        nxt = data.get("next_oldest")
-        if not nxt or nxt == oldest:
-            break
-        oldest = nxt
-    return messages
+    data = page_reader(channel, thread_ts, oldest)
+    messages = [{"ts": m.get("ts"), "user": m.get("user"),
+                 "bot_id": m.get("bot_id"),
+                 "text": m.get("text") or ""}
+                for m in data.get("messages", [])]
+    return messages, bool(data.get("has_more"))
 
 
 def check(channel, event_ts, thread_ts, questioner, self_id,
@@ -160,9 +162,15 @@ def check(channel, event_ts, thread_ts, questioner, self_id,
     if not any(m.get("ts") == parent_ts
                for m in page.get("messages", [])):
         return {"verdict": "parent_deleted", "parent_ts": parent_ts}
-    # 2. スレッド全件を走査し、イベントより後の他者による本文つき投稿を探す。
+    # 2. 対象イベントの 60 秒前を起点に 1 ページ（最大 SCAN_PAGE_LIMIT 件）
+    #    だけ読み、イベントより後の他者による本文つき投稿を探す。
     try:
-        replies = read_thread_all(page_reader, channel, thread_ts)
+        scan_oldest = float(event_ts) - SCAN_ORIGIN_LEAD_SECS
+    except (TypeError, ValueError):
+        scan_oldest = event_ts  # 数値化できない ts はイベント自身を起点にする
+    try:
+        replies, has_more = read_thread_window(page_reader, channel,
+                                               thread_ts, scan_oldest)
     except Exception as exc:  # noqa: BLE001 - 同上
         return {"verdict": "cannot_verify", "reason": "thread_read_failed",
                 "error": str(exc)[:200]}
@@ -177,6 +185,12 @@ def check(channel, event_ts, thread_ts, questioner, self_id,
         return {"verdict": "answered_by_other",
                 "answered_by_ts": answered_by.get("ts"),
                 "answered_by_user": answered_by.get("user"),
+                "checked_messages": len(replies)}
+    if has_more:
+        # 窓の中に答えはなかったが、窓の外にまだ投稿がある。答え済みで
+        # ないとは断定できないので fail-closed（送らず見送る）。
+        return {"verdict": "cannot_verify",
+                "reason": "answer_may_be_beyond_window",
                 "checked_messages": len(replies)}
     return {"verdict": "ok_to_resend", "checked_messages": len(replies)}
 
@@ -207,7 +221,8 @@ def main(argv):
     self_id = opts.get("self-id") or self_user_id(workspace, slackcli)
 
     def page_reader(ch, th, oldest):
-        return read_page_retry(slackcli, ch, oldest, th, workspace)
+        return read_page_retry(slackcli, ch, oldest, th, workspace,
+                               limit=SCAN_PAGE_LIMIT)
 
     def channel_reader(ch, oldest):
         return read_page_retry(slackcli, ch, oldest, None, workspace)
