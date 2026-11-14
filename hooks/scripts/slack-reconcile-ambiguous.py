@@ -194,7 +194,8 @@ def load_records(path):
 def build_targets(records):
     """照合対象を作る。
 
-    (channel, thread_ts, text) ごとに1対象。文面のない記録は飛ばす。
+    (channel, thread_ts, text) ごとに1対象。文面のない記録は飛ばす
+    （空白だけの文面も文面なし扱い）。
     戻り値: (targets, used_found_ts)
       targets: [{channel, thread_ts, text, earliest_time}]
       used_found_ts: {(channel, thread_ts): {found_ts, ...}} — 既存の
@@ -214,7 +215,9 @@ def build_targets(records):
         if outcome != "ambiguous_post_outcome":
             continue
         text = rec.get("text") or ""
-        if not text:
+        if not text.strip():
+            # 空白だけの文面も文面なし扱い（Yamaさんの指摘 2026-11-14：
+            # " " は not text では弾かれずキーになりうる）。
             continue
         key = (channel, thread_ts, text)
         rec_time = parse_record_time(rec.get("time"))
@@ -253,7 +256,7 @@ def build_no_text_groups(records):
             continue
         if outcome != "ambiguous_post_outcome":
             continue
-        if rec.get("text"):
+        if (rec.get("text") or "").strip():
             continue
         if key not in groups:
             groups[key] = {"channel": channel, "thread_ts": thread_ts,
@@ -286,7 +289,7 @@ def reconcile(records, history_reader):
     total_no_text = sum(
         1 for r in records
         if r.get("outcome") == "ambiguous_post_outcome"
-        and not (r.get("text") or ""))
+        and not (r.get("text") or "").strip())
     skipped_no_text = total_no_text - sum(g["count"] for g in no_text_groups)
     resolved = []
     cannot_verify = []

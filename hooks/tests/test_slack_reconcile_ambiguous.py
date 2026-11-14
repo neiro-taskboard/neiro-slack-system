@@ -32,6 +32,8 @@ Covered:
   10. dry-run appends nothing and does not update last-run
   11. CLI end-to-end with a fake slackcli: resolves and exits 0,
       gated second run exits 0 without calling slackcli again
+  15. whitespace-only text is treated as no-text: closed as
+      closed_no_text, never a grouping key (Yama's note 2026-11-14)
 """
 import importlib.util
 import json
@@ -142,6 +144,29 @@ def test_no_text_closed_without_read():
           and len(out["closed_no_text"]) == 1
           and out["closed_no_text"][0]["count"] == 1
           and calls == [], str(out))
+
+
+def test_whitespace_only_text_treated_as_no_text():
+    mod = load_mod()
+    calls = []
+
+    def reader(channel, thread_ts, oldest):
+        calls.append((channel, thread_ts))
+        return [], SELF
+
+    # 半角スペースだけの文面（Yamaさんの指摘 2026-11-14）：not text では
+    # 弾かれず、(channel, thread_ts, " ") のキーになりうる。strip して
+    # 判定し、文面なし扱いで closed_no_text に入れる。
+    out = mod.reconcile([amb(text="   ")], reader)
+    check("whitespace-only text treated as no-text, closed without read",
+          out["resolved"] == [] and out["targets"] == 0
+          and out["skipped_no_text"] == 0
+          and len(out["closed_no_text"]) == 1
+          and out["closed_no_text"][0]["count"] == 1
+          and calls == [], str(out))
+    targets, _used = mod.build_targets([amb(text=" ")])
+    check("whitespace-only text makes no target",
+          targets == [], str(targets))
 
 
 def test_no_text_already_closed_not_reclosed():
@@ -350,6 +375,7 @@ def main():
     test_other_user_identical_text_no_resolve()
     test_reply_before_parent_no_resolve()
     test_no_text_closed_without_read()
+    test_whitespace_only_text_treated_as_no_text()
     test_no_text_already_closed_not_reclosed()
     test_no_text_after_close_forms_new_group()
     test_append_closed_no_text_roundtrip()
