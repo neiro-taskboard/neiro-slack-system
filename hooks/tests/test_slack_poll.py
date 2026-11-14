@@ -39,6 +39,11 @@ Covered:
      first wake is left alone (no attempt burned, no dead-letter, no
      re-wake); past the grace the normal retry/dead clock resumes.
      failed has no grace (the worker did start).
+ 13. fastpath reclaim (2026-11-14): with SLACK_POLL_FASTPATH=1, a
+     processing event older than FASTPATH_RECLAIM_SECS (default 120s)
+     is handed to the cron sweeper even inside the start grace, with a
+     fastpath_reclaim annotation; attempts and first_wake_at are left
+     untouched. Without the env var the grace behaviour is unchanged.
 """
 import json
 import os
@@ -457,6 +462,60 @@ def test_parallel_claims_single_flight():
     check("parallel claims -> attempts stays 1", rec["attempts"] == 1, rec)
 
 
+def test_fastpath_reclaims_processing_within_grace():
+    # 高速スイープの取り戻し（2026-11-14）：SLACK_POLL_FASTPATH=1 のとき、
+    # 起動猶予の内側でも processing の経過が FASTPATH_RECLAIM_SECS
+    # （デフォルト120秒）を超えたイベントをスイープ側が引き取る。
+    # attempts と first_wake_at は触らない（会計はフック側）。
+    now = datetime.now(timezone.utc)
+    seed = {"status": "processing", "attempts": 1,
+            "updated_at": now_iso(now - timedelta(seconds=300)),
+            "first_wake_at": now_iso(now - timedelta(minutes=30)),
+            "last_error": ""}
+
+    env = Env()
+    env.env["SLACK_POLL_FASTPATH"] = "1"
+    ev = make_event()
+    env.write_inbox([ev])
+    env.write_state([dict(seed, event_id=eid(ev))])
+    out = env.run()
+    check("fastpath reclaim -> wake", out["decision"] == "wake", out)
+    due = out["payload"]["events"]
+    check("fastpath reclaim -> event carries annotation",
+          len(due) == 1 and isinstance(due[0].get("fastpath_reclaim"), dict),
+          due)
+    age = (due[0].get("fastpath_reclaim") or {}).get("processing_age_secs", 0)
+    check("fastpath reclaim -> age is the seeded ~300s", 290 <= age <= 320, age)
+    rec = env.read_state()[eid(ev)]
+    check("fastpath reclaim -> attempts & first_wake untouched",
+          rec["attempts"] == 1
+          and rec["first_wake_at"] == seed["first_wake_at"]
+          and rec["status"] == "processing", rec)
+    check("fastpath reclaim -> updated_at advanced",
+          rec["updated_at"] != seed["updated_at"], rec)
+    out2 = env.run()
+    check("fastpath reclaim -> immediate re-poll is silent",
+          out2["decision"] == "silent", out2)
+
+    # しきい値未満（60秒）は取り戻さない。
+    env2 = Env()
+    env2.env["SLACK_POLL_FASTPATH"] = "1"
+    env2.write_inbox([ev])
+    env2.write_state([dict(seed, event_id=eid(ev),
+                           updated_at=now_iso(now - timedelta(seconds=60)))])
+    out3 = env2.run()
+    check("fastpath below threshold -> silent",
+          out3["decision"] == "silent", out3)
+
+    # 環境変数なし（フック側）では同じ種でも従来通り猶予で silent。
+    env3 = Env()
+    env3.write_inbox([ev])
+    env3.write_state([dict(seed, event_id=eid(ev))])
+    out4 = env3.run()
+    check("no fastpath env -> grace still applies (silent)",
+          out4["decision"] == "silent", out4)
+
+
 def main():
     global FAIL
     tests = [test_new_event_wakes_once,
@@ -469,6 +528,7 @@ def main():
              test_waiting_boundary_24h,
              test_waiting_rewake_annotates_resend,
              test_start_grace_does_not_burn_attempts,
+             test_fastpath_reclaims_processing_within_grace,
              test_parallel_claims_single_flight]
     for t in tests:
         try:

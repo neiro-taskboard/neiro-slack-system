@@ -72,6 +72,17 @@ TIMEOUT_SECS = 600  # 10 minutes: a "processing" event older than this is retrie
 # 最大で猶予＋30分（3回×10分）まで遅くなる。failed（ワーカーが起動して
 # 失敗を報告した分）には猶予は適用しないので、そちらの検知は従来通り。
 START_GRACE_SECS = 3 * 3600  # 3 hours
+# 高速スイープ（cron slack-fastpath）専用の取り戻し（2026-11-14 追加）。
+# 猶予と TIMEOUT は「wake されたワーカーの起動が遅い」ことを前提にした
+# 保護だが、スイープ側はポーリングを実行しているエージェント自身が
+# そのまま処理するので、起動遅延を待つ理由がない。SLACK_POLL_FASTPATH=1
+# のときだけ、processing のままこの秒数を超えたイベントをスイープ側が
+# 引き取って即処理する（payload に fastpath_reclaim を付けて渡す）。
+# attempts と first_wake_at は触らない：リトライ／dead の会計は従来通り
+# フック側が持ち、遅れて起動した元のワーカーとの競合は送信前チェック
+# （slack-send-once.sh）が受ける。フック側の挙動は一切変えない。
+FASTPATH_RECLAIM_SECS = int(os.environ.get(
+    "SLACK_POLL_FASTPATH_RECLAIM_SECS", "120"))
 # DLQ再送の改訂案（2026-11-13、Yama・Yanayana・Neiroで合意）。
 WAIT_WINDOW_SECS = 24 * 3600  # pre-check失敗から再送を諦めるまでの窓（起点は最初の失敗時刻）
 WAIT_WAKE_INTERVAL_SECS = 3600  # waiting の再 wake 間隔（毎時の定期照合に合わせる）
@@ -190,6 +201,7 @@ def append_dead(ev, rec, dry_run):
 
 def main():
     dry_run = os.environ.get("SLACK_POLL_DRY_RUN") == "1"
+    fastpath = os.environ.get("SLACK_POLL_FASTPATH") == "1"
     inbox = []
     inbox_skipped = 0
     if os.path.exists(INBOX):
@@ -277,6 +289,21 @@ def main():
             continue
         attempts = int(rec.get("attempts", 0))
         updated = parse_iso(rec.get("updated_at"))
+        if fastpath and status == "processing":
+            # 高速スイープの取り戻し：起動猶予の内側でも、processing の
+            # 経過がしきい値を超えていたらスイープ側が即処理する。
+            # 状態は processing のまま updated_at だけ進める（次回の
+            # 取り戻しはそこから FASTPATH_RECLAIM_SECS 後）。
+            age_secs = (now - updated).total_seconds()
+            if age_secs > FASTPATH_RECLAIM_SECS:
+                rec["updated_at"] = now_iso()
+                reclaim_ev = dict(ev)
+                reclaim_ev["fastpath_reclaim"] = {
+                    "processing_age_secs": int(age_secs),
+                }
+                due.append(reclaim_ev)
+                changed = True
+            continue
         stale = (now - updated) > timedelta(seconds=TIMEOUT_SECS)
         if status == "pending" or stale:
             if status == "processing":
