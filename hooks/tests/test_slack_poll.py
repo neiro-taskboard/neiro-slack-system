@@ -13,8 +13,11 @@ Covered:
   1. new event -> wake, attempts=1, status=processing
   2. re-poll inside the timeout -> silent (no double wake)
   3. stale processing -> one re-wake, attempts +1 exactly once
-     (the claim consumes the attempt; the sweep itself burns none)
+     (the claim consumes the attempt; the sweep itself burns none).
+     Seeded first_wake_at is older than the start grace, so the retry
+     path is exercised.
   4. stale processing at MAX_ATTEMPTS -> dead + dead-letter line
+     (first_wake_at older than the start grace, as in 3)
   5. failed (stale) -> retry; failed at MAX_ATTEMPTS -> dead
   6. done -> silent, never re-woken
   7. malformed inbox lines are skipped
@@ -30,6 +33,10 @@ Covered:
      (first_wait_at + JST + prefix) for the "遅れての再送" prefix;
      new events don't. prefix はコード側で固定した
      「遅れての再送（最初の試行：YYYY-MM-DD HH:MM JST）」（2026-11-14 の3者合意）
+ 12. start grace (2026-11-14): a stale processing event within 3h of its
+     first wake is left alone (no attempt burned, no dead-letter, no
+     re-wake); past the grace the normal retry/dead clock resumes.
+     failed has no grace (the worker did start).
 """
 import json
 import os
@@ -143,6 +150,8 @@ def test_new_event_wakes_once():
     rec = env.read_state()[eid(ev)]
     check("new event -> attempts=1, processing",
           rec["attempts"] == 1 and rec["status"] == "processing", rec)
+    check("new event -> first_wake_at recorded",
+          bool(rec.get("first_wake_at")), rec)
     out2 = env.run()
     check("re-poll inside timeout -> silent (no double wake)",
           out2["decision"] == "silent", out2)
@@ -154,9 +163,12 @@ def test_stale_processing_rewakes_once():
     env = Env()
     ev = make_event()
     old = datetime.now(timezone.utc) - timedelta(seconds=TIMEOUT_SECS + 60)
+    # first_wake_at is older than the 3h start grace, so the retry path applies.
+    first = datetime.now(timezone.utc) - timedelta(hours=4)
     env.write_inbox([ev])
     env.write_state([{"event_id": eid(ev), "status": "processing",
                       "attempts": 1, "updated_at": now_iso(old),
+                      "first_wake_at": now_iso(first),
                       "last_error": ""}])
     out = env.run()
     check("stale processing -> wake", out["decision"] == "wake", out)
@@ -169,9 +181,12 @@ def test_stale_at_max_attempts_dead():
     env = Env()
     ev = make_event()
     old = datetime.now(timezone.utc) - timedelta(seconds=TIMEOUT_SECS + 60)
+    # first_wake_at is older than the 3h start grace, so the dead path applies.
+    first = datetime.now(timezone.utc) - timedelta(hours=4)
     env.write_inbox([ev])
     env.write_state([{"event_id": eid(ev), "status": "processing",
                       "attempts": 3, "updated_at": now_iso(old),
+                      "first_wake_at": now_iso(first),
                       "last_error": ""}])
     out = env.run()
     check("stale at max attempts -> reported as dead-letter wake, no event",
@@ -351,6 +366,81 @@ def test_waiting_rewake_annotates_resend():
           rec.get("attempts") == 1, rec)
 
 
+def test_start_grace_does_not_burn_attempts():
+    # 起動猶予（2026-11-14）：最初の wake から3時間の間は、ワーカーがまだ
+    # 起動していなくても試行回数を消費しない。実測の根拠：dead-letter 165件
+    # 全件がイベント発生から 30〜37分で dead 化し、そのうち 116件は遅れて
+    # 起動したワーカーが後に done にしていた。
+    env = Env()
+    ev = make_event()
+    now = datetime.now(timezone.utc)
+    stale = now - timedelta(seconds=TIMEOUT_SECS + 60)
+
+    # 30分前に最初の wake：猶予内なので何もしない（silent、試行そのまま）。
+    env.write_inbox([ev])
+    env.write_state([{"event_id": eid(ev), "status": "processing",
+                      "attempts": 1, "updated_at": now_iso(stale),
+                      "first_wake_at": now_iso(now - timedelta(minutes=30)),
+                      "last_error": ""}])
+    out = env.run()
+    rec = env.read_state()[eid(ev)]
+    check("grace 30m -> silent, attempts untouched",
+          out["decision"] == "silent" and rec["attempts"] == 1
+          and rec["status"] == "processing", rec)
+    check("grace 30m -> no dead-letter line",
+          len(env.read_dead()) == 0, env.read_dead())
+
+    # 2時間59分前でもまだ猶予内。
+    env.write_state([{"event_id": eid(ev), "status": "processing",
+                      "attempts": 1, "updated_at": now_iso(stale),
+                      "first_wake_at": now_iso(now - timedelta(hours=2, minutes=59)),
+                      "last_error": ""}])
+    out2 = env.run()
+    rec2 = env.read_state()[eid(ev)]
+    check("grace 2h59m -> silent, attempts untouched",
+          out2["decision"] == "silent" and rec2["attempts"] == 1, rec2)
+
+    # attempts=3 でも猶予内なら dead にしない。
+    env.write_state([{"event_id": eid(ev), "status": "processing",
+                      "attempts": 3, "updated_at": now_iso(stale),
+                      "first_wake_at": now_iso(now - timedelta(minutes=30)),
+                      "last_error": ""}])
+    out3 = env.run()
+    rec3 = env.read_state()[eid(ev)]
+    check("grace with attempts=3 -> still silent, not dead",
+          out3["decision"] == "silent" and rec3["status"] == "processing"
+          and len(env.read_dead()) == 0, rec3)
+
+    # 猶予を過ぎたら（3時間01分前）通常のリトライに戻る：attempts 1 -> 2。
+    env.write_state([{"event_id": eid(ev), "status": "processing",
+                      "attempts": 1, "updated_at": now_iso(stale),
+                      "first_wake_at": now_iso(now - timedelta(hours=3, minutes=1)),
+                      "last_error": ""}])
+    out4 = env.run()
+    rec4 = env.read_state()[eid(ev)]
+    check("past grace 3h01m -> retry, attempts 1 -> 2",
+          out4["decision"] == "wake" and rec4["attempts"] == 2, rec4)
+
+    # first_wake_at が無い古い記録は updated_at を代用する（移行期）。
+    env.write_state([{"event_id": eid(ev), "status": "processing",
+                      "attempts": 1, "updated_at": now_iso(stale),
+                      "last_error": ""}])
+    out5 = env.run()
+    rec5 = env.read_state()[eid(ev)]
+    check("legacy record without first_wake_at -> grace from updated_at",
+          out5["decision"] == "silent" and rec5["attempts"] == 1, rec5)
+
+    # failed には猶予は無い（ワーカーは起動して失敗を報告した）。
+    env.write_state([{"event_id": eid(ev), "status": "failed",
+                      "attempts": 2, "updated_at": now_iso(stale),
+                      "first_wake_at": now_iso(now - timedelta(minutes=30)),
+                      "last_error": "boom"}])
+    out6 = env.run()
+    rec6 = env.read_state()[eid(ev)]
+    check("failed inside grace -> retry anyway, attempts 2 -> 3",
+          out6["decision"] == "wake" and rec6["attempts"] == 3, rec6)
+
+
 def test_parallel_claims_single_flight():
     import concurrent.futures
     env = Env()
@@ -376,6 +466,7 @@ def main():
              test_skipped_lines_counted_snapshot,
              test_waiting_boundary_24h,
              test_waiting_rewake_annotates_resend,
+             test_start_grace_does_not_burn_attempts,
              test_parallel_claims_single_flight]
     for t in tests:
         try:

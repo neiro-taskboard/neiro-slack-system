@@ -10,10 +10,14 @@ State file (JSONL, one object per line):
 
 Rules:
 - New event (not in state)            -> mark processing, attempts=1, wake it.
-- processing older than TIMEOUT_SECS  -> retry if attempts < MAX_ATTEMPTS
-                                          (mark processing, attempts+1, wake it);
-                                          else mark dead, append to dead-letter file.
-- failed (worker reported failure)     -> same retry/dead handling as stale processing.
+  The first wake time is recorded (first_wake_at).
+- processing older than TIMEOUT_SECS  -> within START_GRACE_SECS of the first
+  wake, the worker may not have started yet: do nothing (no attempt burned,
+  no re-wake, no dead). After the grace, retry if attempts < MAX_ATTEMPTS
+  (mark processing, attempts+1, wake it); else mark dead, append to
+  dead-letter file.
+- failed (worker reported failure)     -> same retry/dead handling as stale
+  processing, but with no start grace (the worker did start).
 - done / dead                          -> skip.
 - waiting (pre-check failure only)     -> DLQ再送の改訂案（2026-11-13、Yama・
   Yanayana・Neiroで合意）。送信前の履歴取得が読めなかった分は投稿の失敗
@@ -54,6 +58,17 @@ STATS_FILE = os.environ.get("SLACK_POLLER_STATS_FILE",
 # behaviour is unchanged.
 MAX_ATTEMPTS = 3
 TIMEOUT_SECS = 600  # 10 minutes: a "processing" event older than this is retried
+# ワーカーの起動猶予（2026-11-14 追加）：最初の wake からこの時間は、
+# ワーカーがまだ起動していなくても試行回数を消費しない。最初の wake は
+# 既に届いているので、この間は起こし直しもしない。
+# 根拠（実測）：dead-letter 165件全件がイベント発生から 30〜37分で dead 化
+# （3回×10分の時計だけの判定）し、そのうち 116件は遅れて起動したワーカーが
+# 後に done にしていた。つまり dead の大半は誤判定で、ワーカーの起動遅延は
+# 実測 40分〜2時間ある。猶予はその実測の上に余裕を取って 3時間。
+# 代償：本当に起動したワーカーが応答しない（クラッシュ等）場合の検知が
+# 最大で猶予＋30分（3回×10分）まで遅くなる。failed（ワーカーが起動して
+# 失敗を報告した分）には猶予は適用しないので、そちらの検知は従来通り。
+START_GRACE_SECS = 3 * 3600  # 3 hours
 # DLQ再送の改訂案（2026-11-13、Yama・Yanayana・Neiroで合意）。
 WAIT_WINDOW_SECS = 24 * 3600  # pre-check失敗から再送を諦めるまでの窓（起点は最初の失敗時刻）
 WAIT_WAKE_INTERVAL_SECS = 3600  # waiting の再 wake 間隔（毎時の定期照合に合わせる）
@@ -197,7 +212,8 @@ def main():
         if rec is None:
             # New event: first attempt.
             rec = {"event_id": eid, "status": "processing",
-                   "attempts": 1, "updated_at": now_iso(), "last_error": ""}
+                   "attempts": 1, "updated_at": now_iso(), "last_error": "",
+                   "first_wake_at": now_iso()}
             state[eid] = rec
             due.append(ev)
             changed = True
@@ -256,6 +272,18 @@ def main():
         updated = parse_iso(rec.get("updated_at"))
         stale = (now - updated) > timedelta(seconds=TIMEOUT_SECS)
         if status == "pending" or stale:
+            if status == "processing":
+                # 起動猶予：最初の wake から START_GRACE_SECS の間は、ワーカーが
+                # まだ起動していない可能性があるので試行回数を消費しない。
+                # 最初の wake は既に届いているので起こし直しもしない。
+                # 猶予を過ぎたら通常のリトライ／dead 判定へ。
+                # first_wake_at が無い古い記録は updated_at を代用する
+                # （移行期の処理中イベントも猶予の対象にするため）。
+                first_wake = parse_iso(rec.get("first_wake_at"))
+                if first_wake == datetime.min.replace(tzinfo=timezone.utc):
+                    first_wake = updated
+                if now < first_wake + timedelta(seconds=START_GRACE_SECS):
+                    continue
             if attempts < MAX_ATTEMPTS:
                 rec["status"] = "processing"
                 rec["attempts"] = attempts + 1

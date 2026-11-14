@@ -102,11 +102,13 @@ class PollTest(unittest.TestCase):
         self.assertEqual(out["decision"], "silent")
 
     # 4. stale processing (attempts<3) -> attempts+1 で再 wake
+    #    first_wake_at は起動猶予（3時間）を過ぎているのでリトライ経路。
     def test_stale_processing_retried(self):
         self.write_inbox([self.ev()])
         self.write_state([{"event_id": "T0CGV6V7161:C0CGYGT9V7G:1794476000.000001",
                            "status": "processing", "attempts": 1,
-                           "updated_at": iso(self.now - timedelta(minutes=20))}])
+                           "updated_at": iso(self.now - timedelta(minutes=20)),
+                           "first_wake_at": iso(self.now - timedelta(hours=4))}])
         out = self.run_main()
         self.assertEqual(out["decision"], "wake")
         st = self.load_state()
@@ -115,11 +117,13 @@ class PollTest(unittest.TestCase):
         self.assertEqual(rec["attempts"], 2)
 
     # 5. stale processing (attempts>=3) -> dead + デッドレター
+    #    first_wake_at は起動猶予（3時間）を過ぎているので dead 経路。
     def test_stale_processing_dead_after_max(self):
         self.write_inbox([self.ev()])
         self.write_state([{"event_id": "T0CGV6V7161:C0CGYGT9V7G:1794476000.000001",
                            "status": "processing", "attempts": 3,
-                           "updated_at": iso(self.now - timedelta(minutes=20))}])
+                           "updated_at": iso(self.now - timedelta(minutes=20)),
+                           "first_wake_at": iso(self.now - timedelta(hours=4))}])
         out = self.run_main()
         self.assertEqual(out["decision"], "wake")
         self.assertEqual(len(out["payload"]["dead_letter"]), 1)
@@ -173,6 +177,32 @@ class PollTest(unittest.TestCase):
     def test_event_id_format(self):
         ev = {"workspace_id": "W1", "channel": "C1", "ts": "123.456"}
         self.assertEqual(self.mod.event_id(ev), "W1:C1:123.456")
+
+    # 11. 起動猶予（2026-11-14）：最初の wake から3時間の間は、stale でも
+    #     試行回数を消費せず dead にもしない（ワーカーがまだ起動していない
+    #     可能性があるため）。猶予内なら attempts=3 でも dead にならない。
+    def test_start_grace_leaves_stale_processing_alone(self):
+        self.write_inbox([self.ev()])
+        self.write_state([{"event_id": "T0CGV6V7161:C0CGYGT9V7G:1794476000.000001",
+                           "status": "processing", "attempts": 1,
+                           "updated_at": iso(self.now - timedelta(minutes=20)),
+                           "first_wake_at": iso(self.now - timedelta(minutes=30))}])
+        out = self.run_main()
+        self.assertEqual(out["decision"], "silent")
+        st = self.load_state()
+        rec = st["T0CGV6V7161:C0CGYGT9V7G:1794476000.000001"]
+        self.assertEqual(rec["attempts"], 1)
+        self.assertEqual(rec["status"], "processing")
+        # attempts=3 でも猶予内なら dead にしない。
+        self.write_state([{"event_id": "T0CGV6V7161:C0CGYGT9V7G:1794476000.000001",
+                           "status": "processing", "attempts": 3,
+                           "updated_at": iso(self.now - timedelta(minutes=20)),
+                           "first_wake_at": iso(self.now - timedelta(minutes=30))}])
+        out2 = self.run_main()
+        self.assertEqual(out2["decision"], "silent")
+        st2 = self.load_state()
+        self.assertEqual(st2["T0CGV6V7161:C0CGYGT9V7G:1794476000.000001"]["status"],
+                         "processing")
 
 
 if __name__ == "__main__":
