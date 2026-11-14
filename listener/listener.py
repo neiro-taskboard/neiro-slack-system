@@ -13,6 +13,11 @@ Tokens:
 - Bot tokens (xoxb) are read from slackcli's own credential store
   (~/.config/slackcli/workspaces.json) at startup, so they are not
   duplicated anywhere.
+- User tokens (xoxp, optional per workspace via "slackcli_user_key")
+  are also read from slackcli's store. When present, DM events are
+  tagged with "identity": "user" if the DM channel belongs to the
+  user account's DM list, so the worker knows to read/reply as the
+  user account rather than the bot. Events default to "bot".
 """
 
 import json
@@ -50,6 +55,23 @@ def load_json(path):
         return json.load(f)
 
 
+def fetch_im_channels(web):
+    """Return {DM channel ID: other party's user ID} for a token."""
+    out = {}
+    cursor = None
+    try:
+        while True:
+            r = web.conversations_list(types="im", limit=200, cursor=cursor)
+            for ch in r.get("channels", []):
+                out[ch["id"]] = ch.get("user", "")
+            cursor = (r.get("response_metadata") or {}).get("next_cursor")
+            if not cursor:
+                break
+    except Exception:
+        log.exception("conversations_list(im) failed")
+    return out
+
+
 def append_event(config, event):
     """Append one event JSON object to the inbox file (atomic-ish)."""
     line = json.dumps(event, ensure_ascii=False)
@@ -69,21 +91,66 @@ def write_heartbeat(config, status):
         json.dump(hb, f, ensure_ascii=False)
 
 
-def make_handler(config, ws, bot_user_id, web):
+def make_handler(config, ws, bot_user_id, web, im_state=None):
+    def resolve_identity(channel):
+        """Which identity a DM channel belongs to: "user" or "bot".
+
+        The DM between the user account and the bot itself appears in
+        both identities' DM lists; it counts as "bot" (that is the
+        operator talking to the bot). Any other DM in the user
+        account's list counts as "user". Uses cached DM maps; on a
+        miss, refreshes both maps once (a brand-new DM channel will
+        not be cached yet). Defaults to "bot".
+        """
+        if not im_state or im_state.get("user_web") is None:
+            return "bot"
+
+        def classify():
+            if channel in im_state["bot"]:
+                return "bot"
+            if channel in im_state["user"]:
+                if im_state["user"][channel] == bot_user_id:
+                    return "bot"
+                return "user"
+            return None
+
+        result = classify()
+        if result is not None:
+            return result
+        im_state["bot"] = fetch_im_channels(im_state["bot_web"])
+        im_state["user"] = fetch_im_channels(im_state["user_web"])
+        return classify() or "bot"
+
     def handler(client: SocketModeClient, req: SocketModeRequest):
         try:
             if req.type == "events_api":
                 event = req.payload.get("event", {})
                 if event.get("type") == "message":
-                    # Ignore neiro's own messages. The `user` field is the
-                    # sender's user ID, and for bot messages it is the
-                    # bot's user ID, so this catches neiro's own posts
-                    # (both human-style and bot_message). Other bots'
-                    # posts (Yama, Yanayana) are accepted now: neiro can
-                    # see them and reply when addressed. Loop protection
-                    # lives in the worker prompt: it must not reply when
-                    # the last 3 messages in the thread are all from bots.
-                    if event.get("user") == bot_user_id:
+                    # Ignore neiro's own messages. For bot-side events the
+                    # sender to skip is the bot's user ID; for DMs that
+                    # belong to the user account, skip posts by the user
+                    # account itself (those are neiro's own replies sent
+                    # with the user token). Other bots' posts (Yama,
+                    # Yanayana) are accepted: neiro can see them and
+                    # reply when addressed.
+                    channel = event.get("channel", "")
+                    identity = "bot"
+                    if event.get("channel_type") == "im":
+                        identity = resolve_identity(channel)
+                    account_user_id = (
+                        im_state.get("account_user_id", "")
+                        if im_state
+                        else ""
+                    )
+                    own_post = (
+                        event.get("user") == bot_user_id
+                        or (
+                            identity == "user"
+                            and account_user_id
+                            and event.get("user") == account_user_id
+                        )
+                    )
+                    if own_post:
                         pass
                     elif event.get("subtype") in (
                         "message_changed",
@@ -94,8 +161,8 @@ def make_handler(config, ws, bot_user_id, web):
                         pass
                     else:
                         text = event.get("text", "")
-                        channel = event.get("channel", "")
                         # Resolve a permalink for convenience (best effort).
+                        # Uses the bot client; fails quietly for user DMs.
                         permalink = ""
                         try:
                             r = web.chat_getPermalink(
@@ -108,6 +175,7 @@ def make_handler(config, ws, bot_user_id, web):
                         ev = {
                             "workspace_id": ws["workspace_id"],
                             "workspace_name": ws["workspace_name"],
+                            "identity": identity,
                             "channel": channel,
                             "channel_type": event.get("channel_type", ""),
                             "user": event.get("user", ""),
@@ -154,12 +222,30 @@ def main():
         bot_token = entry["token"]
         bot_user_id = entry.get("user_id", "")
         web = WebClient(token=bot_token)
+        im_state = None
+        user_key = ws.get("slackcli_user_key")
+        user_entry = store["workspaces"].get(user_key) if user_key else None
+        if user_entry:
+            user_web = WebClient(token=user_entry["token"])
+            im_state = {
+                "bot_web": web,
+                "user_web": user_web,
+                "account_user_id": user_entry.get("user_id", ""),
+                "bot": fetch_im_channels(web),
+                "user": fetch_im_channels(user_web),
+            }
+            log.info(
+                "user DM tagging enabled for %s (%d user DMs, %d bot DMs)",
+                ws["workspace_name"],
+                len(im_state["user"]),
+                len(im_state["bot"]),
+            )
         client = SocketModeClient(
             app_token=ws["app_token"],
             web_client=web,
         )
         client.socket_mode_request_listeners.append(
-            make_handler(config, ws, bot_user_id, web)
+            make_handler(config, ws, bot_user_id, web, im_state)
         )
         clients.append((ws, client))
         status["workspaces"][ws["workspace_id"]] = "connecting"
