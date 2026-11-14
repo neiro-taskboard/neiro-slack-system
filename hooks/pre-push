@@ -34,11 +34,15 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   [ -n "$bad_mail" ] && note "non-noreply email in commits being pushed: $bad_mail"
 
   # Secret and personal-info patterns in file contents (all pushed commits).
-  # Placeholder tokens are allowlisted: a dummy like xoxb-REPLACE-ME in a
-  # config.example.json would otherwise trip this very check and block its
-  # own commit (same trap Yanayana hit 2026-11-14 -- a detection pattern
-  # matching its own placeholder). Real-looking tokens still block.
-  hits=$(git grep -nIE 'xox[baprs]-[A-Za-z0-9-]{10,}|xapp-[A-Za-z0-9-]{10,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|BEGIN [A-Z ]*PRIVATE KEY|AKIA[0-9A-Z]{16}' $commits -- . 2>/dev/null | grep -v 'REPLACE-ME' | head -5)
+  # Placeholder tokens are allowlisted by TOKEN STRING, not by line:
+  # the literal string REPLACE-ME is stripped from each matching line and
+  # the pattern is re-checked, so a dummy like xoxb-REPLACE-ME passes but
+  # a real token on the same line still blocks. (Line-wide grep -v, used
+  # in commit 22a12ba, had exactly that hole -- pointed out by Yama
+  # 2026-11-14: a real token sharing a line with REPLACE-ME slipped
+  # through. The same stripping also keeps this file's own comment,
+  # which mentions the dummy, from tripping the check.)
+  hits=$(git grep -nIE 'xox[baprs]-[A-Za-z0-9-]{10,}|xapp-[A-Za-z0-9-]{10,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|BEGIN [A-Z ]*PRIVATE KEY|AKIA[0-9A-Z]{16}' $commits -- . 2>/dev/null | sed 's/REPLACE-ME//g' | grep -E 'xox[baprs]-[A-Za-z0-9-]{10,}|xapp-[A-Za-z0-9-]{10,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|BEGIN [A-Z ]*PRIVATE KEY|AKIA[0-9A-Z]{16}' | head -5)
   [ -n "$hits" ] && note "possible secret found:\n$hits"
 
   # Real names: read from .git/hooks/pre-push-names (one per line, fixed
