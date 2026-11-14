@@ -160,6 +160,29 @@
 #       （Ev…の形）とは中身が違うが、元のイベントを一意に指す点では
 #       同じ役割、という整理で三者合意済み）。
 #
+#   13. 別の event_id の投稿を文面照合の候補から外すガード（2026-11-15、
+#       muse取締役会 #slack-へようこそ 1794621025.648949 で約束して実装）。
+#       設計上は「別の event_id が付いた投稿は文面が一致しても候補から
+#       外す」だったが、実装が追いついておらず、台帳照合は別の event_id
+#       の記録でも文面一致で拾い、スレッドの文面チェックは slackcli
+#       経由で metadata が返ってこないため印の違いが見えていなかった。
+#       台帳側：記録の印（event_id / request_id）と現在の送信の印が
+#       両方あって違う場合は、その記録を文面一致の候補から外す。印の
+#       ない記録・印のない送信は従来どおり文面で拾う（Yanayana さんへの
+#       回答と一致）。
+#       スレッド側：印付きの送信の文面チェックは、slack-read-metadata.py
+#       --dump（include_all_metadata 付き）で読み直し、自分の投稿のうち
+#       印が現在の送信と違うものを文面一致の候補から外す。印のない投稿は
+#       従来どおり文面で拾う。印のない送信の文面チェックは従来の
+#       slackcli 経由のまま（印の比較対象がないため）。
+#       他者の同一文面チェック（exit 4）は対象外：他者の投稿の印は別
+#       ボットのもので、parroting 防止の意味が変わってしまうため。
+#       チャンネル側の窓・bounded チェックも対象外（今回の約束は
+#       スレッド側のみ。チャンネル側も同じ穴はあるが、別途検討）。
+#       読み取り失敗時は従来どおり文面照合へ進み、そこで読めなければ
+#       fail-closed で送らない（Yanayana さんの「metadata を単一障害点に
+#       しない」使い分けと同じ）。
+#
 # 使い方:
 #   slack-send-once.sh --channel C0CGYGT9V7G --message '...' [--workspace muse-board]
 #   slack-send-once.sh --permalink <url> --message '...' [--workspace muse-board]
@@ -513,6 +536,21 @@ with f:
         if request_id and rec.get('request_id') == request_id:
             found = rec.get('ts')
             break
+        # 別のイベントの記録は文面一致の候補から外す（2026-11-15、ヘッダーの 13）。
+        # 記録の印と現在の送信の印が両方あって違う場合だけ外す（印の一致
+        # は上の分岐で既に拾っているので、ここに来るのは違う印か印なし）。
+        # 印のない記録・印のない送信は従来どおり文面で拾う。
+        if event_id or request_id:
+            rec_mark = None
+            if rec.get('event_id'):
+                rec_mark = ('event_id', str(rec['event_id']))
+            elif rec.get('request_id'):
+                rec_mark = ('request_id', str(rec['request_id']))
+            if rec_mark is not None:
+                cur_mark = (('event_id', event_id) if event_id
+                            else ('request_id', request_id))
+                if rec_mark != cur_mark:
+                    continue
         if _norm(rec.get('text') or '') == target:
             found = rec.get('ts')
             break
@@ -619,12 +657,77 @@ sys.exit(1)
   return 2
 }
 
+# スレッド返信の自分の同一文面チェック（印付きの送信のみ）。
+#   0 = 見つかった（その ts を出す）、1 = なし、2 = 履歴が読めなかった。
+# slack-read-metadata.py --dump（include_all_metadata 付き）で読み直し、
+# 自分の投稿のうち印（event_id / request_id）が現在の送信と違うものを
+# 文面一致の候補から外す（2026-11-15、ヘッダーの 13）。印のない投稿は
+# 従来どおり文面で拾う。--dump は1ページで親＋直近100件を返す
+# （conversations.replies の実測）ので、従来の窓（直近100件）と同じ。
+# 読み取り失敗時は最大5回リトライし、それでも読めなければ cannot-verify
+# （check_duplicate_thread と同じ間隔・回数）。
+check_duplicate_thread_marked() {
+  local attempt=0 raw found rc
+  local dump_args
+  while [ "$attempt" -lt "$HISTORY_ATTEMPTS" ]; do
+    attempt=$((attempt + 1))
+    dump_args=(--channel "$CHANNEL" --thread-ts "$THREAD_TS" --dump)
+    if [ -n "$WORKSPACE" ]; then dump_args+=(--workspace "$WORKSPACE"); fi
+    raw=$(python3 "$READ_META" "${dump_args[@]}" 2>/dev/null || true)
+    found=$(printf '%s' "$raw" | python3 -c "
+import sys, json, re
+raw = sys.stdin.read()
+try:
+    d = json.loads(raw)
+except Exception:
+    sys.exit(2)
+if not d.get('ok'):
+    sys.exit(2)
+_RESEND_HEAD = re.compile(r'^遅れての再送（(?:元の失敗時刻|最初の試行)：\d{4}-\d{2}-\d{2} \d{2}:\d{2} JST）\n(?=.)')
+def _norm_resend(t):
+    return _RESEND_HEAD.sub('', t.strip(), count=1)
+target = _norm_resend(open('$TMP_MSG', encoding='utf-8').read())
+if '$EVENT_ID':
+    cur_mark = ('event_id', '$EVENT_ID')
+else:
+    cur_mark = ('request_id', '$REQUEST_ID')
+for m in d.get('messages', []):
+    if m.get('user') != '$SELF_ID':
+        continue
+    mark = m.get('mark')
+    if mark is not None and (mark.get('kind'), mark.get('value')) != cur_mark:
+        continue
+    if _norm_resend(m.get('text') or '') == target:
+        print('FOUND ' + str(m.get('ts', '')))
+        sys.exit(0)
+sys.exit(1)
+" 2>/dev/null)
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+      echo "duplicate found: ${found#FOUND }"
+      CHECK_VIA="thread-bounded"
+      FOUND_TS="${found#FOUND }"
+      return 0
+    elif [ "$rc" -eq 1 ]; then
+      return 1
+    fi
+    # rc == 2: 読めなかった。指数バックオフで再試行（他と同じ間隔）。
+    if [ "$attempt" -lt "$HISTORY_ATTEMPTS" ]; then sleep $((1 << (attempt - 1))); fi
+  done
+  return 2
+}
+
 # スレッド返信の自分の同一文面チェック（直近 THREAD_CHECK_N 件）。
 #   0 = 見つかった（その ts を出す）、1 = なし、2 = 履歴が読めなかった。
 # --oldest を付けず --limit THREAD_CHECK_N で読むと「親＋直近N件」が
 # 1回で取れる（実スレッド検証済み）。経緯と割り切りはヘッダーの 10。
 # 再送ヘッダーの同一視は窓チェックと共通（ヘッダーの 9）。
+# 印付きの送信は check_duplicate_thread_marked へ委譲する（ヘッダーの 13）。
 check_duplicate_thread() {
+  if [ -n "$EVENT_ID" ] || [ -n "$REQUEST_ID" ]; then
+    check_duplicate_thread_marked
+    return $?
+  fi
   local attempt=0 raw found rc
   while [ "$attempt" -lt "$HISTORY_ATTEMPTS" ]; do
     attempt=$((attempt + 1))

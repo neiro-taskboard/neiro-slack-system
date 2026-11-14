@@ -106,6 +106,15 @@ class ReadMetadataTest(unittest.TestCase):
             channel, **kw, token=token, urlopen=urlopen,
             sleep=lambda s: None)
 
+    def dump(self, **kw):
+        channel = kw.pop("channel", "C0CGYGT9V7G")
+        token = kw.pop("token", FAKE_TOKEN_BOARD)
+        urlopen = kw.pop("urlopen", None) or self.fake_urlopen(
+            kw.pop("bodies", [{"ok": True, "messages": []}]))
+        return self.mod.dump_messages(
+            channel, **kw, token=token, urlopen=urlopen,
+            sleep=lambda s: None)
+
     # 1. event_id 一致の投稿が見つかる（スレッド読み取り）
     def test_find_by_event_id_in_thread(self):
         bodies = [{"ok": True, "messages": [
@@ -244,6 +253,71 @@ class ReadMetadataTest(unittest.TestCase):
         out = json.loads(buf.getvalue())
         self.assertTrue(out["found"])
         self.assertEqual(out["ts"], "1794660000.000001")
+        self.assertNotIn(FAKE_TOKEN_BOARD, buf.getvalue())
+        self.assertNotIn(FAKE_TOKEN_DEFAULT, buf.getvalue())
+
+    # 12. dump は投稿一覧を印付きで返す（スレッド読み取り）
+    def test_dump_thread_returns_marks(self):
+        bodies = [{"ok": True, "messages": [
+            {"ts": "1794660000.000001", "user": "U0CH1B19D4J",
+             "text": "plain"},
+            marked_msg("1794660000.000002", "U0CH1B19D4J",
+                       event_id=EVENT_ID),
+            marked_msg("1794660000.000003", "U0CH1B19D4J",
+                       request_id=REQUEST_ID),
+            marked_msg("1794660000.000004", "U0CH1B19D4J",
+                       event_id=EVENT_ID, event_type="yama_reply"),
+        ]}]
+        out = self.dump(thread_ts="1794583788.831849", bodies=bodies)
+        self.assertEqual(out["checked"], 4)
+        msgs = out["messages"]
+        self.assertIsNone(msgs[0]["mark"])
+        self.assertEqual(msgs[1]["mark"],
+                         {"kind": "event_id", "value": EVENT_ID})
+        self.assertEqual(msgs[2]["mark"],
+                         {"kind": "request_id", "value": REQUEST_ID})
+        # event_type が違う印は印なし扱い
+        self.assertIsNone(msgs[3]["mark"])
+        req = self.calls[0]
+        self.assertIn("conversations.replies", req.full_url)
+        self.assertIn("include_all_metadata=true", req.full_url)
+        self.assertIn("ts=1794583788.831849", req.full_url)
+
+    # 13. dump はチャンネル読み取りでは conversations.history を使う
+    def test_dump_channel_uses_history(self):
+        out = self.dump(bodies=[{"ok": True, "messages": []}])
+        self.assertEqual(out["messages"], [])
+        self.assertEqual(out["checked"], 0)
+        self.assertIn("conversations.history", self.calls[0].full_url)
+
+    # 14. dump の読み取り失敗は RuntimeError
+    def test_dump_slack_error_raises(self):
+        with self.assertRaises(RuntimeError):
+            self.dump(bodies=[{"ok": False, "error": "channel_not_found"}])
+        self.assertEqual(len(self.calls), 1)
+
+    # 15. main --dump の出力にトークンは出ない
+    def test_main_dump_output_has_no_token(self):
+        orig = self.mod.dump_messages
+
+        def _dump(*a, **kw):
+            return {"messages": [{"ts": "1794660000.000001",
+                                  "user": "U0CH1B19D4J", "text": "hi",
+                                  "mark": None}], "checked": 1}
+
+        self.mod.dump_messages = _dump
+        try:
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                code = self.mod.main(["--channel", "C0CGYGT9V7G",
+                                      "--dump", "--workspace", "muse-board"])
+        finally:
+            self.mod.dump_messages = orig
+        self.assertEqual(code, 0)
+        out = json.loads(buf.getvalue())
+        self.assertTrue(out["ok"])
+        self.assertEqual(len(out["messages"]), 1)
+        self.assertEqual(out["checked"], 1)
         self.assertNotIn(FAKE_TOKEN_BOARD, buf.getvalue())
         self.assertNotIn(FAKE_TOKEN_DEFAULT, buf.getvalue())
 

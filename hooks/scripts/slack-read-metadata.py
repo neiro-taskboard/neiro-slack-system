@@ -27,6 +27,15 @@ Slack の event_id（Ev…の形）とは中身が違うが、元のイベント
   slack-read-metadata.py --channel C... [--thread-ts TS]
       [--workspace muse-board] (--event-id <ID> | --request-id <UUID>)
       [--self-id U...] [--limit 100]
+  slack-read-metadata.py --channel C... [--thread-ts TS]
+      [--workspace muse-board] --dump [--limit 100]
+      # --dump: 印付きの投稿一覧を出す（文面照合のガード用、2026-11-15）。
+      # slackcli の読み取りでは metadata が返ってこないので、印の違いが
+      # 見えない。--dump は各投稿に印（event_id / request_id、無ければ
+      # null）を付けて返す。スレッド指定時は conversations.replies
+      # （親＋直近 limit 件が1ページで取れる）、未指定時は
+      # conversations.history。ページングはしない（文面照合の窓は
+      # 直近100件、という slack-send-once.sh の割り切りと同じ）。
 
 出力: JSON 1行 {"ok": true, "found": true/false, "ts": ...,
                 "checked": <見た件数>}。
@@ -225,6 +234,54 @@ def find_by_metadata(channel, thread_ts=None, event_id=None, request_id=None,
     return {"found": False, "ts": None, "checked": checked}
 
 
+def dump_messages(channel, thread_ts=None, workspace=None, limit=100,
+                  token=None, urlopen=urllib.request.urlopen,
+                  sleep=time.sleep):
+    """include_all_metadata 付きで読んだ投稿の一覧を返す。
+
+    文面照合のガード用（2026-11-15、muse取締役会 #slack-へようこそ
+    1794621025.648949 で約束）。slackcli の conversations read では
+    metadata が返ってこないので、印の違いが見えない。こちらは直接 API
+    を叩き、投稿ごとに印（event_id / request_id、無ければ None）を
+    付けて返す。呼び出し側（slack-send-once.sh のスレッド文面チェック）
+    は、現在の送信と違う印の付いた自分の投稿を、文面一致の候補から
+    外す。印のない投稿は従来どおり文面で拾う。
+
+    スレッド指定時は conversations.replies、未指定時は
+    conversations.history。1ページだけ読む（replies は親＋直近 limit
+    件が1ページで取れる。文面照合の窓は直近100件、という
+    slack-send-once.sh の割り切りと同じで、それより古い投稿は
+    文面照合の対象外）。読めなければ RuntimeError。
+    """
+    if token is None:
+        token = resolve_token(workspace)
+    if not token:
+        raise RuntimeError("token_not_found")
+    if thread_ts:
+        url = REPLIES_API
+        params = {"channel": channel, "ts": thread_ts,
+                  "include_all_metadata": "true", "limit": str(limit)}
+    else:
+        url = HISTORY_API
+        params = {"channel": channel,
+                  "include_all_metadata": "true", "limit": str(limit)}
+    ok, result = fetch_page(url, params, token,
+                            urlopen=urlopen, sleep=sleep)
+    if not ok:
+        raise RuntimeError(result)
+    messages = []
+    for m in result.get("messages", []):
+        mark = message_mark(m)
+        messages.append({
+            "ts": str(m.get("ts", "")),
+            "user": m.get("user"),
+            "text": m.get("text") or "",
+            "mark": ({"kind": mark[0], "value": mark[1]}
+                     if mark else None),
+        })
+    return {"messages": messages, "checked": len(messages)}
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(
         description="metadata の印で投稿を探す（include_all_metadata 付きで読む）")
@@ -235,9 +292,18 @@ def main(argv=None):
     ap.add_argument("--request-id")
     ap.add_argument("--self-id")
     ap.add_argument("--limit", type=int, default=100)
+    ap.add_argument("--dump", action="store_true",
+                    help="印付きの投稿一覧を JSON で出す（文面照合のガード用）")
     args = ap.parse_args(argv)
 
     try:
+        if args.dump:
+            result = dump_messages(
+                args.channel, args.thread_ts, args.workspace, args.limit)
+            print(json.dumps({"ok": True, "messages": result["messages"],
+                              "checked": result["checked"]},
+                             ensure_ascii=False))
+            return 0
         result = find_by_metadata(
             args.channel, args.thread_ts, args.event_id, args.request_id,
             args.self_id, args.workspace, args.limit)
