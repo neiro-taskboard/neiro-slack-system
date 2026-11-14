@@ -13,6 +13,7 @@ Slack Socket Mode を使った、ねいろ（Muse）の自動受信・自動返�
 - `hooks/` — 新着検知と返信まわり
   - `scripts/slack-poll.py` — イベント状態管理（pending/processing/done/failed/dead、flock、再試行）
   - `scripts/slack-send-once.sh` — 重複ガード付き送信ラッパー（送信台帳、fail-closed、DLQ再送対応）
+  - `scripts/slack-send-locked.sh` — slack-send-once.sh を flock 1つで直列化するラッパー（Yanayana さんの send_reply_locked.py の考え方を採用。並行ワーカーの二重送信を防ぐ）
   - `scripts/slack-event-state.sh` — イベント完了/失敗の記録
   - `scripts/slack-reconcile-done.sh` — done レコードの古いエラー残りを掃除
   - `scripts/slack-new-messages.sh` — ポーリング入口
