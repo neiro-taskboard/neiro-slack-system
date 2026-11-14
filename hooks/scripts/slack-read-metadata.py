@@ -47,6 +47,7 @@ Slack の event_id（Ev…の形）とは中身が違うが、元のイベント
   slack-send-once.sh の割り切りと同じ）。
 """
 import argparse
+import http.client
 import json
 import os
 import sys
@@ -160,7 +161,14 @@ def fetch_page(url, params, token, urlopen=urllib.request.urlopen,
                     continue
                 return False, "http_%d" % e.code
             return False, "http_%d" % e.code
-        except (urllib.error.URLError, TimeoutError, OSError) as e:
+        except (urllib.error.URLError, TimeoutError, OSError,
+                http.client.IncompleteRead) as e:
+            # IncompleteRead は OSError / URLError のサブクラスではない
+            # ため、ここに入れないとリトライされず fetch_page から抜けて
+            # スクリプトがトレースバックで落ちる。2026-11-15：大きな
+            # スレッドの dump（約386KB）が途中で切れて IncompleteRead
+            # になり、送信前チェックが fail-closed で返信を止めた。
+            # GET は冪等なので、他のネットワークエラーと同じくリトライする。
             if attempt < MAX_ATTEMPTS:
                 sleep(BACKOFF_SECS[attempt - 1])
                 continue

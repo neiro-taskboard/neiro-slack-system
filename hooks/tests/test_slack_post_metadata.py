@@ -5,6 +5,7 @@ Yama さんの metadata 照合の設計（2026-11-14）を取り込む送信経�
 実際の Slack 呼び出しはしない。urlopen と認証ストアは差し替える。
 Run with: python3 -m unittest test_slack_post_metadata -v
 """
+import http.client
 import importlib.util
 import io
 import json
@@ -296,6 +297,25 @@ class PostMetadataTest(unittest.TestCase):
         self.assertEqual(code, 1)
         out = json.loads(buf.getvalue())
         self.assertEqual(out["error"], "token_not_found")
+
+
+    # 16. 応答の途中切断（IncompleteRead）は応答ロストなので再送しない。
+    # POST は冪等でないため、GET の fetch_page とは扱いが違う
+    # （リトライしない、429 のみ再送の方針のまま）。
+    # 2026-11-15：read 側の IncompleteRead が送信前チェックを
+    # fail-closed させたのと同じ抜けが post() にもあった。
+    def test_post_incomplete_read_no_retry(self):
+        def _open(req, timeout=30):
+            self.calls.append(req)
+            raise http.client.IncompleteRead(b'{"ok": true', 100)
+
+        payload = self.mod.build_payload("C0CGYGT9V7G", "hello",
+                                         event_id="T0CGV6V7161:C0CGYGT9V7G:1.1")
+        ok, err = self.mod.post(payload, FAKE_TOKEN_BOARD, urlopen=_open,
+                                sleep=lambda s: None)
+        self.assertFalse(ok)
+        self.assertIn("network", err)
+        self.assertEqual(len(self.calls), 1)
 
 
 if __name__ == "__main__":

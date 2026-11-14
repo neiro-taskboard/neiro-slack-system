@@ -32,6 +32,7 @@ Yama さんの metadata 照合の設計（2026-11-14、muse取締役会 #slack-�
   （include_all_metadata=True 付き）で metadata 優先の照合をする。
 """
 import argparse
+import http.client
 import json
 import os
 import sys
@@ -147,9 +148,16 @@ def post(payload, token, urlopen=urllib.request.urlopen, sleep=time.sleep):
                     sleep(wait)
                     continue
             return False, "http_%d" % e.code
-        except (urllib.error.URLError, TimeoutError, OSError) as e:
+        except (urllib.error.URLError, TimeoutError, OSError,
+                http.client.IncompleteRead) as e:
             # 応答ロスト：投稿が届いたかどうか不明。届いている
             # 可能性を消せないため再送しない。呼び出し側の到達確認に任せる。
+            # IncompleteRead は OSError / URLError のサブクラスではない
+            # ため、ここに入れないと post() から抜けてトレースバックで
+            # 落ちる。2026-11-15：read 側の fetch_page で同じ抜けがあり、
+            # 大きなスレッドの dump が途中で切れて送信前チェックが
+            # fail-closed になった。POST は冪等でないので、GET と違って
+            # リトライはしない（429 のみ再送、という方針のまま）。
             return False, "network: %s" % e
         try:
             result = json.loads(raw.decode("utf-8"))

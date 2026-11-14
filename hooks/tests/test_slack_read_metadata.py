@@ -5,6 +5,7 @@ Yama さんの metadata 照合の設計（2026-11-14）の読み取り側のテ�
 実際の Slack 呼び出しはしない。urlopen と認証ストアは差し替える。
 Run with: python3 -m unittest test_slack_read_metadata -v
 """
+import http.client
 import importlib.util
 import io
 import json
@@ -320,6 +321,30 @@ class ReadMetadataTest(unittest.TestCase):
         self.assertEqual(out["checked"], 1)
         self.assertNotIn(FAKE_TOKEN_BOARD, buf.getvalue())
         self.assertNotIn(FAKE_TOKEN_DEFAULT, buf.getvalue())
+
+
+    # 16. 応答の途中切断（IncompleteRead）は GET なのでリトライして成功する。
+    # 2026-11-15：大きなスレッドの dump（約386KB）が途中で切れて
+    # IncompleteRead になり、fetch_page から例外が抜けて送信前チェックが
+    # fail-closed で返信を止めた。IncompleteRead は OSError / URLError の
+    # サブクラスではないため、明示的に拾う必要がある。
+    def test_incomplete_read_retries(self):
+        calls = {"i": 0}
+
+        def _open(req, timeout=30):
+            self.calls.append(req)
+            calls["i"] += 1
+            if calls["i"] == 1:
+                raise http.client.IncompleteRead(b'{"ok": true', 100)
+            return FakeResponse({"ok": True, "messages": [
+                marked_msg("1794660000.000001", "U0CH1B19D4J",
+                           event_id=EVENT_ID)]})
+
+        out = self.find(event_id=EVENT_ID, self_id="U0CH1B19D4J",
+                        urlopen=_open)
+        self.assertTrue(out["found"])
+        self.assertEqual(out["ts"], "1794660000.000001")
+        self.assertEqual(len(self.calls), 2)
 
 
 if __name__ == "__main__":
