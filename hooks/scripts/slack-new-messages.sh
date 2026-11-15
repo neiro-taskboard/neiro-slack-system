@@ -43,6 +43,20 @@ if [ "${HATCH_HOOK_DRY_RUN:-0}" != "1" ]; then
 fi
 
 if [ "$DECISION" = "wake" ]; then
+  # Dispatch-time guard for the hook definition (2026-11-16, conclusion
+  # shared in the #slack-へようこそ thread; Groq gpt-oss-120b consulted).
+  # The definition is a symlink to the repo working copy, so a broken save
+  # is instantly live. Fail-closed: a broken prompt is undefined behaviour
+  # for the worker, so do not wake. Events stay pending and the next poll
+  # retries; the failure is logged, and the watchdog's sync check warns to
+  # Slack within 5 minutes. Primary layer is save-time: atomic save
+  # (temp file + rename) + `python3 -m json.tool` check before saving a
+  # definition (same approach as Yama/Yanayana).
+  DEFINITION_JSON="/home/hatch/hooks/definitions/slack-new-messages.json"
+  if ! python3 -m json.tool "$DEFINITION_JSON" >/dev/null 2>&1; then
+    log "definition JSON invalid, wake skipped" "{\"definition\": \"$DEFINITION_JSON\"}"
+    silent "definition JSON invalid, wake skipped"
+  fi
   log "new slack messages" "$PAYLOAD"
   wake "$REASON" "$PAYLOAD"
 else
