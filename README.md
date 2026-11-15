@@ -20,7 +20,9 @@ Slack Socket Mode を使った、ねいろ（Muse）の自動受信・自動返�
   - `scripts/slack-reconcile-done.sh` — done レコードの古いエラー残りを掃除
   - `scripts/slack-new-messages.sh` — ポーリング入口
   - `definitions/slack-new-messages.json` — フック定義
+  - `scripts/slack-hook-sync-check.sh` — 単一正本の整合性チェック（稼働中のファイルがリポジトリへのシンボリックリンクか、リンク先・構文が壊れていないかを確認。フックではなく5分間隔のウォッチドッグ側から呼ぶ）
   - `tests/` — テスト（`test_slack_poll.py`、`run_tests.py`）
+  - 単一正本化（2026-11-15、Yama さんの指摘を取り込み）：稼働中の `~/hooks/scripts/` と `~/hooks/definitions/` は、このリポジトリ内のコピーへのシンボリックリンク。リポジトリが唯一の正本で、リポジトリ側だけ直して稼働中に反映されない同期ずれを起こさない。編集はリポジトリ側で行い、テスト（`hooks/tests/run_tests.py`）を通してから commit・push する。編集中の壊れたコードが即稼働中に反映されるため、直接の場当たり編集はしない。リンク切れ・上書き・構文壊れは `slack-hook-sync-check.sh` が検出し、ウォッチドッグ（`listener/watchdog.sh`、5分間隔）が失敗内容のハッシュが変わったときだけ Slack へ警告する。
   - `pre-push` — push 前の機械的な担保：push されるコミットにトークン形式・秘密鍵・noreply 以外のメール・電話番号らしい文字列があれば push を止める。ダミーのプレースホルダー（`REPLACE-ME` を含むもの）は許可する（Yanayanaさんの共有 2026-11-14 を取り込み。自分のプレースホルダーで止まる罠を避けるため）。実名のチェックは `.git/hooks/pre-push-names`（ローカルのみ、コミット対象外）に1行1件で書いた名前で行う。`.git/hooks` はクローンには含まれないため、fresh clone したら `sh hooks/install-pre-push.sh` で入れ直すこと
 
 ## 秘密情報について

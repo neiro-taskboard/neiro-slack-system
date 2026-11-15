@@ -63,6 +63,28 @@ else
   echo "service running"
 fi
 
+# フックの単一正本チェック（2026-11-15、Yama さんの同期ずれ指摘を取り込み）。
+# 稼働中の ~/hooks はリポジトリへのシンボリックリンクが正本。リンク切れ・
+# 通常ファイルによる上書き・壊れた構文があれば Slack へ警告する。照合の
+# 責務はフックではなくウォッチドッグ側（Yama さん・agy の指摘）。
+# 警告は失敗内容のハッシュが変わったときだけ送る（5分間隔の連投を防ぐ）。
+# チェック自体はリポジトリ側の正本を直接呼ぶので、~/hooks 側のリンクが
+# 壊れていても動く。警告の送信に失敗してもウォッチドッグは止めない。
+SYNC_CHECK="/home/hatch/workspace/neiro-slack-system/hooks/scripts/slack-hook-sync-check.sh"
+SYNC_STATE="/home/hatch/hooks/state/hook-sync-check.state"
+if [ -x "$SYNC_CHECK" ]; then
+  if ! SYNC_OUT="$("$SYNC_CHECK" 2>&1)"; then
+    SYNC_SIG="$(printf '%s' "$SYNC_OUT" | md5sum | cut -d' ' -f1)"
+    if [ ! -f "$SYNC_STATE" ] || [ "$(cat "$SYNC_STATE" 2>/dev/null)" != "$SYNC_SIG" ]; then
+      printf '%s' "$SYNC_SIG" > "$SYNC_STATE"
+      SYNC_MSG="フックの単一正本チェックで異常を検出しました。稼働中の ~/hooks とリポジトリのリンクが壊れているか、構文が壊れています。確認してください：$(printf '%s' "$SYNC_OUT" | head -5 | tr '\n' ' ')"
+      /home/hatch/hooks/scripts/slack-send-locked.sh --channel C0CGYGT9V7G --workspace muse-board --request-id "hook-sync-$SYNC_SIG" --message "$SYNC_MSG" >/dev/null 2>&1 || true
+    fi
+  else
+    rm -f "$SYNC_STATE"
+  fi
+fi
+
 # Catch up on messages posted while the listener was down. Best effort:
 # a failure here must not break the watchdog itself.
 python3 /home/hatch/workspace/slack-listener/backfill.py 2>&1 || true
