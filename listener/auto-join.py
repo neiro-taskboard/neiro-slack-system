@@ -42,6 +42,18 @@ reply_count says it has. slackcli strips the subtype field from
 history reads, so join/leave messages are also caught by matching
 their rendered text.
 
+Opt-out (2026-11-18, Yama's idea, adopted after his share): without
+it, a channel the bot was removed from looks exactly like a channel
+it has never joined, so the next 5-minute check would rejoin it
+within minutes of being kicked. This script records the channels
+the bot is a member of (events/auto_join_state.json); a channel
+that was recorded as joined but is no longer a member is treated as
+removed and is never auto-joined again. If someone invites the bot
+back by hand, the removal record is cleared, so a deliberate
+re-invite still works. Channels the listener has a baseline for but
+the bot is no longer a member of count as removed from the first run,
+so the record does not need a run during membership to notice.
+
 Run from watchdog.sh (best effort, never fails the watchdog).
 Set AUTO_JOIN_DRY_RUN=1 to print what would be joined/seeded.
 Set AUTO_JOIN_SEED_TEST_CHANNEL=<id> (with DRY_RUN=1) to simulate
@@ -59,6 +71,7 @@ from urllib.parse import urlparse
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE, "config.json")
+STATE_PATH = os.path.join(BASE, "events", "auto_join_state.json")
 SLACKCLI_STORE = "/home/hatch/.config/slackcli/workspaces.json"
 SLACKCLI = "/home/hatch/workspace/bin/slackcli"
 MIN_MEMBERS = 2
@@ -108,7 +121,8 @@ def run_slackcli(args):
         return None
 
 
-def is_candidate(channel, members, user_id):
+def is_candidate(channel, members, user_id, removed=None,
+                 workspace_id=""):
     """Pure decision: should the bot join this channel?"""
     if channel.get("is_private"):
         return False
@@ -120,7 +134,82 @@ def is_candidate(channel, members, user_id):
         return False
     if not user_id or user_id not in (members or []):
         return False
+    if removed and state_key(workspace_id, channel.get("id", "")) in removed:
+        return False
     return True
+
+
+def state_key(workspace_id, channel_id):
+    return f"{workspace_id}:{channel_id}"
+
+
+def load_join_state(path):
+    """Return (joined, removed) channel-key sets from the state file.
+
+    Missing or corrupt state starts empty: the next run re-records
+    current memberships as the initial state.
+    """
+    joined, removed = set(), set()
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return joined, removed
+    if not isinstance(data, dict):
+        return joined, removed
+    for key in data.get("joined", []) or []:
+        if isinstance(key, str):
+            joined.add(key)
+    for key in data.get("removed", []) or []:
+        if isinstance(key, str):
+            removed.add(key)
+    return joined, removed
+
+
+def save_join_state(path, joined, removed):
+    """Write the state file. Never raises: a stale state file must not
+    break the watchdog run."""
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(
+                {"joined": sorted(joined), "removed": sorted(removed)},
+                f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except OSError as e:
+        log(f"could not save join state {path}: {e}")
+
+
+def update_join_state(channels, workspace_id, joined, removed,
+                      baselines=()):
+    """Reconcile membership state against one channel list (pure apart
+    from logging). Public channels only; private ones are never
+    auto-join candidates, so they are not tracked.
+
+    - member now -> recorded as joined, removal cleared (a manual
+      re-invite counts as a deliberate return).
+    - was joined / has a baseline but not a member now -> removed.
+    Returns (joined, removed).
+    """
+    joined = set(joined)
+    removed = set(removed)
+    for ch in channels or []:
+        if ch.get("is_private"):
+            continue
+        key = state_key(workspace_id, ch.get("id", ""))
+        if not ch.get("id"):
+            continue
+        if ch.get("is_member"):
+            joined.add(key)
+            removed.discard(key)
+        elif key in joined or (workspace_id, ch["id"]) in baselines:
+            if key not in removed:
+                log(f"channel {ch['id']} was removed; "
+                    f"will not auto-join")
+            joined.discard(key)
+            removed.add(key)
+    return joined, removed
 
 
 def load_inbox_state(inbox_path):
@@ -318,6 +407,7 @@ def main():
     joined = 0
     seeded = 0
     checked = 0
+    joined_keys, removed_keys = load_join_state(STATE_PATH)
     for ws in config.get("workspaces", []):
         bot_key = ws.get("slackcli_key", "")
         user_key = ws.get("slackcli_user_key", "")
@@ -335,6 +425,10 @@ def main():
         )
         if not data:
             continue
+        wid = ws.get("workspace_id", "")
+        joined_keys, removed_keys = update_join_state(
+            data.get("conversations", []), wid, joined_keys, removed_keys,
+            baselines)
         for ch in data.get("conversations", []):
             checked += 1
             if ch.get("is_member"):
@@ -350,6 +444,9 @@ def main():
                 continue
             if (ch.get("num_members") or 0) < MIN_MEMBERS:
                 continue
+            key = state_key(wid, ch["id"])
+            if key in removed_keys:
+                continue
             mdata = run_slackcli(
                 [
                     "conversations", "members", "list", ch["id"],
@@ -357,7 +454,7 @@ def main():
                 ]
             )
             members = (mdata or {}).get("members", [])
-            if not is_candidate(ch, members, user_id):
+            if not is_candidate(ch, members, user_id, removed_keys, wid):
                 continue
             if DRY_RUN:
                 log(f"DRY-RUN would join [{ws.get('workspace_name', '')}] "
@@ -374,11 +471,15 @@ def main():
                 log(f"joined [{ws.get('workspace_name', '')}] "
                     f"#{ch.get('name', '')} ({ch['id']})")
                 joined += 1
+                joined_keys.add(key)
+                removed_keys.discard(key)
                 seeded += seed_channel(
                     ws, ch["id"], bot_key, own_ids, seen, domains,
                     thread_counts, inbox_path, dry=False)
             else:
                 log(f"join failed for {ch['id']}")
+    if not DRY_RUN:
+        save_join_state(STATE_PATH, joined_keys, removed_keys)
     if DRY_RUN and SEED_TEST_CHANNEL:
         for ws in config.get("workspaces", []):
             if ws.get("workspace_id") == "T0CGV6V7161":
