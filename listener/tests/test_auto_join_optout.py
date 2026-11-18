@@ -142,6 +142,37 @@ class StateFileTest(unittest.TestCase):
         self.assertEqual(joined, set())
         self.assertEqual(removed, set())
 
+    def test_good_main_updates_backup(self):
+        # Two good saves: the backup holds the previous generation.
+        auto_join.save_join_state(
+            self.path, {"T0TEST:C1"}, set())
+        auto_join.save_join_state(
+            self.path, {"T0TEST:C1", "T0TEST:C2"}, set())
+        with open(f"{self.path}.bak") as f:
+            bak = json.load(f)
+        self.assertEqual(bak["joined"], ["T0TEST:C1"])
+
+    def test_corrupt_main_does_not_overwrite_backup(self):
+        # Yanayana's guard (2026-11-18): only a state file that
+        # still parses is copied to the backup. A corrupt main must
+        # not destroy the last good backup on the next save.
+        auto_join.save_join_state(
+            self.path, {"T0TEST:C1"}, {"T0TEST:C2"})
+        auto_join.save_join_state(
+            self.path, {"T0TEST:C1"}, {"T0TEST:C2", "T0TEST:C3"})
+        with open(self.path, "w") as f:
+            f.write("{corrupted")
+        auto_join.save_join_state(
+            self.path, {"T0TEST:C9"}, set())
+        with open(f"{self.path}.bak") as f:
+            bak = json.load(f)
+        self.assertEqual(bak["joined"], ["T0TEST:C1"])
+        self.assertEqual(bak["removed"], ["T0TEST:C2"])
+        # The new main is the fresh save, and the corrupt generation
+        # is gone, but the backup still holds the good state.
+        joined, removed = auto_join.load_join_state(self.path)
+        self.assertEqual(joined, {"T0TEST:C9"})
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

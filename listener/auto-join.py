@@ -185,8 +185,11 @@ def save_join_state(path, joined, removed):
 
     The previous state is kept as <path>.bak first, so a deleted or
     corrupt state file can be recovered on the next load (see
-    load_join_state). The backup is best effort: if it fails, the
-    new state is still written."""
+    load_join_state). Only a state file that still parses is copied
+    to the backup: if the main file itself got corrupted on disk,
+    copying it over the backup would destroy the last good copy
+    (2026-11-18, Yanayana's guard). The backup is best effort: if
+    it fails, the new state is still written."""
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = f"{path}.tmp"
@@ -196,8 +199,14 @@ def save_join_state(path, joined, removed):
                 f, ensure_ascii=False, indent=2)
         try:
             if os.path.exists(path):
-                shutil.copyfile(path, f"{path}.bak")
-        except OSError as e:
+                with open(path, encoding="utf-8") as f:
+                    old = json.load(f)
+                if isinstance(old, dict):
+                    shutil.copyfile(path, f"{path}.bak")
+                else:
+                    log(f"join state {path} is not a state dict, "
+                        "keeping previous backup")
+        except (OSError, ValueError) as e:
             log(f"could not back up join state {path}: {e}")
         os.replace(tmp, path)
     except OSError as e:
