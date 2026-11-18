@@ -77,25 +77,28 @@ def read_inbox(path):
     return events
 
 
-def fetch_history(workspace_key, channel, limit=20):
+def fetch_history(workspace_key, channel, limit=20, quiet=False):
     """Return the channel's recent top-level messages via slackcli."""
     cmd = [SLACKCLI, "conversations", "read", channel,
            "--workspace", workspace_key, "--limit", str(limit), "--json"]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     except (subprocess.SubprocessError, OSError) as e:
-        log(f"history fetch failed for {channel}: {e}")
+        if not quiet:
+            log(f"history fetch failed for {channel}: {e}")
         return []
     out = proc.stdout
     start = out.find("{")
     if start < 0:
-        log(f"history fetch failed for {channel}: no JSON in output "
-            f"(rc={proc.returncode}, stderr={proc.stderr.strip()[:200]})")
+        if not quiet:
+            log(f"history fetch failed for {channel}: no JSON in output "
+                f"(rc={proc.returncode}, stderr={proc.stderr.strip()[:200]})")
         return []
     try:
         data = json.loads(out[start:])
     except json.JSONDecodeError as e:
-        log(f"history fetch failed for {channel}: bad JSON: {e}")
+        if not quiet:
+            log(f"history fetch failed for {channel}: bad JSON: {e}")
         return []
     return data.get("messages", [])
 
@@ -112,12 +115,14 @@ def main():
     store = load_json(SLACKCLI_STORE)
     inbox_path = config["inbox_path"]
 
-    # Own bot user id per workspace (to skip neiro's own posts).
-    own_user = {}
+    # Own ids (bot user id and user-account id per workspace) — neiro's
+    # own posts must never be backfilled as "missed" messages.
+    own_ids = set()
     for ws in config.get("workspaces", []):
-        entry = store.get("workspaces", {}).get(ws.get("slackcli_key", ""), {})
-        if entry.get("user_id"):
-            own_user[ws["workspace_id"]] = entry["user_id"]
+        for key in (ws.get("slackcli_key", ""), ws.get("slackcli_user_key", "")):
+            entry = store.get("workspaces", {}).get(key, {})
+            if entry.get("user_id"):
+                own_ids.add(entry["user_id"])
 
     inbox = read_inbox(inbox_path)
     seen = {(e.get("workspace_id"), e.get("channel"), e.get("ts")) for e in inbox}
@@ -148,7 +153,30 @@ def main():
         for channel in channels:
             checked += 1
             newest = baseline[(wid, channel)]
-            messages = fetch_history(ws.get("slackcli_key", ""), channel)
+            # DM channels (D...): bot DMs are visible only to the bot
+            # token, user DMs only to the user token. Fetch with both
+            # keys and merge by ts (added 2026-11-15: bot-key-only fetch
+            # missed all user DMs with channel_not_found).
+            by_ts = {}
+            if channel.startswith("D") and ws.get("slackcli_user_key"):
+                got_any = False
+                for key, ident in ((ws.get("slackcli_key", ""), "bot"),
+                                   (ws["slackcli_user_key"], "user")):
+                    msgs = fetch_history(key, channel, quiet=True)
+                    if msgs:
+                        got_any = True
+                    for m in msgs:
+                        ts = m.get("ts", "")
+                        if ts and ts not in by_ts:
+                            m = dict(m)
+                            m["_identity"] = ident
+                            by_ts[ts] = m
+                if not got_any:
+                    log(f"history fetch failed for {channel}: "
+                        f"neither bot nor user key can read it")
+                messages = list(by_ts.values())
+            else:
+                messages = fetch_history(ws.get("slackcli_key", ""), channel)
             new_events = []
             for m in messages:
                 ts = m.get("ts", "")
@@ -160,13 +188,14 @@ def main():
                     continue
                 if SYSTEM_TEXT_RE.match(m.get("text", "")):
                     continue
-                if m.get("user") in own_user.values():
+                if m.get("user") in own_ids:
                     continue
                 ev = {
                     "workspace_id": wid,
                     "workspace_name": ws_name.get(wid, ""),
+                    "identity": m.get("_identity", "bot") if channel.startswith("D") else "bot",
                     "channel": channel,
-                    "channel_type": "channel",
+                    "channel_type": "im" if channel.startswith("D") else "channel",
                     "user": m.get("user", ""),
                     "bot_id": m.get("bot_id", ""),
                     "text": m.get("text", ""),
