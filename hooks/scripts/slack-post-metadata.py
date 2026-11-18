@@ -35,6 +35,8 @@ import argparse
 import http.client
 import json
 import os
+import shutil
+import subprocess
 import sys
 import time
 import urllib.error
@@ -102,6 +104,89 @@ def build_payload(channel, text, thread_ts=None, event_id=None,
     return payload
 
 
+def _post_curl(body, token, timeout=30):
+    """curl で chat.postMessage を叩く。(status, body_bytes) を返す。
+
+    接続できなかったときは (None, None)。トークンと送信文は argv に
+    載せず、0600 の一時ファイル経由で渡す。
+    """
+    cfg = body_file = None
+    try:
+        import tempfile
+        with tempfile.NamedTemporaryFile(
+                "w", delete=False, prefix="slack-curl-") as f:
+            f.write('header = "Authorization: Bearer %s"\n' % token)
+            cfg = f.name
+        os.chmod(cfg, 0o600)
+        with tempfile.NamedTemporaryFile(
+                "wb", delete=False, prefix="slack-post-") as f:
+            f.write(body)
+            body_file = f.name
+        os.chmod(body_file, 0o600)
+        proc = subprocess.run(
+            ["curl", "-sS", "--max-time", str(timeout),
+             "-w", "\n__STATUS__:%{http_code}",
+             "-K", cfg,
+             "-H", "Content-Type: application/json; charset=utf-8",
+             "--data", "@" + body_file, SLACK_API],
+            capture_output=True, timeout=timeout + 5)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None, None
+    finally:
+        for p in (cfg, body_file):
+            if p:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+    out = proc.stdout
+    marker = b"\n__STATUS__:"
+    if marker not in out:
+        return None, None
+    resp_body, _, status_b = out.rpartition(marker)
+    try:
+        status = int(status_b.decode("ascii").strip())
+    except ValueError:
+        return None, None
+    return status, resp_body
+
+
+def _post_urllib(body, token, urlopen):
+    """urllib で chat.postMessage を叩く。(status, body_bytes) を返す。
+
+    接続できなかったときは (None, None)。curl が無いときの
+    フォールバック。
+    """
+    req = urllib.request.Request(
+        SLACK_API, data=body,
+        headers={"Authorization": "Bearer " + token,
+                 "Content-Type": "application/json; charset=utf-8"},
+        method="POST")
+    try:
+        with urlopen(req, timeout=30) as resp:
+            raw = resp.read()
+            try:
+                retry_after = resp.headers.get("Retry-After")
+            except AttributeError:
+                retry_after = None
+            return resp.status, raw, retry_after
+    except urllib.error.HTTPError as e:
+        try:
+            raw = e.read()
+        except Exception:
+            raw = b""
+        try:
+            retry_after = e.headers.get("Retry-After")
+        except AttributeError:
+            retry_after = None
+        return e.code, raw, retry_after
+    except (urllib.error.URLError, TimeoutError, OSError,
+            http.client.IncompleteRead):
+        # IncompleteRead は OSError / URLError のサブクラスではない
+        # ため、ここに入れないと呼び出し側へ例外が抜ける。
+        return None, None, None
+
+
 def post(payload, token, urlopen=urllib.request.urlopen, sleep=time.sleep):
     """chat.postMessage を叩く。成功時は (True, 応答)、失敗時は (False, 理由)。
 
@@ -118,47 +203,44 @@ def post(payload, token, urlopen=urllib.request.urlopen, sleep=time.sleep):
     3 件並んだ。送信台帳に残ったのは最後の 1 件だけで、最初の
     2 件の ts は応答と一緒に失われていた。429 だけが「未投稿の
     確定」なので、リトライ対象はそこに絞る。
+
+    送信は curl を使う（2026-11-19：読み取り側と同じく、同じ URL・
+    同じトークンで urllib の応答が Remote end closed で失われ、
+    投稿が届いたのに「送信失敗」扱いになって重複投稿を起こしたため。
+    curl が無ければ urllib へフォールバックする）。
     """
     body = json.dumps(payload).encode("utf-8")
+    use_curl = shutil.which("curl") is not None
     for attempt in range(1, MAX_ATTEMPTS + 1):
-        req = urllib.request.Request(
-            SLACK_API, data=body,
-            headers={"Authorization": "Bearer " + token,
-                     "Content-Type": "application/json; charset=utf-8"},
-            method="POST")
-        try:
-            with urlopen(req, timeout=30) as resp:
-                raw = resp.read()
-                retry_after = None
-                try:
-                    retry_after = resp.headers.get("Retry-After")
-                except AttributeError:
-                    pass
-        except urllib.error.HTTPError as e:
-            # 429 は Slack が受信前に却下した確定なので再送してよい。
-            # 5xx は応答こそ受け取ったが書き込みの有無が曖昧なため
-            # 再送しない（呼び出し側の到達確認に任せる）。
-            if e.code == 429:
-                if attempt < MAX_ATTEMPTS:
-                    wait = BACKOFF_SECS[attempt - 1]
-                    try:
-                        wait = float(e.headers.get("Retry-After", wait))
-                    except (AttributeError, ValueError, TypeError):
-                        pass
-                    sleep(wait)
-                    continue
-            return False, "http_%d" % e.code
-        except (urllib.error.URLError, TimeoutError, OSError,
-                http.client.IncompleteRead) as e:
+        if use_curl:
+            status, raw = _post_curl(body, token)
+            retry_after = None
+        else:
+            status, raw, retry_after = _post_urllib(body, token, urlopen)
+        if status is None:
             # 応答ロスト：投稿が届いたかどうか不明。届いている
             # 可能性を消せないため再送しない。呼び出し側の到達確認に任せる。
-            # IncompleteRead は OSError / URLError のサブクラスではない
-            # ため、ここに入れないと post() から抜けてトレースバックで
-            # 落ちる。2026-11-15：read 側の fetch_page で同じ抜けがあり、
-            # 大きなスレッドの dump が途中で切れて送信前チェックが
-            # fail-closed になった。POST は冪等でないので、GET と違って
-            # リトライはしない（429 のみ再送、という方針のまま）。
-            return False, "network: %s" % e
+            # POST は冪等でないので、GET と違ってリトライはしない
+            # （429 のみ再送、という方針のまま）。
+            return False, "network: connection_failed"
+        if status == 429:
+            # 429 は Slack が受信前に却下した確定なので再送してよい。
+            if attempt < MAX_ATTEMPTS:
+                wait = BACKOFF_SECS[attempt - 1]
+                if retry_after is not None:
+                    try:
+                        wait = float(retry_after)
+                    except (TypeError, ValueError):
+                        pass
+                sleep(wait)
+                continue
+            return False, "http_429"
+        if status >= 500:
+            # 5xx は応答こそ受け取ったが書き込みの有無が曖昧なため
+            # 再送しない（呼び出し側の到達確認に任せる）。
+            return False, "http_%d" % status
+        if status != 200:
+            return False, "http_%d" % status
         try:
             result = json.loads(raw.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
