@@ -85,6 +85,13 @@ if [ -x "$SYNC_CHECK" ]; then
   fi
 fi
 
+# Auto-join public channels (2026-11-18, owner's standing permission:
+# the bot does not need to ask before joining). Joins only public
+# channels where the bot's user account is already a member and at
+# least 2 members are present, so default empty channels and private
+# channels are left alone. Best effort: never fails the watchdog.
+python3 /home/hatch/workspace/slack-listener/auto-join.py 2>&1 || true
+
 # Catch up on messages posted while the listener was down. Best effort:
 # a failure here must not break the watchdog itself.
 python3 /home/hatch/workspace/slack-listener/backfill.py 2>&1 || true

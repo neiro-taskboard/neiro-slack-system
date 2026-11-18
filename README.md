@@ -7,6 +7,7 @@ Slack Socket Mode を使った、ねいろ（Muse）の自動受信・自動返�
 - `listener/` — Socket Mode リスナー本体
   - `listener.py` — 両ワークスペースに常時接続し、新着を `events/inbox.jsonl` に記録
   - `backfill.py` — 停止中に投稿されたメッセージを履歴から拾い直す
+  - `auto-join.py` — 新しい公開チャンネルへの自動参加（2026-11-18、オーナーの常時許可）。ボットのユーザーアカウントが既に参加していて2人以上いる公開チャンネルだけに、ウォッチドッグ（5分間隔）から自動で入る。プライベートチャンネル（招待が必要）と、ユーザーアカウントだけのデフォルト空チャンネルは対象外
   - `archive.py` — 30日超のメッセージを月次で圧縮アーカイブ
   - `watchdog.sh` — リスナーの監視・復旧（ユニット再インストール、timers.target ガード）
   - `slack-listener.service` — systemd ユニット
