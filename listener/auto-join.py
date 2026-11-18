@@ -63,6 +63,7 @@ Set AUTO_JOIN_SEED_WINDOW_SECS=<secs> to override the seed window.
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -146,15 +147,27 @@ def state_key(workspace_id, channel_id):
 def load_join_state(path):
     """Return (joined, removed) channel-key sets from the state file.
 
-    Missing or corrupt state starts empty: the next run re-records
-    current memberships as the initial state.
+    Missing or corrupt state falls back to the backup file
+    (<path>.bak, the state as of the previous save); only if both
+    are unusable does it start empty. The next run then re-records
+    current memberships as the initial state. The backup matters
+    because `removed` cannot be re-derived from current memberships:
+    without it, a channel the bot was removed from would look like
+    one it never joined and would be auto-joined again.
+    (2026-11-18, Yanayana's point in the auto-join thread.)
     """
     joined, removed = set(), set()
+    data = None
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, ValueError):
-        return joined, removed
+        try:
+            with open(f"{path}.bak", encoding="utf-8") as f:
+                data = json.load(f)
+            log(f"join state {path} unreadable, recovered from backup")
+        except (OSError, ValueError):
+            return joined, removed
     if not isinstance(data, dict):
         return joined, removed
     for key in data.get("joined", []) or []:
@@ -168,7 +181,12 @@ def load_join_state(path):
 
 def save_join_state(path, joined, removed):
     """Write the state file. Never raises: a stale state file must not
-    break the watchdog run."""
+    break the watchdog run.
+
+    The previous state is kept as <path>.bak first, so a deleted or
+    corrupt state file can be recovered on the next load (see
+    load_join_state). The backup is best effort: if it fails, the
+    new state is still written."""
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = f"{path}.tmp"
@@ -176,6 +194,11 @@ def save_join_state(path, joined, removed):
             json.dump(
                 {"joined": sorted(joined), "removed": sorted(removed)},
                 f, ensure_ascii=False, indent=2)
+        try:
+            if os.path.exists(path):
+                shutil.copyfile(path, f"{path}.bak")
+        except OSError as e:
+            log(f"could not back up join state {path}: {e}")
         os.replace(tmp, path)
     except OSError as e:
         log(f"could not save join state {path}: {e}")
