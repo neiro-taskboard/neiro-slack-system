@@ -22,8 +22,17 @@ Safety:
   are added, so repeated runs are idempotent.
 - The poller's state machine dedupes by event id, so even a duplicate
   append is harmless.
-- v1 covers top-level channel messages only; thread replies posted
-  while the listener was down are not backfilled yet.
+- Thread replies (2026-11-18, Yanayana's approach): after the channel
+  history, parents with reply_count are re-read thread by thread and
+  their replies go through the same admit as top-level posts, so a
+  reply posted while the listener was down is recovered too. A thread
+  is only re-read when the inbox holds fewer of its replies than
+  reply_count says it has, so in steady state (listener up) no extra
+  call is made; threads neiro herself replied in are re-read once
+  per run while the parent stays in the recent history, because her
+  own posts are never in the inbox — harmless, just one extra call.
+  Thread reads pass --oldest=<channel baseline>, so the 100-message
+  page covers every reply the floor admits even in a long thread.
 
 Set BACKFILL_DRY_RUN=1 to print what would be appended without writing.
 """
@@ -103,6 +112,101 @@ def fetch_history(workspace_key, channel, limit=20, quiet=False):
     return data.get("messages", [])
 
 
+def fetch_thread(workspace_key, channel, thread_ts, oldest=None,
+                 quiet=False):
+    """Return one thread's messages via slackcli (parent + replies).
+
+    With oldest set, only messages after it are returned, so the
+    100-message page covers every reply the floor admits instead of
+    the thread's oldest page.
+    """
+    cmd = [SLACKCLI, "conversations", "read", channel,
+           "--thread-ts", thread_ts,
+           "--workspace", workspace_key, "--limit", "100", "--json"]
+    if oldest is not None:
+        cmd += ["--oldest", str(oldest)]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except (subprocess.SubprocessError, OSError) as e:
+        if not quiet:
+            log(f"thread fetch failed for {channel} {thread_ts}: {e}")
+        return []
+    out = proc.stdout
+    start = out.find("{")
+    if start < 0:
+        if not quiet:
+            log(f"thread fetch failed for {channel} {thread_ts}: no JSON "
+                f"in output (rc={proc.returncode}, "
+                f"stderr={proc.stderr.strip()[:200]})")
+        return []
+    try:
+        data = json.loads(out[start:])
+    except json.JSONDecodeError as e:
+        if not quiet:
+            log(f"thread fetch failed for {channel} {thread_ts}: bad JSON: {e}")
+        return []
+    if data.get("has_more"):
+        log(f"thread {channel} {thread_ts} has more than 100 messages "
+            f"after {oldest}; only the first page is backfilled")
+    return data.get("messages", [])
+
+
+def fetch_thread_messages(ws, channel, thread_ts, oldest=None):
+    """Thread messages for one parent, both keys for DMs (same as history)."""
+    if channel.startswith("D") and ws.get("slackcli_user_key"):
+        by_ts = {}
+        for key, ident in ((ws.get("slackcli_key", ""), "bot"),
+                           (ws["slackcli_user_key"], "user")):
+            for m in fetch_thread(key, channel, thread_ts,
+                                  oldest=oldest, quiet=True):
+                ts = m.get("ts", "")
+                if ts and ts not in by_ts:
+                    m = dict(m)
+                    m["_identity"] = ident
+                    by_ts[ts] = m
+        return list(by_ts.values())
+    return fetch_thread(ws.get("slackcli_key", ""), channel, thread_ts,
+                        oldest=oldest)
+
+
+def admit_message(m, wid, channel, newest, seen, own_ids):
+    """Shared admit for top-level posts and thread replies: the floor
+    (strictly newer than the channel's newest inbox event), the seen
+    dedup, and the listener's filters (subtypes, join/leave text, own
+    posts). Returns True when the message should be backfilled."""
+    ts = m.get("ts", "")
+    if not ts or ts <= newest:
+        return False
+    if (wid, channel, ts) in seen:
+        return False
+    if m.get("subtype") in SKIP_SUBTYPES:
+        return False
+    if SYSTEM_TEXT_RE.match(m.get("text", "")):
+        return False
+    if m.get("user") in own_ids:
+        return False
+    return True
+
+
+def build_event(m, wid, channel, ws_name, domain, identity):
+    return {
+        "workspace_id": wid,
+        "workspace_name": ws_name,
+        "identity": identity,
+        "channel": channel,
+        "channel_type": "im" if channel.startswith("D") else "channel",
+        "user": m.get("user", ""),
+        "bot_id": m.get("bot_id", ""),
+        "text": m.get("text", ""),
+        "ts": m.get("ts", ""),
+        "thread_ts": m.get("thread_ts", ""),
+        "permalink": build_permalink(
+            domain, channel, m.get("ts", ""), m.get("thread_ts", "")),
+        "received_at": datetime.now(timezone.utc).isoformat(),
+        "backfilled": True,
+    }
+
+
 def build_permalink(domain, channel, ts, thread_ts):
     p = f"https://{domain}/archives/{channel}/p{ts.replace('.', '')}"
     if thread_ts:
@@ -145,6 +249,16 @@ def main():
             except Exception:
                 pass
 
+    # Replies per thread already in the inbox, for the thread-fetch
+    # pruning below: (workspace, channel, parent ts) -> reply count.
+    # The parent itself (ts == thread_ts) is not a reply.
+    thread_counts = {}
+    for e in inbox:
+        tts = e.get("thread_ts", "")
+        if tts and e.get("ts", "") != tts:
+            key = (e.get("workspace_id"), e.get("channel"), tts)
+            thread_counts[key] = thread_counts.get(key, 0) + 1
+
     added = 0
     checked = 0
     for ws in config.get("workspaces", []):
@@ -177,35 +291,40 @@ def main():
                 messages = list(by_ts.values())
             else:
                 messages = fetch_history(ws.get("slackcli_key", ""), channel)
+            # Thread replies (2026-11-18, Yanayana's approach): re-read
+            # each parent with replies and admit its replies through
+            # the same checks as top-level posts. Only fetch a thread
+            # when the inbox holds fewer of its replies than
+            # reply_count says it has.
+            parents = []
+            for m in messages:
+                try:
+                    rc = int(m.get("reply_count") or 0)
+                except (TypeError, ValueError):
+                    rc = 0
+                if rc <= 0:
+                    continue
+                pts = m.get("ts", "")
+                if not pts:
+                    continue
+                if thread_counts.get((wid, channel, pts), 0) >= rc:
+                    continue
+                parents.append(pts)
+            for pts in parents:
+                for m in fetch_thread_messages(ws, channel, pts,
+                                               oldest=newest):
+                    if m.get("ts", "") == pts:
+                        continue  # the parent itself; handled above
+                    messages.append(m)
             new_events = []
             for m in messages:
-                ts = m.get("ts", "")
-                if not ts or ts <= newest:
+                if not admit_message(m, wid, channel, newest, seen, own_ids):
                     continue
-                if (wid, channel, ts) in seen:
-                    continue
-                if m.get("subtype") in SKIP_SUBTYPES:
-                    continue
-                if SYSTEM_TEXT_RE.match(m.get("text", "")):
-                    continue
-                if m.get("user") in own_ids:
-                    continue
-                ev = {
-                    "workspace_id": wid,
-                    "workspace_name": ws_name.get(wid, ""),
-                    "identity": m.get("_identity", "bot") if channel.startswith("D") else "bot",
-                    "channel": channel,
-                    "channel_type": "im" if channel.startswith("D") else "channel",
-                    "user": m.get("user", ""),
-                    "bot_id": m.get("bot_id", ""),
-                    "text": m.get("text", ""),
-                    "ts": ts,
-                    "thread_ts": m.get("thread_ts", ""),
-                    "permalink": build_permalink(
-                        domain.get(wid, ""), channel, ts, m.get("thread_ts", "")),
-                    "received_at": datetime.now(timezone.utc).isoformat(),
-                    "backfilled": True,
-                }
+                ev = build_event(
+                    m, wid, channel, ws_name.get(wid, ""),
+                    domain.get(wid, ""),
+                    m.get("_identity", "bot")
+                    if channel.startswith("D") else "bot")
                 new_events.append(ev)
             new_events.sort(key=lambda e: e["ts"])
             if not new_events:

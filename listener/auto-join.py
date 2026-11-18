@@ -31,13 +31,16 @@ also runs for channels the bot is already a member of but which have
 no inbox baseline yet (e.g. joined by hand, or a join whose seed
 failed last time) — it self-heals instead of leaving the gap.
 
-Seeding is bounded: only top-level messages (parity with backfill
-v1 — thread replies in the gap are still not covered), only inside
-the window, never the bot's/user account's own posts, never
-channel_join/leave or edited/deleted subtypes, and never anything
-already in the inbox (dedup by event id). slackcli strips the
-subtype field from history reads, so join/leave messages are also
-caught by matching their rendered text.
+Seeding is bounded: only messages inside the window, never the bot's/
+user account's own posts, never channel_join/leave or edited/deleted
+subtypes, and never anything already in the inbox (dedup by event
+id). Thread replies in the gap are covered too (2026-11-18,
+Yanayana's thread-following backfill, same approach as backfill.py):
+parents with reply_count are re-read thread by thread, and a thread
+is only re-read when the inbox holds fewer of its replies than
+reply_count says it has. slackcli strips the subtype field from
+history reads, so join/leave messages are also caught by matching
+their rendered text.
 
 Run from watchdog.sh (best effort, never fails the watchdog).
 Set AUTO_JOIN_DRY_RUN=1 to print what would be joined/seeded.
@@ -121,12 +124,14 @@ def is_candidate(channel, members, user_id):
 
 
 def load_inbox_state(inbox_path):
-    """Return (seen event ids, channels with a baseline, domains)."""
+    """Return (seen event ids, channels with a baseline, domains,
+    replies per thread already in the inbox)."""
     seen = set()
     baselines = set()
     domains = {}
+    thread_counts = {}
     if not os.path.exists(inbox_path):
-        return seen, baselines, domains
+        return seen, baselines, domains, thread_counts
     with open(inbox_path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -143,12 +148,16 @@ def load_inbox_state(inbox_path):
                 baselines.add((wid, ch))
             if wid and ch and ts:
                 seen.add((wid, ch, ts))
+            tts = e.get("thread_ts", "")
+            if wid and ch and tts and ts != tts:
+                key = (wid, ch, tts)
+                thread_counts[key] = thread_counts.get(key, 0) + 1
             if e.get("permalink"):
                 try:
                     domains[wid] = urlparse(e["permalink"]).netloc
                 except Exception:
                     pass
-    return seen, baselines, domains
+    return seen, baselines, domains, thread_counts
 
 
 def build_permalink(domain, channel, ts, thread_ts):
@@ -160,9 +169,51 @@ def build_permalink(domain, channel, ts, thread_ts):
     return p
 
 
+def seed_event_for(m, ws, channel_id, cutoff, seen, own_ids, domains,
+                   allow_thread_reply=False):
+    """Build the backfilled seed event for one message, or None when it
+    must not be seeded (outside the window, already seen, filtered)."""
+    wid = ws.get("workspace_id", "")
+    ts = m.get("ts", "")
+    if not ts:
+        return None
+    try:
+        if float(ts) <= cutoff:
+            return None
+    except ValueError:
+        return None
+    if (wid, channel_id, ts) in seen:
+        return None
+    if m.get("subtype") in SKIP_SUBTYPES:
+        return None
+    if SYSTEM_TEXT_RE.match(m.get("text", "")):
+        return None
+    if m.get("user") in own_ids:
+        return None
+    thread_ts = m.get("thread_ts", "")
+    if thread_ts and thread_ts != ts and not allow_thread_reply:
+        return None  # thread reply; only admitted via its own thread
+    return {
+        "workspace_id": wid,
+        "workspace_name": ws.get("workspace_name", ""),
+        "identity": "bot",
+        "channel": channel_id,
+        "channel_type": "channel",
+        "user": m.get("user", ""),
+        "bot_id": m.get("bot_id", ""),
+        "text": m.get("text", ""),
+        "ts": ts,
+        "thread_ts": thread_ts,
+        "permalink": build_permalink(
+            domains.get(wid, ""), channel_id, ts, thread_ts),
+        "received_at": datetime.now(timezone.utc).isoformat(),
+        "backfilled": True,
+    }
+
+
 def seed_channel(ws, channel_id, bot_key, own_ids, seen, domains,
-                  inbox_path, dry=False):
-    """Seed a just-joined channel's recent top-level history.
+                  thread_counts, inbox_path, dry=False):
+    """Seed a just-joined channel's recent history.
 
     Returns the number of events added (or that would be added).
     Never raises: a seed failure must not break the watchdog run.
@@ -178,44 +229,56 @@ def seed_channel(ws, channel_id, bot_key, own_ids, seen, domains,
         if not data:
             return 0
         cutoff = time.time() - SEED_WINDOW_SECS
-        new_events = []
-        for m in data.get("messages", []):
-            ts = m.get("ts", "")
-            if not ts:
-                continue
+        messages = data.get("messages", [])
+        # Thread replies (2026-11-18, Yanayana's approach, same as
+        # backfill.py): re-read each parent with replies and seed its
+        # replies through the same checks. Only fetch a thread when
+        # the inbox holds fewer of its replies than reply_count says.
+        parents = []
+        for m in messages:
             try:
-                if float(ts) <= cutoff:
-                    continue
-            except ValueError:
+                rc = int(m.get("reply_count") or 0)
+            except (TypeError, ValueError):
+                rc = 0
+            if rc <= 0:
                 continue
-            if (wid, channel_id, ts) in seen:
+            pts = m.get("ts", "")
+            if not pts:
                 continue
-            if m.get("subtype") in SKIP_SUBTYPES:
+            if thread_counts.get((wid, channel_id, pts), 0) >= rc:
                 continue
-            if SYSTEM_TEXT_RE.match(m.get("text", "")):
+            parents.append(pts)
+        thread_messages = []
+        for pts in parents:
+            tdata = run_slackcli(
+                [
+                    "conversations", "read", channel_id,
+                    "--thread-ts", pts,
+                    "--oldest", f"{cutoff:.6f}",
+                    "--workspace", bot_key, "--limit", "100", "--json",
+                ]
+            )
+            if not tdata:
                 continue
-            if m.get("user") in own_ids:
-                continue
-            thread_ts = m.get("thread_ts", "")
-            if thread_ts and thread_ts != ts:
-                continue  # thread reply; backfill v1 parity
-            ev = {
-                "workspace_id": wid,
-                "workspace_name": ws.get("workspace_name", ""),
-                "identity": "bot",
-                "channel": channel_id,
-                "channel_type": "channel",
-                "user": m.get("user", ""),
-                "bot_id": m.get("bot_id", ""),
-                "text": m.get("text", ""),
-                "ts": ts,
-                "thread_ts": thread_ts,
-                "permalink": build_permalink(
-                    domains.get(wid, ""), channel_id, ts, thread_ts),
-                "received_at": datetime.now(timezone.utc).isoformat(),
-                "backfilled": True,
-            }
-            new_events.append(ev)
+            if tdata.get("has_more"):
+                log(f"thread {channel_id} {pts} has more than 100 "
+                    f"replies in the window; only the first page is "
+                    f"seeded")
+            for m in tdata.get("messages", []):
+                if m.get("ts", "") == pts:
+                    continue  # the parent itself; handled above
+                thread_messages.append(m)
+        new_events = []
+        for m in messages:
+            ev = seed_event_for(m, ws, channel_id, cutoff, seen,
+                                own_ids, domains)
+            if ev:
+                new_events.append(ev)
+        for m in thread_messages:
+            ev = seed_event_for(m, ws, channel_id, cutoff, seen,
+                                own_ids, domains, allow_thread_reply=True)
+            if ev:
+                new_events.append(ev)
         new_events.sort(key=lambda e: e["ts"])
         if not new_events:
             return 0
@@ -243,7 +306,7 @@ def main():
     config = load_json(CONFIG_PATH)
     store = load_json(SLACKCLI_STORE)
     inbox_path = config.get("inbox_path", "")
-    seen, baselines, domains = load_inbox_state(inbox_path)
+    seen, baselines, domains, thread_counts = load_inbox_state(inbox_path)
     # Own ids (bot user id and user-account id per workspace) — neiro's
     # own posts must never be seeded as "missed" messages.
     own_ids = set()
@@ -281,7 +344,7 @@ def main():
                 if (ws.get("workspace_id", ""), ch["id"]) not in baselines:
                     seeded += seed_channel(
                         ws, ch["id"], bot_key, own_ids, seen, domains,
-                        inbox_path, dry=DRY_RUN)
+                        thread_counts, inbox_path, dry=DRY_RUN)
                 continue
             if ch.get("is_private") or ch.get("is_archived"):
                 continue
@@ -313,7 +376,7 @@ def main():
                 joined += 1
                 seeded += seed_channel(
                     ws, ch["id"], bot_key, own_ids, seen, domains,
-                    inbox_path, dry=False)
+                    thread_counts, inbox_path, dry=False)
             else:
                 log(f"join failed for {ch['id']}")
     if DRY_RUN and SEED_TEST_CHANNEL:
@@ -321,7 +384,8 @@ def main():
             if ws.get("workspace_id") == "T0CGV6V7161":
                 seeded += seed_channel(
                     ws, SEED_TEST_CHANNEL, ws.get("slackcli_key", ""),
-                    own_ids, seen, domains, inbox_path, dry=True)
+                    own_ids, seen, domains, thread_counts, inbox_path,
+                    dry=True)
     log(f"done: checked {checked} channels, joined {joined}, "
         f"seeded {seeded} messages"
         + (" (dry run)" if DRY_RUN else ""))
