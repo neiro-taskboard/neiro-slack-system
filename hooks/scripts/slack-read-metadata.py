@@ -54,6 +54,8 @@ import argparse
 import http.client
 import json
 import os
+import shutil
+import subprocess
 import sys
 import time
 import urllib.error
@@ -135,6 +137,82 @@ def matches(message, key, value, self_id=None):
     return mark is not None and mark == (key, value)
 
 
+def _get_page_curl(full_url, token, timeout=30):
+    """curl で GET し、(status, body_bytes, retry_after) を返す。
+
+    接続できなかったときは (None, None, None)。トークンは argv に
+    載せず、0600 の一時設定ファイル経由で渡す（ps 等への露出を避ける）。
+    """
+    cfg = None
+    try:
+        import tempfile
+        with tempfile.NamedTemporaryFile(
+                "w", delete=False, prefix="slack-curl-") as f:
+            f.write('header = "Authorization: Bearer %s"\n' % token)
+            cfg = f.name
+        os.chmod(cfg, 0o600)
+        proc = subprocess.run(
+            ["curl", "-sS", "--max-time", str(timeout),
+             "-w", "\n__STATUS__:%{http_code}",
+             "-K", cfg, full_url],
+            capture_output=True, timeout=timeout + 5)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None, None, None
+    finally:
+        if cfg:
+            try:
+                os.unlink(cfg)
+            except OSError:
+                pass
+    out = proc.stdout
+    marker = b"\n__STATUS__:"
+    if marker not in out:
+        return None, None, None
+    body, _, status_b = out.rpartition(marker)
+    try:
+        status = int(status_b.decode("ascii").strip())
+    except ValueError:
+        return None, None, None
+    return status, body, None
+
+
+def _get_page_urllib(full_url, token, urlopen):
+    """urllib で GET し、(status, body_bytes, retry_after) を返す。
+
+    接続できなかったときは (None, None, None)。curl が無いときの
+    フォールバック。
+    """
+    req = urllib.request.Request(
+        full_url,
+        headers={"Authorization": "Bearer " + token},
+        method="GET")
+    try:
+        with urlopen(req, timeout=30) as resp:
+            raw = resp.read()
+            try:
+                retry_after = resp.headers.get("Retry-After")
+            except AttributeError:
+                retry_after = None
+            return resp.status, raw, retry_after
+    except urllib.error.HTTPError as e:
+        try:
+            raw = e.read()
+        except Exception:
+            raw = b""
+        try:
+            retry_after = e.headers.get("Retry-After")
+        except AttributeError:
+            retry_after = None
+        return e.code, raw, retry_after
+    except (urllib.error.URLError, TimeoutError, OSError,
+            http.client.IncompleteRead):
+        # IncompleteRead は OSError / URLError のサブクラスではない
+        # ため、ここに入れないと呼び出し側へ例外が抜ける。2026-11-15：
+        # 大きなスレッドの dump（約386KB）が途中で切れて IncompleteRead
+        # になり、送信前チェックが fail-closed で返信を止めた。
+        return None, None, None
+
+
 def fetch_page(url, params, token, urlopen=urllib.request.urlopen,
                sleep=time.sleep):
     """1ページ読む。成功時は (True, 応答)、失敗時は (False, 理由)。
@@ -142,46 +220,41 @@ def fetch_page(url, params, token, urlopen=urllib.request.urlopen,
     ネットワークエラー・429（ratelimited）・5xx は最大 MAX_ATTEMPTS 回まで
     リトライする（429 は Retry-After を尊重）。Slack の ok:false（チャンネル
     不明など）はリトライしない。
+
+    読み取りは curl を使う（2026-11-19：同じ URL・同じトークンで
+    urllib が IncompleteRead / Remote end closed を繰り返す一方、
+    curl は 5/5 成功したため。出口プロキシとの相性と思われる）。
+    curl が無ければ urllib へフォールバックする。
     """
     query = urllib.parse.urlencode(params)
     full_url = url + "?" + query
+    use_curl = shutil.which("curl") is not None
     for attempt in range(1, MAX_ATTEMPTS + 1):
-        req = urllib.request.Request(
-            full_url,
-            headers={"Authorization": "Bearer " + token},
-            method="GET")
-        try:
-            with urlopen(req, timeout=30) as resp:
-                raw = resp.read()
-                retry_after = None
-                try:
-                    retry_after = resp.headers.get("Retry-After")
-                except AttributeError:
-                    pass
-        except urllib.error.HTTPError as e:
-            if e.code == 429 or e.code >= 500:
-                if attempt < MAX_ATTEMPTS:
-                    wait = BACKOFF_SECS[attempt - 1]
-                    try:
-                        wait = float(e.headers.get("Retry-After", wait))
-                    except (AttributeError, ValueError, TypeError):
-                        pass
-                    sleep(wait)
-                    continue
-                return False, "http_%d" % e.code
-            return False, "http_%d" % e.code
-        except (urllib.error.URLError, TimeoutError, OSError,
-                http.client.IncompleteRead) as e:
-            # IncompleteRead は OSError / URLError のサブクラスではない
-            # ため、ここに入れないとリトライされず fetch_page から抜けて
-            # スクリプトがトレースバックで落ちる。2026-11-15：大きな
-            # スレッドの dump（約386KB）が途中で切れて IncompleteRead
-            # になり、送信前チェックが fail-closed で返信を止めた。
+        if use_curl:
+            status, raw, retry_after = _get_page_curl(full_url, token)
+        else:
+            status, raw, retry_after = _get_page_urllib(
+                full_url, token, urlopen)
+        if status is None:
+            # 接続できなかった等（IncompleteRead を含む）。
             # GET は冪等なので、他のネットワークエラーと同じくリトライする。
             if attempt < MAX_ATTEMPTS:
                 sleep(BACKOFF_SECS[attempt - 1])
                 continue
-            return False, "network: %s" % e
+            return False, "network: connection_failed"
+        if status == 429 or status >= 500:
+            if attempt < MAX_ATTEMPTS:
+                wait = BACKOFF_SECS[attempt - 1]
+                if retry_after is not None:
+                    try:
+                        wait = float(retry_after)
+                    except (TypeError, ValueError):
+                        pass
+                sleep(wait)
+                continue
+            return False, "http_%d" % status
+        if status != 200:
+            return False, "http_%d" % status
         try:
             result = json.loads(raw.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
