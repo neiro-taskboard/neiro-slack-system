@@ -63,6 +63,33 @@ else
   echo "service running"
 fi
 
+# Auto-join timer units (2026-11-18): auto-join.py runs on a 1-minute
+# systemd timer (slack-auto-join.timer) instead of being called
+# directly from this watchdog. Reinstall the units from the workspace
+# copies if /etc lost them (VM replacement) or they are stale, and
+# make sure the timer is enabled and active. Best effort: a failure
+# here must not break the watchdog.
+AJ_CHANGED=0
+for AJ_UNIT in slack-auto-join.service slack-auto-join.timer; do
+  AJ_SRC="/home/hatch/workspace/slack-listener/$AJ_UNIT"
+  AJ_DST="/etc/systemd/system/$AJ_UNIT"
+  if [ ! -f "$AJ_DST" ] || ! cmp -s "$AJ_SRC" "$AJ_DST"; then
+    if cp "$AJ_SRC" "$AJ_DST"; then
+      AJ_CHANGED=1
+      echo "auto-join unit reinstalled: $AJ_UNIT"
+    else
+      echo "auto-join unit reinstall failed: $AJ_UNIT" >&2
+    fi
+  fi
+done
+if [ "$AJ_CHANGED" = "1" ]; then
+  systemctl daemon-reload || true
+fi
+if ! systemctl is-active --quiet slack-auto-join.timer; then
+  systemctl enable --now slack-auto-join.timer >/dev/null 2>&1 || systemctl start slack-auto-join.timer
+  echo "auto-join timer started"
+fi
+
 # フックの単一正本チェック（2026-11-15、Yama さんの同期ずれ指摘を取り込み）。
 # 稼働中の ~/hooks はリポジトリへのシンボリックリンクが正本。リンク切れ・
 # 通常ファイルによる上書き・壊れた構文があれば Slack へ警告する。照合の
@@ -86,11 +113,11 @@ if [ -x "$SYNC_CHECK" ]; then
 fi
 
 # Auto-join public channels (2026-11-18, owner's standing permission:
-# the bot does not need to ask before joining). Joins only public
-# channels where the bot's user account is already a member and at
-# least 2 members are present, so default empty channels and private
-# channels are left alone. Best effort: never fails the watchdog.
-python3 /home/hatch/workspace/slack-listener/auto-join.py 2>&1 || true
+# the bot does not need to ask before joining) runs on the 1-minute
+# systemd timer above, no longer as a direct call from this watchdog.
+# It joins only public channels where the bot's user account is
+# already a member and at least 2 members are present, so default
+# empty channels and private channels are left alone.
 
 # Catch up on messages posted while the listener was down. Best effort:
 # a failure here must not break the watchdog itself.

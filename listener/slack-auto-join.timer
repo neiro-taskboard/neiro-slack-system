@@ -1,0 +1,10 @@
+[Unit]
+Description=Run slack-auto-join every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+Unit=slack-auto-join.service
+
+[Install]
+WantedBy=timers.target
