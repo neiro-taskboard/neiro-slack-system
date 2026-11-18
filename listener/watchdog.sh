@@ -112,6 +112,28 @@ if [ -x "$SYNC_CHECK" ]; then
   fi
 fi
 
+# リスナーの同期チェック（2026-11-18、Yama さんの質問を取り込み）。
+# フックはシンボリックリンクで単一正本化されているが、リスナー側
+# （~/workspace/slack-listener/*.py など）は実体コピーのため、同じ罠が
+# 起きた。Yanayana さんのガードがリポジトリにだけあって稼働中の
+# auto-join.py に反映されていないずれを、手作業の diff で見つけたのが
+# きっかけ。上のフックのチェックと同じ形で、内容のずれ・欠落・構文
+# エラーを検出したら Slack へ警告する（重複抑止はハッシュ付き状態ファイル）。
+LISTENER_SYNC_CHECK="/home/hatch/workspace/neiro-slack-system/hooks/scripts/slack-listener-sync-check.sh"
+LISTENER_SYNC_STATE="/home/hatch/hooks/state/listener-sync-check.state"
+if [ -x "$LISTENER_SYNC_CHECK" ]; then
+  if ! LISTENER_SYNC_OUT="$("$LISTENER_SYNC_CHECK" 2>&1)"; then
+    LISTENER_SYNC_SIG="$(printf '%s' "$LISTENER_SYNC_OUT" | md5sum | cut -d' ' -f1)"
+    if [ ! -f "$LISTENER_SYNC_STATE" ] || [ "$(cat "$LISTENER_SYNC_STATE" 2>/dev/null)" != "$LISTENER_SYNC_SIG" ]; then
+      printf '%s' "$LISTENER_SYNC_SIG" > "$LISTENER_SYNC_STATE"
+      LISTENER_SYNC_MSG="リスナーの同期チェックで異常を検出しました。稼働中の ~/workspace/slack-listener とリポジトリの内容がずれています。確認してください：$(printf '%s' "$LISTENER_SYNC_OUT" | head -5 | tr '\n' ' ')"
+      /home/hatch/hooks/scripts/slack-send-locked.sh --channel C0CGYGT9V7G --workspace muse-board --request-id "listener-sync-$LISTENER_SYNC_SIG" --message "$LISTENER_SYNC_MSG" >/dev/null 2>&1 || true
+    fi
+  else
+    rm -f "$LISTENER_SYNC_STATE"
+  fi
+fi
+
 # Auto-join public channels (2026-11-18, owner's standing permission:
 # the bot does not need to ask before joining) runs on the 1-minute
 # systemd timer above, no longer as a direct call from this watchdog.
