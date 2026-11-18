@@ -29,6 +29,7 @@ Set BACKFILL_DRY_RUN=1 to print what would be appended without writing.
 """
 import json
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -40,6 +41,15 @@ SLACKCLI_STORE = "/home/hatch/.config/slackcli/workspaces.json"
 SLACKCLI = "/home/hatch/workspace/bin/slackcli"
 
 SKIP_SUBTYPES = {"message_changed", "message_deleted", "channel_join", "channel_leave"}
+# slackcli's `conversations read --json` strips the subtype field, so a
+# channel_join / channel_leave message arrives looking like an ordinary
+# message. Match its rendered text as a fallback (2026-11-18: found
+# while adding the auto-join seed — the same hole exists here).
+SYSTEM_TEXT_RE = re.compile(
+    r"^<@U[A-Z0-9]+>さんがチャンネルに参加しました$"
+    r"|^<@U[A-Z0-9]+>さんがチャンネルから退出しました$"
+    r"|^<@U[A-Z0-9]+> has (joined|left) the channel$"
+)
 DRY_RUN = os.environ.get("BACKFILL_DRY_RUN") == "1"
 
 
@@ -147,6 +157,8 @@ def main():
                 if (wid, channel, ts) in seen:
                     continue
                 if m.get("subtype") in SKIP_SUBTYPES:
+                    continue
+                if SYSTEM_TEXT_RE.match(m.get("text", "")):
                     continue
                 if m.get("user") in own_user.values():
                     continue

@@ -18,13 +18,41 @@ Rules (all must hold for a channel to be joined):
 - at least MIN_MEMBERS members (excludes default empty channels
   where only the user account sits alone).
 
+Seed on join (2026-11-18, Yama's point): the watchdog only runs
+every 5 minutes, so up to ~5 minutes of posts can land in a channel
+before the bot joins — and the listener cannot see a channel it has
+not joined yet. The backfill cannot recover those posts either: it
+only covers channels that already have an inbox baseline, and only
+messages newer than that baseline. So right after joining, this
+script seeds the channel's recent top-level history (last
+SEED_WINDOW_SECS, default 15 minutes) into the inbox as backfilled
+events, so they flow through the normal pipeline. The same seeding
+also runs for channels the bot is already a member of but which have
+no inbox baseline yet (e.g. joined by hand, or a join whose seed
+failed last time) — it self-heals instead of leaving the gap.
+
+Seeding is bounded: only top-level messages (parity with backfill
+v1 — thread replies in the gap are still not covered), only inside
+the window, never the bot's/user account's own posts, never
+channel_join/leave or edited/deleted subtypes, and never anything
+already in the inbox (dedup by event id). slackcli strips the
+subtype field from history reads, so join/leave messages are also
+caught by matching their rendered text.
+
 Run from watchdog.sh (best effort, never fails the watchdog).
-Set AUTO_JOIN_DRY_RUN=1 to print what would be joined.
+Set AUTO_JOIN_DRY_RUN=1 to print what would be joined/seeded.
+Set AUTO_JOIN_SEED_TEST_CHANNEL=<id> (with DRY_RUN=1) to simulate
+seeding one channel the bot is already in, without joining anything.
+Set AUTO_JOIN_SEED_WINDOW_SECS=<secs> to override the seed window.
 """
 import json
 import os
+import re
 import subprocess
 import sys
+import time
+from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE, "config.json")
@@ -32,6 +60,19 @@ SLACKCLI_STORE = "/home/hatch/.config/slackcli/workspaces.json"
 SLACKCLI = "/home/hatch/workspace/bin/slackcli"
 MIN_MEMBERS = 2
 DRY_RUN = os.environ.get("AUTO_JOIN_DRY_RUN") == "1"
+SEED_WINDOW_SECS = int(os.environ.get("AUTO_JOIN_SEED_WINDOW_SECS", "900"))
+SEED_LIMIT = 20
+SEED_TEST_CHANNEL = os.environ.get("AUTO_JOIN_SEED_TEST_CHANNEL", "")
+SKIP_SUBTYPES = {"message_changed", "message_deleted", "channel_join", "channel_leave"}
+# slackcli's `conversations read --json` strips the subtype field, so a
+# channel_join / channel_leave message arrives looking like an ordinary
+# message. Match its rendered text as a fallback, or the seed would
+# inject "Xさんがチャンネルに参加しました" noise into the inbox.
+SYSTEM_TEXT_RE = re.compile(
+    r"^<@U[A-Z0-9]+>さんがチャンネルに参加しました$"
+    r"|^<@U[A-Z0-9]+>さんがチャンネルから退出しました$"
+    r"|^<@U[A-Z0-9]+> has (joined|left) the channel$"
+)
 
 
 def load_json(path):
@@ -79,10 +120,140 @@ def is_candidate(channel, members, user_id):
     return True
 
 
+def load_inbox_state(inbox_path):
+    """Return (seen event ids, channels with a baseline, domains)."""
+    seen = set()
+    baselines = set()
+    domains = {}
+    if not os.path.exists(inbox_path):
+        return seen, baselines, domains
+    with open(inbox_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                e = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            wid = e.get("workspace_id", "")
+            ch = e.get("channel", "")
+            ts = e.get("ts", "")
+            if wid and ch:
+                baselines.add((wid, ch))
+            if wid and ch and ts:
+                seen.add((wid, ch, ts))
+            if e.get("permalink"):
+                try:
+                    domains[wid] = urlparse(e["permalink"]).netloc
+                except Exception:
+                    pass
+    return seen, baselines, domains
+
+
+def build_permalink(domain, channel, ts, thread_ts):
+    if not domain:
+        return ""
+    p = f"https://{domain}/archives/{channel}/p{ts.replace('.', '')}"
+    if thread_ts:
+        p += f"?thread_ts={thread_ts}&cid={channel}"
+    return p
+
+
+def seed_channel(ws, channel_id, bot_key, own_ids, seen, domains,
+                  inbox_path, dry=False):
+    """Seed a just-joined channel's recent top-level history.
+
+    Returns the number of events added (or that would be added).
+    Never raises: a seed failure must not break the watchdog run.
+    """
+    wid = ws.get("workspace_id", "")
+    try:
+        data = run_slackcli(
+            [
+                "conversations", "read", channel_id,
+                "--workspace", bot_key, "--limit", str(SEED_LIMIT), "--json",
+            ]
+        )
+        if not data:
+            return 0
+        cutoff = time.time() - SEED_WINDOW_SECS
+        new_events = []
+        for m in data.get("messages", []):
+            ts = m.get("ts", "")
+            if not ts:
+                continue
+            try:
+                if float(ts) <= cutoff:
+                    continue
+            except ValueError:
+                continue
+            if (wid, channel_id, ts) in seen:
+                continue
+            if m.get("subtype") in SKIP_SUBTYPES:
+                continue
+            if SYSTEM_TEXT_RE.match(m.get("text", "")):
+                continue
+            if m.get("user") in own_ids:
+                continue
+            thread_ts = m.get("thread_ts", "")
+            if thread_ts and thread_ts != ts:
+                continue  # thread reply; backfill v1 parity
+            ev = {
+                "workspace_id": wid,
+                "workspace_name": ws.get("workspace_name", ""),
+                "identity": "bot",
+                "channel": channel_id,
+                "channel_type": "channel",
+                "user": m.get("user", ""),
+                "bot_id": m.get("bot_id", ""),
+                "text": m.get("text", ""),
+                "ts": ts,
+                "thread_ts": thread_ts,
+                "permalink": build_permalink(
+                    domains.get(wid, ""), channel_id, ts, thread_ts),
+                "received_at": datetime.now(timezone.utc).isoformat(),
+                "backfilled": True,
+            }
+            new_events.append(ev)
+        new_events.sort(key=lambda e: e["ts"])
+        if not new_events:
+            return 0
+        if dry:
+            for ev in new_events:
+                log(f"DRY-RUN would seed [{ws.get('workspace_name', '')}] "
+                    f"{channel_id} {ev['ts']} {ev['user']}: "
+                    f"{ev['text'][:60]}")
+        else:
+            with open(inbox_path, "a", encoding="utf-8") as f:
+                for ev in new_events:
+                    f.write(json.dumps(ev, ensure_ascii=False) + "\n")
+                    seen.add((wid, channel_id, ev["ts"]))
+            for ev in new_events:
+                log(f"seeded [{ws.get('workspace_name', '')}] "
+                    f"{channel_id} {ev['ts']} {ev['user']}: "
+                    f"{ev['text'][:60]}")
+        return len(new_events)
+    except Exception as e:  # noqa: BLE001 - best effort, never fail watchdog
+        log(f"seed failed for {channel_id}: {e}")
+        return 0
+
+
 def main():
     config = load_json(CONFIG_PATH)
     store = load_json(SLACKCLI_STORE)
+    inbox_path = config.get("inbox_path", "")
+    seen, baselines, domains = load_inbox_state(inbox_path)
+    # Own ids (bot user id and user-account id per workspace) — neiro's
+    # own posts must never be seeded as "missed" messages.
+    own_ids = set()
+    for ws in config.get("workspaces", []):
+        for key in (ws.get("slackcli_key", ""), ws.get("slackcli_user_key", "")):
+            entry = store.get("workspaces", {}).get(key, {})
+            if entry.get("user_id"):
+                own_ids.add(entry["user_id"])
     joined = 0
+    seeded = 0
     checked = 0
     for ws in config.get("workspaces", []):
         bot_key = ws.get("slackcli_key", "")
@@ -103,7 +274,16 @@ def main():
             continue
         for ch in data.get("conversations", []):
             checked += 1
-            if ch.get("is_member") or ch.get("is_private") or ch.get("is_archived"):
+            if ch.get("is_member"):
+                # Already a member but no inbox baseline yet (joined by
+                # hand, or a previous seed failed): seed the recent
+                # history so the join gap is closed retroactively.
+                if (ws.get("workspace_id", ""), ch["id"]) not in baselines:
+                    seeded += seed_channel(
+                        ws, ch["id"], bot_key, own_ids, seen, domains,
+                        inbox_path, dry=DRY_RUN)
+                continue
+            if ch.get("is_private") or ch.get("is_archived"):
                 continue
             if (ch.get("num_members") or 0) < MIN_MEMBERS:
                 continue
@@ -131,9 +311,19 @@ def main():
                 log(f"joined [{ws.get('workspace_name', '')}] "
                     f"#{ch.get('name', '')} ({ch['id']})")
                 joined += 1
+                seeded += seed_channel(
+                    ws, ch["id"], bot_key, own_ids, seen, domains,
+                    inbox_path, dry=False)
             else:
                 log(f"join failed for {ch['id']}")
-    log(f"done: checked {checked} channels, joined {joined}"
+    if DRY_RUN and SEED_TEST_CHANNEL:
+        for ws in config.get("workspaces", []):
+            if ws.get("workspace_id") == "T0CGV6V7161":
+                seeded += seed_channel(
+                    ws, SEED_TEST_CHANNEL, ws.get("slackcli_key", ""),
+                    own_ids, seen, domains, inbox_path, dry=True)
+    log(f"done: checked {checked} channels, joined {joined}, "
+        f"seeded {seeded} messages"
         + (" (dry run)" if DRY_RUN else ""))
     return 0
 
