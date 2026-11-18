@@ -154,6 +154,38 @@ if [ -x "$LISTENER_SYNC_CHECK" ]; then
   fi
 fi
 
+# 最古の未処理イベントの警告（2026-11-19、Yanayana さんの依頼を取り込み）。
+# fastpath の取り戻しは 120 秒、確認の余裕 60 秒で、警告は 180 秒。
+# 最古の未処理（done / dead 以外）が 180 秒以上なら Slack へ警告し、
+# フラグファイルを作る。警告なし（未処理 0 件、または最古でも 180 秒
+# 未満）になったらフラグと警告状態を消す（0件で削除、の形）。
+# 警告は最古のイベント ID が変わったときだけ送る（年齢の秒数を署名に
+# 入れると 5 分ごとに変わって連投になるため）。復旧したら状態ファイルを
+# 消すので、次の詰まりではまた警告が出る。警告の送信に失敗しても
+# ウォッチドッグは止めない。
+OLDEST_CHECK="/home/hatch/workspace/neiro-slack-system/hooks/scripts/slack-oldest-unprocessed-check.sh"
+OLDEST_STATE="/home/hatch/hooks/state/oldest-unprocessed-warning.state"
+OLDEST_FLAG="/home/hatch/hooks/state/oldest-unprocessed-warning.flag"
+if [ -x "$OLDEST_CHECK" ]; then
+  if OLDEST_OUT="$("$OLDEST_CHECK" 2>/dev/null)"; then
+    rm -f "$OLDEST_FLAG" "$OLDEST_STATE"
+  else
+    OLDEST_FIELDS="$(printf '%s' "$OLDEST_OUT" | python3 -c 'import json,sys; d=json.load(sys.stdin); print((d.get("oldest_event_id") or "") + "|" + str(d.get("oldest_age_secs") or "") + "|" + str(d.get("unprocessed_count") or ""))' 2>/dev/null)"
+    IFS='|' read -r OLDEST_ID OLDEST_AGE OLDEST_COUNT <<< "$OLDEST_FIELDS"
+    if [ -n "$OLDEST_ID" ]; then
+      printf '%s' "$OLDEST_ID" > "$OLDEST_FLAG"
+      OLDEST_SIG="$(printf '%s' "$OLDEST_ID" | md5sum | cut -d' ' -f1)"
+      if [ ! -f "$OLDEST_STATE" ] || [ "$(cat "$OLDEST_STATE" 2>/dev/null)" != "$OLDEST_SIG" ]; then
+        printf '%s' "$OLDEST_SIG" > "$OLDEST_STATE"
+        OLDEST_MSG="最古の未処理イベントが180秒以上経っています：${OLDEST_ID}（${OLDEST_AGE}秒、未処理 ${OLDEST_COUNT}件）。フックのワーカーが起動していないか、処理が詰まっている可能性があります。"
+        /home/hatch/hooks/scripts/slack-send-locked.sh --channel C0CGYGT9V7G --workspace muse-board --request-id "oldest-unprocessed-$OLDEST_SIG" --message "$OLDEST_MSG" >/dev/null 2>&1 || true
+      fi
+    else
+      echo "oldest-unprocessed check output unparseable: $OLDEST_OUT" >&2
+    fi
+  fi
+fi
+
 # Auto-join public channels (2026-11-18, owner's standing permission:
 # the bot does not need to ask before joining) runs on the 1-minute
 # systemd timer above, no longer as a direct call from this watchdog.
