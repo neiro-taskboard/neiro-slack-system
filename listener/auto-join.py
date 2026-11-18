@@ -144,39 +144,80 @@ def state_key(workspace_id, channel_id):
     return f"{workspace_id}:{channel_id}"
 
 
-def load_join_state(path):
-    """Return (joined, removed) channel-key sets from the state file.
+def is_valid_state(data):
+    """Shape check for a join-state dict.
 
-    Missing or corrupt state falls back to the backup file
-    (<path>.bak, the state as of the previous save); only if both
-    are unusable does it start empty. The next run then re-records
-    current memberships as the initial state. The backup matters
-    because `removed` cannot be re-derived from current memberships:
-    without it, a channel the bot was removed from would look like
-    one it never joined and would be auto-joined again.
-    (2026-11-18, Yanayana's point in the auto-join thread.)
+    A state file must be a dict with "joined" and "removed" keys,
+    both lists of channel-key strings. This is stricter than "parses
+    as JSON": a file that decayed into {} or {"joined": []} still
+    parses, but it has lost the removal record, so it must never be
+    trusted as the current state or copied over a good backup
+    (2026-11-18, Yama's sanity-check guard).
     """
-    joined, removed = set(), set()
-    data = None
+    if not isinstance(data, dict):
+        return False
+    for key in ("joined", "removed"):
+        value = data.get(key)
+        if not isinstance(value, list):
+            return False
+        if not all(isinstance(item, str) for item in value):
+            return False
+    return True
+
+
+def _load_valid_state(path):
+    """Read one state file, returning its dict or None if unusable."""
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, ValueError):
-        try:
-            with open(f"{path}.bak", encoding="utf-8") as f:
-                data = json.load(f)
+        return None
+    return data if is_valid_state(data) else None
+
+
+def load_join_state(path):
+    """Return (joined, removed, status) channel-key sets.
+
+    status is one of:
+    - "ok": the main file read and passed the shape check.
+    - "recovered": the main file was unusable and the backup was
+      used instead; callers should write the recovered state back
+      at once, so the next save cannot rotate a corrupt main file
+      over the good backup.
+    - "fresh": neither file exists yet (first run); an empty state
+      is correct.
+    - "unusable": at least one file exists but neither could be
+      trusted. Callers must NOT proceed on this: starting empty
+      would forget every removal record and auto-join channels the
+      bot was removed from. Stop and let a human look
+      (2026-11-18, Yama's proposal).
+
+    The backup matters because `removed` cannot be re-derived from
+    current memberships: without it, a channel the bot was removed
+    from would look like one it never joined and would be auto-joined
+    again. (2026-11-18, Yanayana's point in the auto-join thread.)
+    """
+    joined, removed = set(), set()
+    data = _load_valid_state(path)
+    if data is not None:
+        status = "ok"
+    else:
+        data = _load_valid_state(f"{path}.bak")
+        if data is not None:
             log(f"join state {path} unreadable, recovered from backup")
-        except (OSError, ValueError):
-            return joined, removed
-    if not isinstance(data, dict):
-        return joined, removed
-    for key in data.get("joined", []) or []:
-        if isinstance(key, str):
-            joined.add(key)
-    for key in data.get("removed", []) or []:
-        if isinstance(key, str):
-            removed.add(key)
-    return joined, removed
+            status = "recovered"
+        elif not os.path.exists(path) \
+                and not os.path.exists(f"{path}.bak"):
+            return joined, removed, "fresh"
+        else:
+            log(f"join state {path} unusable (main and backup both "
+                "failed), refusing to start empty")
+            return joined, removed, "unusable"
+    for key in data["joined"]:
+        joined.add(key)
+    for key in data["removed"]:
+        removed.add(key)
+    return joined, removed, status
 
 
 def save_join_state(path, joined, removed):
@@ -185,11 +226,15 @@ def save_join_state(path, joined, removed):
 
     The previous state is kept as <path>.bak first, so a deleted or
     corrupt state file can be recovered on the next load (see
-    load_join_state). Only a state file that still parses is copied
-    to the backup: if the main file itself got corrupted on disk,
-    copying it over the backup would destroy the last good copy
-    (2026-11-18, Yanayana's guard). The backup is best effort: if
-    it fails, the new state is still written."""
+    load_join_state). Only a state file that passes the shape check
+    is copied to the backup: if the main file itself got corrupted
+    on disk, copying it over the backup would destroy the last good
+    copy (2026-11-18, Yanayana's guard, strengthened 2026-11-18 with
+    Yama's shape check). A valid-but-empty main file is also kept
+    out of the backup while the backup still holds entries: that
+    shape means the record was wiped, not reset (Yama's count
+    sanity check). The backup is best effort: if it fails, the
+    new state is still written."""
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = f"{path}.tmp"
@@ -199,14 +244,19 @@ def save_join_state(path, joined, removed):
                 f, ensure_ascii=False, indent=2)
         try:
             if os.path.exists(path):
-                with open(path, encoding="utf-8") as f:
-                    old = json.load(f)
-                if isinstance(old, dict):
-                    shutil.copyfile(path, f"{path}.bak")
+                old = _load_valid_state(path)
+                keep_bak = old is None
+                if old is not None and not old["joined"] \
+                        and not old["removed"]:
+                    bak = _load_valid_state(f"{path}.bak")
+                    if bak and (bak["joined"] or bak["removed"]):
+                        keep_bak = True
+                if keep_bak:
+                    log(f"join state {path} is not a trustworthy "
+                        "previous state, keeping previous backup")
                 else:
-                    log(f"join state {path} is not a state dict, "
-                        "keeping previous backup")
-        except (OSError, ValueError) as e:
+                    shutil.copyfile(path, f"{path}.bak")
+        except OSError as e:
             log(f"could not back up join state {path}: {e}")
         os.replace(tmp, path)
     except OSError as e:
@@ -439,7 +489,17 @@ def main():
     joined = 0
     seeded = 0
     checked = 0
-    joined_keys, removed_keys = load_join_state(STATE_PATH)
+    joined_keys, removed_keys, state_status = load_join_state(STATE_PATH)
+    if state_status == "unusable":
+        # Fail closed: an empty state would forget every removal
+        # record and rejoin channels the bot was removed from.
+        # The timer unit fails visibly so a human looks at it.
+        return 1
+    if state_status == "recovered":
+        # Write the recovered state back at once, so the main file
+        # is healthy again before the join loop runs (2026-11-18,
+        # Yama's proposal).
+        save_join_state(STATE_PATH, joined_keys, removed_keys)
     for ws in config.get("workspaces", []):
         bot_key = ws.get("slackcli_key", "")
         user_key = ws.get("slackcli_user_key", "")

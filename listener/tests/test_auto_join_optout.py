@@ -126,21 +126,84 @@ class StateFileTest(unittest.TestCase):
     def test_roundtrip(self):
         auto_join.save_join_state(
             self.path, {"T0TEST:C1"}, {"T0TEST:C2"})
-        joined, removed = auto_join.load_join_state(self.path)
+        joined, removed, status = auto_join.load_join_state(self.path)
+        self.assertEqual(status, "ok")
         self.assertEqual(joined, {"T0TEST:C1"})
         self.assertEqual(removed, {"T0TEST:C2"})
 
-    def test_missing_file_starts_empty(self):
-        joined, removed = auto_join.load_join_state(self.path)
+    def test_missing_files_are_fresh(self):
+        # Neither file exists: first run, an empty state is correct.
+        joined, removed, status = auto_join.load_join_state(self.path)
+        self.assertEqual(status, "fresh")
         self.assertEqual(joined, set())
         self.assertEqual(removed, set())
 
-    def test_corrupt_file_starts_empty(self):
+    def test_corrupt_file_with_no_backup_is_unusable(self):
+        # Yama's fail-closed proposal (2026-11-18): a corrupt main
+        # with no usable backup must not start empty — that would
+        # forget every removal record.
         with open(self.path, "w") as f:
             f.write("{not json")
-        joined, removed = auto_join.load_join_state(self.path)
+        joined, removed, status = auto_join.load_join_state(self.path)
+        self.assertEqual(status, "unusable")
         self.assertEqual(joined, set())
         self.assertEqual(removed, set())
+
+    def test_both_corrupt_is_unusable(self):
+        auto_join.save_join_state(
+            self.path, {"T0TEST:C1"}, {"T0TEST:C2"})
+        auto_join.save_join_state(
+            self.path, {"T0TEST:C1"}, {"T0TEST:C2", "T0TEST:C3"})
+        with open(self.path, "w") as f:
+            f.write("{corrupted")
+        with open(f"{self.path}.bak", "w") as f:
+            f.write("{also corrupted")
+        joined, removed, status = auto_join.load_join_state(self.path)
+        self.assertEqual(status, "unusable")
+
+    def test_empty_dict_main_falls_back_to_backup(self):
+        # Yama's shape check (2026-11-18): {} parses as JSON but has
+        # lost the removal record, so it must fall back to the backup
+        # instead of being trusted.
+        auto_join.save_join_state(
+            self.path, {"T0TEST:C1"}, {"T0TEST:C2"})
+        auto_join.save_join_state(
+            self.path, {"T0TEST:C1"}, {"T0TEST:C2", "T0TEST:C3"})
+        with open(self.path, "w") as f:
+            f.write("{}")
+        joined, removed, status = auto_join.load_join_state(self.path)
+        self.assertEqual(status, "recovered")
+        self.assertEqual(joined, {"T0TEST:C1"})
+        self.assertEqual(removed, {"T0TEST:C2"})
+
+    def test_corrupt_main_recovers_from_backup(self):
+        auto_join.save_join_state(
+            self.path, {"T0TEST:C1"}, {"T0TEST:C2"})
+        auto_join.save_join_state(
+            self.path, {"T0TEST:C1"}, {"T0TEST:C2", "T0TEST:C3"})
+        with open(self.path, "w") as f:
+            f.write("{corrupted")
+        joined, removed, status = auto_join.load_join_state(self.path)
+        self.assertEqual(status, "recovered")
+        self.assertEqual(joined, {"T0TEST:C1"})
+        self.assertEqual(removed, {"T0TEST:C2"})
+
+    def test_empty_main_does_not_overwrite_nonempty_backup(self):
+        # Yama's count sanity check (2026-11-18): a valid-but-empty
+        # main file while the backup still holds entries means the
+        # record was wiped, not reset — keep the backup.
+        auto_join.save_join_state(
+            self.path, {"T0TEST:C1"}, {"T0TEST:C2"})
+        auto_join.save_join_state(
+            self.path, {"T0TEST:C1"}, {"T0TEST:C2", "T0TEST:C3"})
+        with open(self.path, "w") as f:
+            json.dump({"joined": [], "removed": []}, f)
+        auto_join.save_join_state(
+            self.path, {"T0TEST:C9"}, set())
+        with open(f"{self.path}.bak") as f:
+            bak = json.load(f)
+        self.assertEqual(bak["joined"], ["T0TEST:C1"])
+        self.assertEqual(bak["removed"], ["T0TEST:C2"])
 
     def test_good_main_updates_backup(self):
         # Two good saves: the backup holds the previous generation.
@@ -170,7 +233,8 @@ class StateFileTest(unittest.TestCase):
         self.assertEqual(bak["removed"], ["T0TEST:C2"])
         # The new main is the fresh save, and the corrupt generation
         # is gone, but the backup still holds the good state.
-        joined, removed = auto_join.load_join_state(self.path)
+        joined, removed, status = auto_join.load_join_state(self.path)
+        self.assertEqual(status, "ok")
         self.assertEqual(joined, {"T0TEST:C9"})
 
 
