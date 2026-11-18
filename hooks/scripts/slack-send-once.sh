@@ -653,6 +653,11 @@ check_metadata() {
   if [ -n "$WORKSPACE" ]; then meta_args+=(--workspace "$WORKSPACE"); fi
   if [ -n "$THREAD_TS" ]; then meta_args+=(--thread-ts "$THREAD_TS"); fi
   if [ -n "$EVENT_ID" ]; then meta_args+=(--event-id "$EVENT_ID"); else meta_args+=(--request-id "$REQUEST_ID"); fi
+  # イベント駆動の送信では、重複はイベントの後でしか起きないので
+  # イベントの ts より後の投稿だけ読む（2026-11-19、101件スレッドの
+  # 約606KB読みが IncompleteRead で切れたため。Yanayana さんの
+  # --oldest <floor> 付き1ページの割り切りと同じ考え方）。
+  if [ -n "$EVENT_ID" ]; then meta_args+=(--oldest "${EVENT_ID##*:}"); fi
   out=$(python3 "$READ_META" "${meta_args[@]}" 2>/dev/null || true)
   found_ts=$(printf '%s' "$out" | python3 -c "
 import sys, json
@@ -685,8 +690,11 @@ sys.exit(1)
 # slack-read-metadata.py --dump（include_all_metadata 付き）で読み直し、
 # 自分の投稿のうち印（event_id / request_id）が現在の送信と違うものを
 # 文面一致の候補から外す（2026-11-15、ヘッダーの 13）。印のない投稿は
-# 従来どおり文面で拾う。--dump は1ページで親＋直近100件を返す
-# （conversations.replies の実測）ので、従来の窓（直近100件）と同じ。
+# 従来どおり文面で拾う。--dump は20件ずつページングして直近100件を返す
+# ので、従来の窓（直近100件）と同じ。イベント駆動の送信では
+# --oldest にイベントの ts を渡し、イベントより後の投稿だけ読む
+# （2026-11-19、101件スレッドの約606KB読みが IncompleteRead で
+# 切れたため。Yanayana さんの提案を取り入れ）。
 # 読み取り失敗時は最大5回リトライし、それでも読めなければ cannot-verify
 # （check_duplicate_thread と同じ間隔・回数）。
 check_duplicate_thread_marked() {
@@ -696,6 +704,9 @@ check_duplicate_thread_marked() {
     attempt=$((attempt + 1))
     dump_args=(--channel "$CHANNEL" --thread-ts "$THREAD_TS" --dump)
     if [ -n "$WORKSPACE" ]; then dump_args+=(--workspace "$WORKSPACE"); fi
+    # イベント駆動の送信では、重複はイベントの後でしか起きないので
+    # イベントの ts より後の投稿だけ読む（check_metadata と同じ理由）。
+    if [ -n "$EVENT_ID" ]; then dump_args+=(--oldest "${EVENT_ID##*:}"); fi
     raw=$(python3 "$READ_META" "${dump_args[@]}" 2>/dev/null || true)
     found=$(printf '%s' "$raw" | python3 -c "
 import sys, json, re

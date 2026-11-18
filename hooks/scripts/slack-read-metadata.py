@@ -32,19 +32,23 @@ Slack の event_id（Ev…の形）とは中身が違うが、元のイベント
       # --dump: 印付きの投稿一覧を出す（文面照合のガード用、2026-11-15）。
       # slackcli の読み取りでは metadata が返ってこないので、印の違いが
       # 見えない。--dump は各投稿に印（event_id / request_id、無ければ
-      # null）を付けて返す。スレッド指定時は conversations.replies
-      # （親＋直近 limit 件が1ページで取れる）、未指定時は
-      # conversations.history。ページングはしない（文面照合の窓は
-      # 直近100件、という slack-send-once.sh の割り切りと同じ）。
+      # null）を付けて返す。スレッド指定時は conversations.replies、
+      # 未指定時は conversations.history。20件ずつページングして
+      # 直近 limit 件を返す（2026-11-19、101件スレッドの約606KB読みが
+      # IncompleteRead で切れたため。Yanayana さんの提案）。
+      # 文面照合の窓は直近100件、という slack-send-once.sh の割り切りと同じ。
 
 出力: JSON 1行 {"ok": true, "found": true/false, "ts": ...,
                 "checked": <見た件数>}。
   失敗時は {"ok": false, "error": ...} を出し、終了コード 1。
 
 注意: スレッド指定時は conversations.replies、未指定時は
-  conversations.history を使う。ページングは最大 3 ページまで
-  （スレッドの重複チェックは直近 100 件で足りる、という
-  slack-send-once.sh の割り切りと同じ）。
+  conversations.history を使う。ページングは最大 6 ページまで
+  （1ページ20件。101件スレッドの metadata 付き1ページ読み
+  （約606KB）が IncompleteRead で切れたため、2026-11-19 に
+  小さいページ＋カーソルへ変更。Yanayana さんの提案）。
+  スレッドの重複チェックは直近 100 件で足りる、という
+  slack-send-once.sh の割り切りと同じ。
 """
 import argparse
 import http.client
@@ -62,7 +66,12 @@ REPLIES_API = "https://slack.com/api/conversations.replies"
 EVENT_TYPE = "neiro_reply"
 MAX_ATTEMPTS = 3
 BACKOFF_SECS = (1, 2)
-MAX_PAGES = 3
+# metadata 付きの1ページは大きい（101件スレッドで約606KB）ため
+# IncompleteRead で途中で切れる。1ページを20件に絞り、カーソルで
+# 回す。2026-11-19、Yanayana さんの提案（limit を小さくして
+# カーソルで回す）を採用。20件×6ページ＝120件で101件スレッドを覆う。
+PAGE_LIMIT = 20
+MAX_PAGES = 6
 
 
 def load_workspaces(path=None):
@@ -196,11 +205,18 @@ def fetch_page(url, params, token, urlopen=urllib.request.urlopen,
 
 def find_by_metadata(channel, thread_ts=None, event_id=None, request_id=None,
                      self_id=None, workspace=None, limit=100, token=None,
+                     oldest=None,
                      urlopen=urllib.request.urlopen, sleep=time.sleep):
     """印に一致する投稿を探す。
 
     見つかれば {"found": True, "ts": ...}、無ければ {"found": False} を返す。
     読めなければ RuntimeError。token を渡さなければ workspace から解決する。
+    1ページは PAGE_LIMIT（20件）に絞り、カーソルで最大 MAX_PAGES ページ
+    まで回る（2026-11-19、101件スレッドの約606KB読みが IncompleteRead
+    で切れたため。Yanayana さんの提案）。
+    oldest を渡すと、その時刻より後の投稿だけを読む（イベント駆動の
+    返信では、重複はイベントの後でしか起きないため。Yanayana さんの
+    --oldest <floor> 付き1ページの割り切りと同じ考え方）。
     """
     if bool(event_id) == bool(request_id):
         raise ValueError("event_id と request_id はどちらか一方だけ指定する")
@@ -214,11 +230,13 @@ def find_by_metadata(channel, thread_ts=None, event_id=None, request_id=None,
     if thread_ts:
         url = REPLIES_API
         params = {"channel": channel, "ts": thread_ts,
-                  "include_all_metadata": "true", "limit": str(limit)}
+                  "include_all_metadata": "true", "limit": str(PAGE_LIMIT)}
     else:
         url = HISTORY_API
         params = {"channel": channel,
-                  "include_all_metadata": "true", "limit": str(limit)}
+                  "include_all_metadata": "true", "limit": str(PAGE_LIMIT)}
+    if oldest:
+        params["oldest"] = str(oldest)
     checked = 0
     cursor = None
     for _ in range(MAX_PAGES):
@@ -235,6 +253,8 @@ def find_by_metadata(channel, thread_ts=None, event_id=None, request_id=None,
             if matches(m, key, value, self_id):
                 return {"found": True, "ts": str(m.get("ts", "")),
                         "checked": checked}
+        if checked >= limit:
+            break
         meta = result.get("response_metadata") or {}
         cursor = meta.get("next_cursor") or None
         if not result.get("has_more") or not cursor:
@@ -243,7 +263,8 @@ def find_by_metadata(channel, thread_ts=None, event_id=None, request_id=None,
 
 
 def dump_messages(channel, thread_ts=None, workspace=None, limit=100,
-                  token=None, urlopen=urllib.request.urlopen,
+                  token=None, oldest=None,
+                  urlopen=urllib.request.urlopen,
                   sleep=time.sleep):
     """include_all_metadata 付きで読んだ投稿の一覧を返す。
 
@@ -256,10 +277,15 @@ def dump_messages(channel, thread_ts=None, workspace=None, limit=100,
     外す。印のない投稿は従来どおり文面で拾う。
 
     スレッド指定時は conversations.replies、未指定時は
-    conversations.history。1ページだけ読む（replies は親＋直近 limit
-    件が1ページで取れる。文面照合の窓は直近100件、という
-    slack-send-once.sh の割り切りと同じで、それより古い投稿は
-    文面照合の対象外）。読めなければ RuntimeError。
+    conversations.history。20件ずつページングして読み、直近 limit 件
+    を返す（replies は1ページに親＋直近 PAGE_LIMIT 件を返し、カーソル
+    を辿ると古い方へ進む。2026-11-19 実測。2026-11-19、101件スレッド
+    の約606KB読みが IncompleteRead で切れたため。Yanayana さんの提案）。
+    oldest を渡すと、その時刻より後の投稿だけを読む（イベント駆動の
+    返信では、重複はイベントの後でしか起きないため）。
+    文面照合の窓は直近100件、という slack-send-once.sh の
+    割り切りと同じで、それより古い投稿は文面照合の対象外）。
+    読めなければ RuntimeError。
     """
     if token is None:
         token = resolve_token(workspace)
@@ -268,17 +294,34 @@ def dump_messages(channel, thread_ts=None, workspace=None, limit=100,
     if thread_ts:
         url = REPLIES_API
         params = {"channel": channel, "ts": thread_ts,
-                  "include_all_metadata": "true", "limit": str(limit)}
+                  "include_all_metadata": "true", "limit": str(PAGE_LIMIT)}
     else:
         url = HISTORY_API
         params = {"channel": channel,
-                  "include_all_metadata": "true", "limit": str(limit)}
-    ok, result = fetch_page(url, params, token,
-                            urlopen=urlopen, sleep=sleep)
-    if not ok:
-        raise RuntimeError(result)
+                  "include_all_metadata": "true", "limit": str(PAGE_LIMIT)}
+    if oldest:
+        params["oldest"] = str(oldest)
+    all_messages = []
+    cursor = None
+    for _ in range(MAX_PAGES):
+        page_params = dict(params)
+        if cursor:
+            page_params["cursor"] = cursor
+        ok, result = fetch_page(url, page_params, token,
+                                urlopen=urlopen, sleep=sleep)
+        if not ok:
+            raise RuntimeError(result)
+        all_messages.extend(result.get("messages", []))
+        # 1ページ目が直近分なので、窓が埋まったら古い方は読まない。
+        if limit and len(all_messages) >= limit:
+            break
+        meta = result.get("response_metadata") or {}
+        cursor = meta.get("next_cursor") or None
+        if not result.get("has_more") or not cursor:
+            break
+    window = all_messages[:limit] if limit else all_messages
     messages = []
-    for m in result.get("messages", []):
+    for m in window:
         mark = message_mark(m)
         messages.append({
             "ts": str(m.get("ts", "")),
@@ -300,6 +343,10 @@ def main(argv=None):
     ap.add_argument("--request-id")
     ap.add_argument("--self-id")
     ap.add_argument("--limit", type=int, default=100)
+    ap.add_argument("--oldest",
+                    help="この時刻より後の投稿だけ読む（イベント駆動の返信では"
+                         "イベントの ts を渡す。重複はイベントの後でしか"
+                         "起きないため）")
     ap.add_argument("--dump", action="store_true",
                     help="印付きの投稿一覧を JSON で出す（文面照合のガード用）")
     args = ap.parse_args(argv)
@@ -307,14 +354,16 @@ def main(argv=None):
     try:
         if args.dump:
             result = dump_messages(
-                args.channel, args.thread_ts, args.workspace, args.limit)
+                args.channel, args.thread_ts, args.workspace, args.limit,
+                oldest=args.oldest)
             print(json.dumps({"ok": True, "messages": result["messages"],
                               "checked": result["checked"]},
                              ensure_ascii=False))
             return 0
         result = find_by_metadata(
             args.channel, args.thread_ts, args.event_id, args.request_id,
-            args.self_id, args.workspace, args.limit)
+            args.self_id, args.workspace, args.limit,
+            oldest=args.oldest)
     except (ValueError, RuntimeError) as e:
         print(json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False))
         return 1
