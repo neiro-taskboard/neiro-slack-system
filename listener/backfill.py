@@ -35,6 +35,27 @@ Safety:
   page covers every reply the floor admits even in a long thread.
 
 Set BACKFILL_DRY_RUN=1 to print what would be appended without writing.
+
+Inbox .bak (2026-11-18, Yanayana's seen_state.py approach applied to
+inbox.jsonl): the inbox is append-only and backfill only covers channels
+already in it, so losing the whole inbox also loses the per-channel
+baseline (newest ts) and backfill stops recovering anything. The .bak
+protects that baseline; re-fetching newer messages is still backfill's
+job (its floor is the newest inbox ts per channel).
+- snapshot_inbox(): called on every backfill run; copies the inbox to
+  inbox.jsonl.bak only when every non-empty line parses as JSON and at
+  least one event exists. A broken or empty body never overwrites a
+  good .bak — the same guard as seen_state.py. The bytes copied are
+  the exact bytes validated, so a torn line appended mid-copy cannot
+  sneak into the snapshot.
+- load_inbox(): reads the body first, then the .bak when the body is
+  missing or cannot be opened at all. A body that opens but has broken
+  lines is used as-is (bad lines are skipped, as before).
+- On a .bak recovery, main() rewrites the body from the recovered
+  events (atomic tmp + os.replace; the listener opens the inbox in
+  append mode per event, so the replace cannot lose a message), then
+  backfill runs as usual and re-fetches anything newer than the .bak.
+DRY_RUN skips both the snapshot and the restore (read-only).
 """
 import json
 import os
@@ -71,19 +92,103 @@ def log(msg):
     print(f"[backfill] {msg}", flush=True)
 
 
+def _read_lines(path):
+    """Parse a JSONL file, returning (events, bad_line_count)."""
+    events = []
+    bad = 0
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                events.append(json.loads(line))
+            except json.JSONDecodeError:
+                bad += 1
+    return events, bad
+
+
 def read_inbox(path):
     events = []
     if os.path.exists(path):
-        with open(path, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    events.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
+        events, _bad = _read_lines(path)
     return events
+
+
+BAK_SUFFIX = ".bak"
+
+
+def load_inbox(path):
+    """Read the inbox, falling back to path + '.bak' when the body is
+    missing or cannot be opened at all. Returns (events, from_bak)."""
+    bak = path + BAK_SUFFIX
+    if os.path.exists(path):
+        try:
+            return read_inbox(path), False
+        except OSError as e:
+            log(f"inbox unreadable ({e}); trying .bak")
+    elif os.path.exists(bak):
+        log("inbox missing; trying .bak")
+    if os.path.exists(bak):
+        try:
+            return read_inbox(bak), True
+        except OSError as e:
+            log(f"inbox .bak unreadable too ({e}); starting empty")
+    return [], False
+
+
+def snapshot_inbox(path):
+    """Copy the inbox to path + '.bak', but only when the exact bytes
+    being copied parse fully clean (every non-empty line valid JSON,
+    at least one event). A broken or empty body never overwrites a
+    good .bak. Returns True when the snapshot was written."""
+    bak = path + BAK_SUFFIX
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError as e:
+        log(f"inbox snapshot skipped: unreadable ({e})")
+        return False
+    events = 0
+    bad = 0
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
+        try:
+            json.loads(line)
+            events += 1
+        except (json.JSONDecodeError, ValueError):
+            bad += 1
+    if bad:
+        log(f"inbox snapshot skipped: {bad} broken line(s); "
+            f"keeping good .bak")
+        return False
+    if not events:
+        log("inbox snapshot skipped: empty inbox; keeping good .bak")
+        return False
+    tmp = bak + ".tmp"
+    try:
+        with open(tmp, "wb") as f:
+            f.write(raw)
+        os.replace(tmp, bak)
+    except OSError as e:
+        log(f"inbox snapshot failed ({e})")
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False
+    return True
+
+
+def restore_inbox(path, events):
+    """Atomically rewrite the inbox body from recovered events (after a
+    .bak fallback), so later appends and reads use the body again."""
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        for e in events:
+            f.write(json.dumps(e, ensure_ascii=False) + "\n")
+    os.replace(tmp, path)
 
 
 def fetch_history(workspace_key, channel, limit=20, quiet=False):
@@ -228,7 +333,18 @@ def main():
             if entry.get("user_id"):
                 own_ids.add(entry["user_id"])
 
-    inbox = read_inbox(inbox_path)
+    inbox, from_bak = load_inbox(inbox_path)
+    if from_bak:
+        log(f"inbox recovered from .bak ({len(inbox)} events)")
+        if not DRY_RUN:
+            try:
+                restore_inbox(inbox_path, inbox)
+                log("inbox body rewritten from .bak")
+            except OSError as e:
+                log(f"inbox restore failed ({e}); "
+                    f"continuing with .bak contents")
+    if not DRY_RUN:
+        snapshot_inbox(inbox_path)
     seen = {(e.get("workspace_id"), e.get("channel"), e.get("ts")) for e in inbox}
 
     # Baseline: newest inbox ts per (workspace, channel), plus a domain
