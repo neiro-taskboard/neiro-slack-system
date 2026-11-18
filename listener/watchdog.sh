@@ -90,6 +90,26 @@ if ! systemctl is-active --quiet slack-auto-join.timer; then
   echo "auto-join timer started"
 fi
 
+# 自動参加サービスの失敗警告（2026-11-18、Yama さんの質問を取り込み）。
+# oneshot の失敗はタイマーを止めないので、上の「タイマーが active か」
+# だけでは毎分繰り返す失敗が見えず、人が systemd の状態を見に行くまで
+# 誰も気づかない。失敗状態なら Slack へ警告する（重複抑止はハッシュ付き
+# 状態ファイルで、上の同期チェックと同じ形）。復旧したら状態ファイルを消す。
+AJ_FAIL_CHECK="/home/hatch/workspace/neiro-slack-system/hooks/scripts/slack-autojoin-fail-check.sh"
+AJ_FAIL_STATE="/home/hatch/hooks/state/auto-join-failed.state"
+if [ -x "$AJ_FAIL_CHECK" ]; then
+  if ! AJ_FAIL_OUT="$("$AJ_FAIL_CHECK" 2>&1)"; then
+    AJ_FAIL_SIG="$(printf '%s' "$AJ_FAIL_OUT" | md5sum | cut -d' ' -f1)"
+    if [ ! -f "$AJ_FAIL_STATE" ] || [ "$(cat "$AJ_FAIL_STATE" 2>/dev/null)" != "$AJ_FAIL_SIG" ]; then
+      printf '%s' "$AJ_FAIL_SIG" > "$AJ_FAIL_STATE"
+      AJ_FAIL_MSG="自動参加（slack-auto-join.service）が失敗しています。$(printf '%s' "$AJ_FAIL_OUT" | head -3 | tr '\n' ' ')"
+      /home/hatch/hooks/scripts/slack-send-locked.sh --channel C0CGYGT9V7G --workspace muse-board --request-id "auto-join-failed-$AJ_FAIL_SIG" --message "$AJ_FAIL_MSG" >/dev/null 2>&1 || true
+    fi
+  else
+    rm -f "$AJ_FAIL_STATE"
+  fi
+fi
+
 # フックの単一正本チェック（2026-11-15、Yama さんの同期ずれ指摘を取り込み）。
 # 稼働中の ~/hooks はリポジトリへのシンボリックリンクが正本。リンク切れ・
 # 通常ファイルによる上書き・壊れた構文があれば Slack へ警告する。照合の
