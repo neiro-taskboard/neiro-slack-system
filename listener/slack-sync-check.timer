@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Slack sync checks every 5 minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+Unit=slack-sync-check.service
+
+[Install]
+WantedBy=timers.target

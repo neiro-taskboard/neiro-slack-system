@@ -9,9 +9,10 @@ Slack Socket Mode を使った、ねいろ（Muse）の自動受信・自動返�
   - `backfill.py` — 停止中に投稿されたメッセージを履歴から拾い直す
   - `auto-join.py` — 新しい公開チャンネルへの自動参加（2026-11-18、オーナーの常時許可）。ボットのユーザーアカウントが既に参加していて2人以上いる公開チャンネルだけに自動で入る。プライベートチャンネル（招待が必要）と、ユーザーアカウントだけのデフォルト空チャンネルは対象外。実行は1分間隔の systemd タイマー（`slack-auto-join.timer`、当初はウォッチドッグ組み込みの5分間隔だったが同日中にタイマーへ移行）
   - `archive.py` — 30日超のメッセージを月次で圧縮アーカイブ
-  - `watchdog.sh` — リスナーの監視・復旧（ユニット再インストール、timers.target ガード、auto-join タイマーのユニット再設置と有効化）
+  - `watchdog.sh` — リスナーの監視・復旧（ユニット再インストール、timers.target ガード、auto-join／sync-check タイマーのユニット再設置と有効化、失敗警告）
   - `slack-listener.service` — systemd ユニット
   - `slack-auto-join.service` / `slack-auto-join.timer` — auto-join を1分間隔で回す systemd ユニット（system 側。service には slackcli（Bun 製）がプロキシを使うための `NODE_USE_ENV_PROXY=1` が必須）
+  - `slack-sync-check.service` / `slack-sync-check.timer` — フックとリスナーの同期チェックを5分間隔で回す systemd ユニット（system 側。Yanayana さんの slack-sync-check.timer と同じ形。2026-11-19 に watchdog.sh 直呼びから切り出し）
 - `hooks/` — 新着検知と返信まわり
   - `scripts/slack-poll.py` — イベント状態管理（pending/processing/done/failed/dead、flock、再試行）
   - `scripts/slack-send-once.sh` — 重複ガード付き送信ラッパー（送信台帳、fail-closed、DLQ再送対応）
@@ -22,9 +23,11 @@ Slack Socket Mode を使った、ねいろ（Muse）の自動受信・自動返�
   - `scripts/slack-reconcile-done.sh` — done レコードの古いエラー残りを掃除
   - `scripts/slack-new-messages.sh` — ポーリング入口
   - `definitions/slack-new-messages.json` — フック定義
-  - `scripts/slack-hook-sync-check.sh` — 単一正本の整合性チェック（稼働中のファイルがリポジトリへのシンボリックリンクか、リンク先・構文が壊れていないかを確認。フックではなく5分間隔のウォッチドッグ側から呼ぶ）
+  - `scripts/slack-hook-sync-check.sh` — 単一正本の整合性チェック（稼働中のファイルがリポジトリへのシンボリックリンクか、リンク先・構文が壊れていないかを確認。フックではなく5分間隔の slack-sync-check.timer から `slack-sync-check-run.sh` 経由で呼ぶ）
+  - `scripts/slack-listener-sync-check.sh` — リスナーの同期チェック（稼働中の `~/workspace/slack-listener/` とリポジトリの内容を照合。同じく5分間隔の slack-sync-check.timer から呼ぶ）
+  - `scripts/slack-sync-check-run.sh` — 上記2つの同期チェックをまとめて実行し、異常があれば Slack へ警告する（重複抑止はハッシュ付き状態ファイル）
   - `tests/` — テスト（`test_slack_poll.py`、`run_tests.py`）
-  - 単一正本化（2026-11-15、Yama さんの指摘を取り込み）：稼働中の `~/hooks/scripts/` と `~/hooks/definitions/` は、このリポジトリ内のコピーへのシンボリックリンク。リポジトリが唯一の正本で、リポジトリ側だけ直して稼働中に反映されない同期ずれを起こさない。編集はリポジトリ側で行い、テスト（`hooks/tests/run_tests.py`）を通してから commit・push する。編集中の壊れたコードが即稼働中に反映されるため、直接の場当たり編集はしない。リンク切れ・上書き・構文壊れは `slack-hook-sync-check.sh` が検出し、ウォッチドッグ（`listener/watchdog.sh`、5分間隔）が失敗内容のハッシュが変わったときだけ Slack へ警告する。
+  - 単一正本化（2026-11-15、Yama さんの指摘を取り込み）：稼働中の `~/hooks/scripts/` と `~/hooks/definitions/` は、このリポジトリ内のコピーへのシンボリックリンク。リポジトリが唯一の正本で、リポジトリ側だけ直して稼働中に反映されない同期ずれを起こさない。編集はリポジトリ側で行い、テスト（`hooks/tests/run_tests.py`）を通してから commit・push する。編集中の壊れたコードが即稼働中に反映されるため、直接の場当たり編集はしない。リンク切れ・上書き・構文壊れは `slack-hook-sync-check.sh` が検出し、5分間隔の `slack-sync-check.timer`（`slack-sync-check-run.sh` 経由）が失敗内容のハッシュが変わったときだけ Slack へ警告する。
   - 壊れた定義への二層の備え（2026-11-16、#slack-へようこそ での三者議論の結論。Groq gpt-oss-120b にも相談済み）：(1) 保存時＝定義 JSON の編集は一時ファイルへ書いて `python3 -m json.tool` で構文確認してからリネームする原子化保存で、壊れた状態が保存される瞬間自体を減らす（Yama・Yanayana さんと同じ運用）。(2) ディスパッチ直前＝`slack-new-messages.sh` が wake を呼ぶ前に定義 JSON を `json.tool` で検証し、壊れていたら wake を呼ばずに止める fail-closed（警告だけ出して進める形は見送り。壊れたプロンプトでワーカーが走るのは未定義動作のため。イベントは未処理のまま残り、次回ポーリングで再試行される）。
   - `pre-push` — push 前の機械的な担保：push されるコミットにトークン形式・秘密鍵・noreply 以外のメール・電話番号らしい文字列があれば push を止める。ダミーのプレースホルダー（`REPLACE-ME` を含むもの）は許可する（Yanayanaさんの共有 2026-11-14 を取り込み。自分のプレースホルダーで止まる罠を避けるため）。実名のチェックは `.git/hooks/pre-push-names`（ローカルのみ、コミット対象外）に1行1件で書いた名前で行う。`.git/hooks` はクローンには含まれないため、fresh clone したら `sh hooks/install-pre-push.sh` で入れ直すこと
 
