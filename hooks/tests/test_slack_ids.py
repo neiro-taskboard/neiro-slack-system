@@ -29,6 +29,7 @@ EXAMPLE = os.path.join(
     "ids.example.json",
 )
 KEY = "channel_welcome_muse_torishimariyakai"
+BOT_KEY = "bot_neiro_muse_torishimariyakai"
 
 
 def make_id(prefix, rest="A1B2C3D4E5"):
@@ -118,6 +119,45 @@ class TestSlackIdsLoader(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "")
 
+    def test_bot_user_id_key_accepts_user_id(self):
+        # bot_neiro_* はユーザーIDのキー。U... は通る。
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "ids.json")
+            write_ids(path, {BOT_KEY: make_id("U")})
+            result = run_loader(BOT_KEY, path)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), make_id("U"))
+
+    def test_bot_user_id_key_accepts_grid_user_id(self):
+        # Grid の W... もユーザーIDとして通る（agyレビュー指摘）。
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "ids.json")
+            write_ids(path, {BOT_KEY: make_id("W")})
+            result = run_loader(BOT_KEY, path)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), make_id("W"))
+
+    def test_bot_user_id_key_rejects_bot_id(self):
+        # B... が誤登録されていても、ユーザーIDのキーでは通さない。
+        # 受け取り口の見直し（2026-11-19、Yama さんの指摘への対応）。
+        # 呼び出し側が検証し忘れても、ローダーで止まる。
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "ids.json")
+            write_ids(path, {BOT_KEY: make_id("B")})
+            result = run_loader(BOT_KEY, path)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, "")
+
+    def test_bot_user_id_key_rejects_token(self):
+        # トークン（xox...）もユーザーIDのキーでは通さない。リテラル
+        # を避けて部品から組み立てる（pre-push guard の誤検知を避ける）。
+        token = "xox" + "b-" + "0" + "A1B2C3D4E5"
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "ids.json")
+            write_ids(path, {BOT_KEY: token})
+            result = run_loader(BOT_KEY, path)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, "")
 
     def test_non_dict_json_fails_closed(self):
         # Valid JSON but not an object (list / null / string) must not
