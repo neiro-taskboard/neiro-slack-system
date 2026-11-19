@@ -2,7 +2,11 @@
 """Tests for hooks/scripts/slack-read-metadata.py.
 
 Yama さんの metadata 照合の設計（2026-11-14）の読み取り側のテスト。
-実際の Slack 呼び出しはしない。urlopen と認証ストアは差し替える。
+実際の Slack 呼び出しはしない。読み取りは curl 経路が既定なので
+subprocess.run を差し替えて curl の標準出力（JSON 本体＋
+``\\n__STATUS__:<code>``）を模す。urllib フォールバック経路は
+shutil.which を None にして urlopen 差し替えで確かめる。
+認証ストアは差し替える。
 Run with: python3 -m unittest test_slack_read_metadata -v
 """
 import http.client
@@ -13,6 +17,8 @@ import os
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+from types import SimpleNamespace
+from unittest import mock
 
 SCRIPT_PATH = os.path.expanduser(
     "~/workspace/neiro-slack-system/hooks/scripts/slack-read-metadata.py")
@@ -34,10 +40,17 @@ OTHER_EVENT_ID = "T0CGV6V7161:C0CGYGT9V7G:1794650000.000000"
 REQUEST_ID = "123e4567-e89b-12d3-a456-426614174000"
 
 
+def curl_stdout(body, status=200):
+    """curl -w で付く ``\\n__STATUS__:<code>`` 付きの標準出力を作る。"""
+    return (json.dumps(body).encode("utf-8")
+            + ("\n__STATUS__:%d" % status).encode("ascii"))
+
+
 class FakeResponse:
-    def __init__(self, body, headers=None):
+    def __init__(self, body, headers=None, status=200):
         self._body = json.dumps(body).encode("utf-8")
         self.headers = headers or {}
+        self.status = status
 
     def read(self):
         return self._body
@@ -81,7 +94,8 @@ class ReadMetadataTest(unittest.TestCase):
                 },
             }, f)
         self.mod.WORKSPACES_JSON = self.store
-        self.calls = []
+        self.calls = []       # urlopen 経由の呼び出し（フォールバック用）
+        self.curl_calls = []  # curl 経由の呼び出し
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -98,23 +112,66 @@ class ReadMetadataTest(unittest.TestCase):
 
         return _open
 
+    def fake_curl_run(self, responses):
+        """subprocess.run の差し替え。responses は1回ずつ消費する。
+
+        各要素は (body_dict, status)・body_dict（status 200）・
+        stdout そのものの bytes・raise する例外のいずれか。
+        呼び出しごとに argv・-K 設定ファイルから読んだトークン・
+        URL（argv の末尾）を記録する。一時ファイルは
+        _get_page_curl が呼んだ後に消すので、読むのはこの中で済ませる。
+        """
+        idx = {"i": 0}
+
+        def _run(argv, **kw):
+            rec = {"argv": list(argv)}
+            if "-K" in argv:
+                cfg = argv[argv.index("-K") + 1]
+                with open(cfg, encoding="utf-8") as f:
+                    cfg_text = f.read()
+                rec["token"] = cfg_text.partition("Bearer ")[2] \
+                    .split('"')[0].strip()
+            rec["url"] = argv[-1]
+            self.curl_calls.append(rec)
+            item = responses[min(idx["i"], len(responses) - 1)]
+            idx["i"] += 1
+            if isinstance(item, BaseException):
+                raise item
+            if isinstance(item, bytes):
+                stdout = item
+            else:
+                body, status = (item if isinstance(item, tuple)
+                                else (item, 200))
+                stdout = curl_stdout(body, status)
+            return SimpleNamespace(stdout=stdout, returncode=0)
+
+        return _run
+
+    def _curl_patched(self, responses):
+        return mock.patch.object(self.mod.subprocess, "run",
+                                 side_effect=self.fake_curl_run(responses))
+
     def find(self, **kw):
         channel = kw.pop("channel", "C0CGYGT9V7G")
         token = kw.pop("token", FAKE_TOKEN_BOARD)
-        urlopen = kw.pop("urlopen", None) or self.fake_urlopen(
-            kw.pop("bodies", [{"ok": True, "messages": []}]))
-        return self.mod.find_by_metadata(
-            channel, **kw, token=token, urlopen=urlopen,
-            sleep=lambda s: None)
+        responses = kw.pop("responses",
+                           kw.pop("bodies", [{"ok": True, "messages": []}]))
+        with self._curl_patched(responses):
+            return self.mod.find_by_metadata(
+                channel, **kw, token=token,
+                urlopen=self.fake_urlopen([{"ok": True, "messages": []}]),
+                sleep=lambda s: None)
 
     def dump(self, **kw):
         channel = kw.pop("channel", "C0CGYGT9V7G")
         token = kw.pop("token", FAKE_TOKEN_BOARD)
-        urlopen = kw.pop("urlopen", None) or self.fake_urlopen(
-            kw.pop("bodies", [{"ok": True, "messages": []}]))
-        return self.mod.dump_messages(
-            channel, **kw, token=token, urlopen=urlopen,
-            sleep=lambda s: None)
+        responses = kw.pop("responses",
+                           kw.pop("bodies", [{"ok": True, "messages": []}]))
+        with self._curl_patched(responses):
+            return self.mod.dump_messages(
+                channel, **kw, token=token,
+                urlopen=self.fake_urlopen([{"ok": True, "messages": []}]),
+                sleep=lambda s: None)
 
     # 1. event_id 一致の投稿が見つかる（スレッド読み取り）
     def test_find_by_event_id_in_thread(self):
@@ -128,12 +185,13 @@ class ReadMetadataTest(unittest.TestCase):
         self.assertTrue(out["found"])
         self.assertEqual(out["ts"], "1794660000.000002")
         self.assertEqual(out["checked"], 2)
-        req = self.calls[0]
-        self.assertIn("conversations.replies", req.full_url)
-        self.assertIn("include_all_metadata=true", req.full_url)
-        self.assertIn("ts=1794583788.831849", req.full_url)
-        self.assertEqual(req.get_header("Authorization"),
-                         "Bearer " + FAKE_TOKEN_BOARD)
+        self.assertEqual(len(self.curl_calls), 1)
+        self.assertEqual(len(self.calls), 0)
+        call = self.curl_calls[0]
+        self.assertIn("conversations.replies", call["url"])
+        self.assertIn("include_all_metadata=true", call["url"])
+        self.assertIn("ts=1794583788.831849", call["url"])
+        self.assertEqual(call["token"], FAKE_TOKEN_BOARD)
 
     # 2. request_id 一致の投稿が見つかる（チャンネル読み取り）
     def test_find_by_request_id_in_channel(self):
@@ -145,9 +203,9 @@ class ReadMetadataTest(unittest.TestCase):
                         bodies=bodies)
         self.assertTrue(out["found"])
         self.assertEqual(out["ts"], "1794660000.000003")
-        req = self.calls[0]
-        self.assertIn("conversations.history", req.full_url)
-        self.assertIn("include_all_metadata=true", req.full_url)
+        call = self.curl_calls[0]
+        self.assertIn("conversations.history", call["url"])
+        self.assertIn("include_all_metadata=true", call["url"])
 
     # 3. 一致なし → found False
     def test_not_found(self):
@@ -213,8 +271,8 @@ class ReadMetadataTest(unittest.TestCase):
         self.assertTrue(out["found"])
         self.assertEqual(out["ts"], "1794660000.000002")
         self.assertEqual(out["checked"], 2)
-        self.assertEqual(len(self.calls), 2)
-        self.assertIn("cursor=abc", self.calls[1].full_url)
+        self.assertEqual(len(self.curl_calls), 2)
+        self.assertIn("cursor=abc", self.curl_calls[1]["url"])
 
     # 9. ratelimited はリトライして成功する
     def test_ratelimited_retries_once(self):
@@ -225,14 +283,14 @@ class ReadMetadataTest(unittest.TestCase):
         out = self.find(event_id=EVENT_ID, self_id="U0CH1B19D4J",
                         bodies=bodies)
         self.assertTrue(out["found"])
-        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(len(self.curl_calls), 2)
 
     # 10. Slack の ok:false は RuntimeError（リトライしない）
     def test_slack_error_raises(self):
         bodies = [{"ok": False, "error": "channel_not_found"}]
         with self.assertRaises(RuntimeError):
             self.find(event_id=EVENT_ID, bodies=bodies)
-        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(len(self.curl_calls), 1)
 
     # 11. main 成功時の出力にトークンは出ない
     def test_main_output_has_no_token(self):
@@ -279,23 +337,23 @@ class ReadMetadataTest(unittest.TestCase):
                          {"kind": "request_id", "value": REQUEST_ID})
         # event_type が違う印は印なし扱い
         self.assertIsNone(msgs[3]["mark"])
-        req = self.calls[0]
-        self.assertIn("conversations.replies", req.full_url)
-        self.assertIn("include_all_metadata=true", req.full_url)
-        self.assertIn("ts=1794583788.831849", req.full_url)
+        call = self.curl_calls[0]
+        self.assertIn("conversations.replies", call["url"])
+        self.assertIn("include_all_metadata=true", call["url"])
+        self.assertIn("ts=1794583788.831849", call["url"])
 
     # 13. dump はチャンネル読み取りでは conversations.history を使う
     def test_dump_channel_uses_history(self):
         out = self.dump(bodies=[{"ok": True, "messages": []}])
         self.assertEqual(out["messages"], [])
         self.assertEqual(out["checked"], 0)
-        self.assertIn("conversations.history", self.calls[0].full_url)
+        self.assertIn("conversations.history", self.curl_calls[0]["url"])
 
     # 14. dump の読み取り失敗は RuntimeError
     def test_dump_slack_error_raises(self):
         with self.assertRaises(RuntimeError):
             self.dump(bodies=[{"ok": False, "error": "channel_not_found"}])
-        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(len(self.curl_calls), 1)
 
     # 15. main --dump の出力にトークンは出ない
     def test_main_dump_output_has_no_token(self):
@@ -323,28 +381,43 @@ class ReadMetadataTest(unittest.TestCase):
         self.assertNotIn(FAKE_TOKEN_DEFAULT, buf.getvalue())
 
 
-    # 16. 応答の途中切断（IncompleteRead）は GET なのでリトライして成功する。
+    # 16. 応答の途中切断は GET なのでリトライして成功する。
+    # curl の意味では、__STATUS__ の付かない途切れた出力がこれに当たる。
     # 2026-11-15：大きなスレッドの dump（約386KB）が途中で切れて
     # IncompleteRead になり、fetch_page から例外が抜けて送信前チェックが
     # fail-closed で返信を止めた。IncompleteRead は OSError / URLError の
     # サブクラスではないため、明示的に拾う必要がある。
     def test_incomplete_read_retries(self):
-        calls = {"i": 0}
-
-        def _open(req, timeout=30):
-            self.calls.append(req)
-            calls["i"] += 1
-            if calls["i"] == 1:
-                raise http.client.IncompleteRead(b'{"ok": true', 100)
-            return FakeResponse({"ok": True, "messages": [
-                marked_msg("1794660000.000001", "U0CH1B19D4J",
-                           event_id=EVENT_ID)]})
-
+        responses = [b'{"ok": true',
+                     {"ok": True, "messages": [
+                         marked_msg("1794660000.000001", "U0CH1B19D4J",
+                                    event_id=EVENT_ID)]}]
         out = self.find(event_id=EVENT_ID, self_id="U0CH1B19D4J",
-                        urlopen=_open)
+                        responses=responses)
         self.assertTrue(out["found"])
         self.assertEqual(out["ts"], "1794660000.000001")
-        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(len(self.curl_calls), 2)
+
+    # 17. curl が無ければ urllib へフォールバックする（旧経路の温存）。
+    def test_fetch_page_urllib_fallback_when_no_curl(self):
+        bodies = [{"ok": True, "messages": [
+            marked_msg("1794660000.000001", "U0CH1B19D4J",
+                       event_id=EVENT_ID)]}]
+        with mock.patch.object(self.mod.shutil, "which",
+                               return_value=None):
+            out = self.mod.find_by_metadata(
+                "C0CGYGT9V7G", event_id=EVENT_ID, self_id="U0CH1B19D4J",
+                token=FAKE_TOKEN_BOARD,
+                urlopen=self.fake_urlopen(bodies),
+                sleep=lambda s: None)
+        self.assertTrue(out["found"])
+        self.assertEqual(out["ts"], "1794660000.000001")
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(len(self.curl_calls), 0)
+        req = self.calls[0]
+        self.assertIn("conversations.history", req.full_url)
+        self.assertEqual(req.get_header("Authorization"),
+                         "Bearer " + FAKE_TOKEN_BOARD)
 
 
 if __name__ == "__main__":
