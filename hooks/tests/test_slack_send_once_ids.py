@@ -53,6 +53,16 @@ esac
 exit 0
 """
 
+STUB_GARBAGE_AUTH = """#!/bin/sh
+# auth fails, but stdout still carries an error-looking "(...)" string.
+echo "$@" >> "$SLACKCLI_LOG"
+case "$1" in
+  auth) echo "Error: (UNAUTHORIZED) please log in"; exit 1 ;;
+  conversations) cat "$SLACKCLI_HISTORY" ;;
+esac
+exit 0
+"""
+
 STUB_WORKING_AUTH = """#!/bin/sh
 # Log argv, then answer like slackcli — auth whoami succeeds and
 # reports the WHOAMI_BOT id (filled in by Env).
@@ -261,6 +271,19 @@ class TestSendOnceIdsFallback(unittest.TestCase):
                 BODY, BOT_MUSE_BOARD, BODY,
                 extra_args=["--workspace", WORKSPACE_MUSE_BOARD])
             self.assertEqual(rc, 3, "unmatchable workspace ID must fail")
+        finally:
+            env.close()
+
+    def test_whoami_garbage_output_falls_back(self):
+        # whoami exits 1 but prints "(UNAUTHORIZED)": the old code's
+        # grep matched U... and returned it as the self ID. It must
+        # fall back to ids.json instead (same hole as answered-check).
+        env = Env(stub=STUB_GARBAGE_AUTH)
+        try:
+            rc = env.run_check_only(
+                BODY, BOT_MUSE_BOARD, BODY,
+                extra_args=["--workspace", "muse-board"])
+            self.assertEqual(rc, 0, "garbage whoami must fall back")
         finally:
             env.close()
 

@@ -362,7 +362,12 @@ self_user_id() {
   local id
   id=$("$SLACKCLI" auth whoami "${WS_ARGS[@]}" 2>/dev/null \
     | grep -oP '\([UW][A-Z0-9]+' | head -1 | tr -d '(' || true)
-  if [ -n "$id" ]; then printf '%s' "$id"; return 0; fi
+  # whoami の失敗時に "(UNAUTHORIZED)" のような文字列が stdout に
+  # 出ても、ID 形状でないものは使わない（2026-11-19、answered-check
+  # の agyレビュー指摘と同じ穴。grep は U 始まりに前方一致する）。
+  if [ -n "$id" ] && [[ "$id" =~ ^[UW]0[A-Z0-9]{8,}$ ]]; then
+    printf '%s' "$id"; return 0
+  fi
   local ws_muse ws_task key
   ws_muse=$(slack_id workspace_muse_torishimariyakai 2>/dev/null || true)
   ws_task=$(slack_id workspace_neiro_task_board 2>/dev/null || true)
@@ -380,7 +385,13 @@ self_user_id() {
       fi
       ;;
   esac
-  slack_id "$key" 2>/dev/null
+  local bot
+  bot=$(slack_id "$key" 2>/dev/null) || return 1
+  # Bot キーに Bot ID（B...）が誤登録されていても使わない。重複
+  # チェックはメッセージの user（ユーザーID）と比べるので、B... では
+  # 自分の投稿と一致せず素通りする（2026-11-19、agyレビュー指摘）。
+  [[ "$bot" =~ ^[UW]0[A-Z0-9]{8,}$ ]] || return 1
+  printf '%s' "$bot"
 }
 # whoami も ids.json も読めないときは送らない（fail-closed、終了コード3。
 # 呼び出し側は waiting として記録し、DLQ再送で後から拾う）。
