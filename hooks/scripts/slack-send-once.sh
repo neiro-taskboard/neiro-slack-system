@@ -200,7 +200,7 @@
 #       候補は印が分からないので文面で拾う（従来どおり）。
 #
 # 使い方:
-#   slack-send-once.sh --channel C0CGYGT9V7G --message '...' [--workspace muse-board]
+#   slack-send-once.sh --channel C... --message '...' [--workspace muse-board]
 #   slack-send-once.sh --permalink <url> --message '...' [--workspace muse-board]
 #   slack-send-once.sh --channel C... --thread-ts 1794477882.362889 --message-file note.txt
 #   slack-send-once.sh --channel C... --thread-ts <ts> --message '...' --event-id <workspace:channel:ts>
@@ -239,6 +239,12 @@ REQUEST_ID=""
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 READ_META="$SCRIPT_DIR/slack-read-metadata.py"
 POST_META="$SCRIPT_DIR/slack-post-metadata.py"
+
+# 実IDは ids.json から読む（2026-11-19、実ID外部化の第2本）。
+# slack-ids.sh は関数定義だけで、source 時の副作用はない。
+# shellcheck source=slack-ids.sh
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/slack-ids.sh"
 
 WORKSPACE=""
 CHANNEL=""
@@ -342,18 +348,46 @@ fi
 WS_ARGS=()
 if [ -n "$WORKSPACE" ]; then WS_ARGS=(--workspace "$WORKSPACE"); fi
 
-# 自分のユーザーIDを調べる（whoami が取れなければ既知の対応表にフォールバック）。
+# 自分のユーザーIDを調べる（whoami が取れなければ ids.json の対応表に
+# フォールバック。2026-11-19、実ID外部化の第2本）。
+# ワークスペースは名前（muse-board）でもIDでも渡されることがあるので、
+# IDの方は ids.json の値と突き合わせて判別する。どちらも読めなければ
+# 非0を返し、呼び出し側が fail-closed で止める（空の SELF_ID では
+# 自分の投稿と他者の投稿を区別できず、重複チェックが素通りするため）。
+# 2026-11-19、agyレビュー指摘の反映：未知のワークスペース名・IDは
+# デフォルトへフォールスルーさせず特定不能として止める（誤った Bot ID
+# でのフェイルオープンを防ぐ）。有効なのは空（既定ワークスペース）、
+# muse-board、既知のワークスペースID2件だけ。
 self_user_id() {
   local id
   id=$("$SLACKCLI" auth whoami "${WS_ARGS[@]}" 2>/dev/null \
-    | grep -oP '\(U[A-Z0-9]+' | head -1 | tr -d '(' || true)
+    | grep -oP '\([UW][A-Z0-9]+' | head -1 | tr -d '(' || true)
   if [ -n "$id" ]; then printf '%s' "$id"; return 0; fi
+  local ws_muse ws_task key
+  ws_muse=$(slack_id workspace_muse_torishimariyakai 2>/dev/null || true)
+  ws_task=$(slack_id workspace_neiro_task_board 2>/dev/null || true)
   case "$WORKSPACE" in
-    muse-board|T0CGV6V7161) printf 'U0CH1B19D4J' ;;
-    *) printf 'U0CH32D1P5F' ;;
+    "") key=bot_neiro_neiro_task_board ;;
+    muse-board) key=bot_neiro_muse_torishimariyakai ;;
+    *)
+      if [ -n "$ws_muse" ] && [ "$WORKSPACE" = "$ws_muse" ]; then
+        key=bot_neiro_muse_torishimariyakai
+      elif [ -n "$ws_task" ] && [ "$WORKSPACE" = "$ws_task" ]; then
+        key=bot_neiro_neiro_task_board
+      else
+        echo "slack-send-once.sh: unknown workspace: $WORKSPACE" >&2
+        return 1
+      fi
+      ;;
   esac
+  slack_id "$key" 2>/dev/null
 }
-SELF_ID=$(self_user_id)
+# whoami も ids.json も読めないときは送らない（fail-closed、終了コード3。
+# 呼び出し側は waiting として記録し、DLQ再送で後から拾う）。
+# 終了コードだけでなく空でないことも確認する（agyレビュー指摘：関数が
+# 0を返しても中身が空・不正値なら止まらなければならない）。
+SELF_ID=$(self_user_id) || { echo "slack-send-once.sh: 自分のユーザーIDが特定できません（whoami と ids.json を確認してください）" >&2; exit 3; }
+if [ -z "$SELF_ID" ]; then echo "slack-send-once.sh: 自分のユーザーIDが特定できません（whoami と ids.json を確認してください）" >&2; exit 3; fi
 
 # 送信台帳の整理（prune）：90日より古いエントリを落とす。
 # Yanayana さんの設計（2026-11-12）：年齢ベースで、タイムスタンプが
