@@ -39,10 +39,12 @@ if [ -x "$SYNC_CHECK" ]; then
   if ! SYNC_OUT="$("$SYNC_CHECK" 2>&1)"; then
     SYNC_SIG="$(printf '%s' "$SYNC_OUT" | md5sum | cut -d' ' -f1)"
     if [ ! -f "$SYNC_STATE" ] || [ "$(cat "$SYNC_STATE" 2>/dev/null)" != "$SYNC_SIG" ]; then
-      printf '%s' "$SYNC_SIG" > "$SYNC_STATE"
       SYNC_MSG="フックの単一正本チェックで異常を検出しました。稼働中の ~/hooks とリポジトリのリンクが壊れているか、構文が壊れています。確認してください：$(printf '%s' "$SYNC_OUT" | head -5 | tr '\n' ' ')"
-      if [ -n "$ALERT_CHANNEL" ]; then
-        /home/hatch/hooks/scripts/slack-send-locked.sh --channel "$ALERT_CHANNEL" --workspace muse-board --request-id "hook-sync-$SYNC_SIG" --message "$SYNC_MSG" >/dev/null 2>&1 || true
+      # 状態ファイルは送信が成功したときだけ更新する（2026-11-19、agyレビュー指摘）。
+      # 先に更新すると、ids.json 欠落などで送信が skip された異常が永久に
+      # 送られなくなる（次回は「変化なし」と判定されてしまう）。
+      if [ -n "$ALERT_CHANNEL" ] && "$SCRIPT_DIR/slack-send-locked.sh" --channel "$ALERT_CHANNEL" --workspace muse-board --request-id "hook-sync-$SYNC_SIG" --message "$SYNC_MSG" >/dev/null 2>&1; then
+        printf '%s' "$SYNC_SIG" > "$SYNC_STATE"
       fi
     fi
   else
@@ -63,10 +65,10 @@ if [ -x "$LISTENER_SYNC_CHECK" ]; then
   if ! LISTENER_SYNC_OUT="$("$LISTENER_SYNC_CHECK" 2>&1)"; then
     LISTENER_SYNC_SIG="$(printf '%s' "$LISTENER_SYNC_OUT" | md5sum | cut -d' ' -f1)"
     if [ ! -f "$LISTENER_SYNC_STATE" ] || [ "$(cat "$LISTENER_SYNC_STATE" 2>/dev/null)" != "$LISTENER_SYNC_SIG" ]; then
-      printf '%s' "$LISTENER_SYNC_SIG" > "$LISTENER_SYNC_STATE"
       LISTENER_SYNC_MSG="リスナーの同期チェックで異常を検出しました。稼働中の ~/workspace/slack-listener とリポジトリの内容がずれています。確認してください：$(printf '%s' "$LISTENER_SYNC_OUT" | head -5 | tr '\n' ' ')"
-      if [ -n "$ALERT_CHANNEL" ]; then
-        /home/hatch/hooks/scripts/slack-send-locked.sh --channel "$ALERT_CHANNEL" --workspace muse-board --request-id "listener-sync-$LISTENER_SYNC_SIG" --message "$LISTENER_SYNC_MSG" >/dev/null 2>&1 || true
+      # 状態ファイルは送信が成功したときだけ更新する（フック側と同じ理由）。
+      if [ -n "$ALERT_CHANNEL" ] && "$SCRIPT_DIR/slack-send-locked.sh" --channel "$ALERT_CHANNEL" --workspace muse-board --request-id "listener-sync-$LISTENER_SYNC_SIG" --message "$LISTENER_SYNC_MSG" >/dev/null 2>&1; then
+        printf '%s' "$LISTENER_SYNC_SIG" > "$LISTENER_SYNC_STATE"
       fi
     fi
   else

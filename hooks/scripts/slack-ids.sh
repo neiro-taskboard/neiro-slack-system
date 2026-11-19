@@ -18,7 +18,11 @@
 # NEIRO_SLACK_IDS_PATH で読むファイルを指定できる。
 # キー一覧はリポジトリ直下の ids.example.json を参照（値は非ID形状の
 # プレースホルダで、実値は入っていない）。
-set -u
+#
+# 注意：このファイルは source される前提のため、トップレベルで set -u
+# などのシェルオプションを変えないこと（2026-11-19、agyレビュー指摘）。
+# 呼び出し元のフラグを勝手に書き換えると、set -u 前提で作られていない
+# 別スクリプトから source されたときに予期せぬ停止を招く。
 
 slack_id() {
   local key="${1:-}"
@@ -33,6 +37,7 @@ slack_id() {
   fi
   python3 - "$path" "$key" <<'PY'
 import json
+import os
 import re
 import sys
 
@@ -42,6 +47,14 @@ try:
         data = json.load(f)
 except (OSError, ValueError) as exc:
     print(f"slack-ids.sh: cannot read ids file: {exc}", file=sys.stderr)
+    sys.exit(1)
+if not isinstance(data, dict):
+    print("slack-ids.sh: ids file must contain a JSON object", file=sys.stderr)
+    sys.exit(1)
+# 実ID入りのファイルは 0600 が前提。他ユーザーに読める状態では
+# fail-closed（コミットログの 0600 記載と実態を一致させる）。
+if os.stat(path).st_mode & 0o077:
+    print("slack-ids.sh: ids file must not be readable by others", file=sys.stderr)
     sys.exit(1)
 value = data.get(key)
 if not isinstance(value, str) or not re.fullmatch(r"[UWBCTGDA]0[A-Z0-9]{8,}", value):

@@ -36,6 +36,23 @@ def make_id(prefix, rest="A1B2C3D4E5"):
     return prefix + "0" + rest
 
 
+def write_ids(path, data, mode=0o600):
+    """Write an ids file with the given data, chmodded like the real one.
+
+    The loader refuses files readable by others (fail-closed), so test
+    fixtures must be 0600, like ~/.config/neiro-slack/ids.json.
+    """
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+    os.chmod(path, mode)
+
+
+def write_raw(path, text, mode=0o600):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.chmod(path, mode)
+
+
 def run_loader(key, ids_path=None):
     env = dict(os.environ)
     if ids_path is None:
@@ -47,12 +64,21 @@ def run_loader(key, ids_path=None):
     )
 
 
+def run_sourced(key, ids_path):
+    """Call slack_id after sourcing the loader (its main use case)."""
+    env = dict(os.environ)
+    env["NEIRO_SLACK_IDS_PATH"] = ids_path
+    return subprocess.run(
+        ["bash", "-c", f'source "{SCRIPT}"; slack_id "{key}"'],
+        capture_output=True, text=True, env=env,
+    )
+
+
 class TestSlackIdsLoader(unittest.TestCase):
     def test_valid_file_returns_value(self):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "ids.json")
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump({KEY: make_id("C")}, f)
+            write_ids(path, {KEY: make_id("C")})
             result = run_loader(KEY, path)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout.strip(), make_id("C"))
@@ -65,8 +91,7 @@ class TestSlackIdsLoader(unittest.TestCase):
     def test_missing_key_fails_closed(self):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "ids.json")
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump({"some_other_key": make_id("C")}, f)
+            write_ids(path, {"some_other_key": make_id("C")})
             result = run_loader(KEY, path)
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(result.stdout, "")
@@ -74,8 +99,7 @@ class TestSlackIdsLoader(unittest.TestCase):
     def test_bad_json_fails_closed(self):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "ids.json")
-            with open(path, "w", encoding="utf-8") as f:
-                f.write("{not json")
+            write_raw(path, "{not json")
             result = run_loader(KEY, path)
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(result.stdout, "")
@@ -84,8 +108,7 @@ class TestSlackIdsLoader(unittest.TestCase):
         # The example file's placeholders must never be usable as IDs.
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "ids.json")
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump({KEY: "EXAMPLE_CHANNEL_WELCOME"}, f)
+            write_ids(path, {KEY: "EXAMPLE_CHANNEL_WELCOME"})
             result = run_loader(KEY, path)
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(result.stdout, "")
@@ -94,6 +117,67 @@ class TestSlackIdsLoader(unittest.TestCase):
         result = run_loader("", "/nonexistent/neiro-slack/ids.json")
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "")
+
+
+    def test_non_dict_json_fails_closed(self):
+        # Valid JSON but not an object (list / null / string) must not
+        # crash with a traceback; it must fail closed with empty stdout.
+        for raw in ("[]", "null", '"just a string"'):
+            with tempfile.TemporaryDirectory() as d:
+                path = os.path.join(d, "ids.json")
+                write_raw(path, raw)
+                result = run_loader(KEY, path)
+                self.assertNotEqual(result.returncode, 0, raw)
+                self.assertEqual(result.stdout, "", raw)
+
+    def test_other_readable_file_fails_closed(self):
+        # The real ids.json is 0600; a group/other-readable copy is refused.
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "ids.json")
+            write_ids(path, {KEY: make_id("C")}, mode=0o644)
+            result = run_loader(KEY, path)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, "")
+
+    def test_sourced_call_returns_value(self):
+        # The main use case: source the file, then call slack_id.
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "ids.json")
+            write_ids(path, {KEY: make_id("C")})
+            result = run_sourced(KEY, path)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), make_id("C"))
+
+    def test_sourcing_does_not_enable_set_u(self):
+        # Sourcing must not change the caller's shell flags (agy review).
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "ids.json")
+            write_ids(path, {KEY: make_id("C")})
+            env = dict(os.environ)
+            env["NEIRO_SLACK_IDS_PATH"] = path
+            result = subprocess.run(
+                ["bash", "-c",
+                 f'source "{SCRIPT}"; case "$-" in *u*) exit 1;; esac'],
+                capture_output=True, text=True, env=env,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_default_path_is_used_without_env(self):
+        # Without NEIRO_SLACK_IDS_PATH, ~/.config/neiro-slack/ids.json
+        # is read. Point HOME at a temp dir so the real file is untouched.
+        with tempfile.TemporaryDirectory() as home:
+            ids_dir = os.path.join(home, ".config", "neiro-slack")
+            os.makedirs(ids_dir)
+            path = os.path.join(ids_dir, "ids.json")
+            write_ids(path, {KEY: make_id("C")})
+            env = dict(os.environ)
+            env.pop("NEIRO_SLACK_IDS_PATH", None)
+            env["HOME"] = home
+            result = subprocess.run(
+                ["bash", SCRIPT, KEY], capture_output=True, text=True, env=env,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), make_id("C"))
 
 
 class TestIdsExample(unittest.TestCase):
