@@ -53,7 +53,23 @@ if [ ! -f "$UNIT_DST" ] || ! cmp -s "$UNIT_SRC" "$UNIT_DST"; then
   fi
 fi
 
-if ! systemctl is-active --quiet "$SERVICE"; then
+# 再起動前の構文チェック（2026-11-19、Yama さんの実装を取り込み）。
+# listener.py を編集中にサービスを起動・再起動すると、書きかけの
+# ファイルでリスナーが立ち上がってしまう。起動・再起動の直前に
+# py_compile をかけ、通らなければその回は見送り、次の5分周期で
+# 再試行する（書きかけなら直っているはず）。見送りは警告ではなく
+# 静かにスキップし、ウォッチドッグ自体は exit 0 で終える。
+# LISTENER_PY はテスト用の上書き可（既定は稼働中の listener.py）。
+LISTENER_PY="${LISTENER_PY:-/home/hatch/workspace/slack-listener/listener.py}"
+LISTENER_OK=1
+if ! python3 -m py_compile "$LISTENER_PY" 2>/dev/null; then
+  echo "listener.py py_compile failed; skipping service start/restart this cycle" >&2
+  LISTENER_OK=0
+fi
+
+if [ "$LISTENER_OK" = "0" ]; then
+  echo "service start/restart skipped (listener.py syntax check failed)"
+elif ! systemctl is-active --quiet "$SERVICE"; then
   systemctl enable --now "$SERVICE" >/dev/null 2>&1 || systemctl start "$SERVICE"
   echo "service started"
 elif [ "$UNIT_CHANGED" = "1" ]; then
