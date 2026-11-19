@@ -26,4 +26,4 @@ Environment="SSL_CERT_FILE=/run/hatch/egress-tls/ca-bundle.pem"
 Environment="REQUESTS_CA_BUNDLE=/run/hatch/egress-tls/ca-bundle.pem"
 Environment="CURL_CA_BUNDLE=/run/hatch/egress-tls/ca-bundle.pem"
 TimeoutStartSec=300
-ExecStart=/bin/bash /home/hatch/workspace/neiro-slack-system/hooks/scripts/slack-sync-check-run.sh
+ExecStart=/bin/bash /home/hatch/workspace/neiro-slack-system/hooks/scripts/slack-sync-check-gate.sh

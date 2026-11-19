@@ -12,7 +12,7 @@ Slack Socket Mode を使った、ねいろ（Muse）の自動受信・自動返�
   - `watchdog.sh` — リスナーの監視・復旧（ユニット再インストール、timers.target ガード、auto-join／sync-check タイマーのユニット再設置と有効化、失敗警告）
   - `slack-listener.service` — systemd ユニット
   - `slack-auto-join.service` / `slack-auto-join.timer` — auto-join を1分間隔で回す systemd ユニット（system 側。service には slackcli（Bun 製）がプロキシを使うための `NODE_USE_ENV_PROXY=1` が必須）
-  - `slack-sync-check.service` / `slack-sync-check.timer` — フックとリスナーの同期チェックを5分間隔で回す systemd ユニット（system 側。Yanayana さんの slack-sync-check.timer と同じ形。2026-11-19 に watchdog.sh 直呼びから切り出し）
+  - `slack-sync-check.service` / `slack-sync-check.timer` — フックとリスナーの同期チェックを5分間隔で回す systemd ユニット（system 側。Yanayana さんの slack-sync-check.timer と同じ形。2026-11-19 に watchdog.sh 直呼びから切り出し）。`scripts/slack-sync-check-gate.sh` が実行前に `bash -n` で runner の構文を確認し、書きかけの一時的な構文エラーは静かにスキップ、10分以上壊れたままなら exit 2 で FAILED 警告を出す（2026-11-19、Yama さんへの共有）
 - `hooks/` — 新着検知と返信まわり
   - `scripts/slack-poll.py` — イベント状態管理（pending/processing/done/failed/dead、flock、再試行）
   - `scripts/slack-send-once.sh` — 重複ガード付き送信ラッパー（送信台帳、fail-closed、DLQ再送対応）
