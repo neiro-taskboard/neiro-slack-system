@@ -86,9 +86,20 @@ RECONCILE_PY = os.environ.get(
 PASS = 0
 FAIL = 0
 
-SELF = "U0CH1B19D4J"
-OTHER = "U0CH1QBC8M8"
-CHANNEL = "C0CGYGT9V7G"
+def make_id(prefix, rest):
+    """Build an ID-shaped string from parts (like a real Slack ID).
+
+    Fixtures are synthetic (2026-11-20): the real bot/user/channel IDs
+    used before were other people's and ours; parts-built fakes keep
+    this file free of real IDs without changing what the tests check
+    (the module compares IDs as opaque strings).
+    """
+    return prefix + "0" + rest
+
+
+SELF = make_id("U", "TESTSELF01")
+OTHER = make_id("U", "TESTOTHER1")
+CHANNEL = make_id("C", "TESTCHAN01")
 THREAD_TS = "1794583788.831849"
 TEXT = "こんにちは、テストです。"
 REC_TIME = "2026-11-13T18:20:00+0000"  # = 1794594000 epoch (UTC)
@@ -370,7 +381,7 @@ def fake_slackcli(tmpdir, messages_by_key):
         "data = json.load(open(sys.argv[0].replace('slackcli', 'data.json'), encoding='utf-8'))\n"
         "args = sys.argv[1:]\n"
         "if args[:2] == ['auth', 'whoami']:\n"
-        "    print('neiro (U0CH1B19D4J)'); sys.exit(0)\n"
+        "    print('neiro (" + SELF + ")'); sys.exit(0)\n"
         "channel = args[2]\n"
         "thread_ts = ''\n"
         "oldest = '0'\n"
@@ -597,8 +608,9 @@ def test_cli_lock_released_after_run():
 
 # --- 印ガード（2026-11-15）のテスト ---
 
-EVENT_ID = "T0CGV6V7161:C0CGYGT9V7G:1794652249.960829"
-OTHER_EVENT_ID = "T0CGV6V7161:C0CGYGT9V7G:1794650000.000000"
+WS_TASK = make_id("T", "TESTWSTASK1")
+EVENT_ID = WS_TASK + ":" + CHANNEL + ":1794652249.960829"
+OTHER_EVENT_ID = WS_TASK + ":" + CHANNEL + ":1794650000.000000"
 REQUEST_ID = "123e4567-e89b-12d3-a456-426614174000"
 
 
@@ -773,6 +785,167 @@ def test_cli_mark_guard_end_to_end():
               f"rc={r2.returncode} out={r2.stdout} err={r2.stderr}")
 
 
+# --- self_user_id の外部化（2026-11-20、実ID外部化の第4本） ---
+
+BOT_MUSE = make_id("U", "TESTBOTMUSE")
+BOT_TASK = make_id("U", "TESTBOTTASK")
+WS_MUSE = make_id("T", "TESTWSMUSE1")
+
+
+def _write_fake_cli(d, body):
+    path = os.path.join(d, "slackcli")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(body)
+    os.chmod(path, 0o755)
+    return path
+
+
+def _write_ids(d, data):
+    path = os.path.join(d, "ids.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+    os.chmod(path, 0o600)
+    return path
+
+
+IDS_FIXTURE = {
+    "workspace_muse_torishimariyakai": WS_MUSE,
+    "workspace_neiro_task_board": WS_TASK,
+    "bot_neiro_muse_torishimariyakai": BOT_MUSE,
+    "bot_neiro_neiro_task_board": BOT_TASK,
+}
+
+FAKE_FAILING_SLACKCLI = """#!/usr/bin/env python3
+import sys
+sys.exit(1)
+"""
+
+
+def _set_ids_env(path):
+    old = os.environ.get("NEIRO_SLACK_IDS_PATH")
+    os.environ["NEIRO_SLACK_IDS_PATH"] = path
+    return old
+
+
+def _restore_ids_env(old):
+    if old is None:
+        os.environ.pop("NEIRO_SLACK_IDS_PATH", None)
+    else:
+        os.environ["NEIRO_SLACK_IDS_PATH"] = old
+
+
+def test_self_id_fallback_from_ids():
+    # whoami fails -> ids.json decides, for names and workspace IDs.
+    mod = load_mod()
+    with tempfile.TemporaryDirectory() as d:
+        fake = _write_fake_cli(d, FAKE_FAILING_SLACKCLI)
+        ids_path = _write_ids(d, IDS_FIXTURE)
+        old = _set_ids_env(ids_path)
+        try:
+            check("fallback: default workspace -> task bot",
+                  mod.self_user_id("", fake) == BOT_TASK)
+            check("fallback: muse-board name -> muse bot",
+                  mod.self_user_id("muse-board", fake) == BOT_MUSE)
+            check("fallback: muse workspace ID -> muse bot",
+                  mod.self_user_id(WS_MUSE, fake) == BOT_MUSE)
+            check("fallback: task workspace ID -> task bot",
+                  mod.self_user_id(WS_TASK, fake) == BOT_TASK)
+            check("fallback: unknown name -> None (fail-closed)",
+                  mod.self_user_id("muse_board", fake) is None)
+            check("fallback: unknown workspace ID -> None",
+                  mod.self_user_id(make_id("T", "TESTWSOTH1"), fake)
+                  is None)
+        finally:
+            _restore_ids_env(old)
+
+
+def test_self_id_missing_ids_fails_closed():
+    # whoami fails and ids.json is missing -> None, never a default.
+    mod = load_mod()
+    with tempfile.TemporaryDirectory() as d:
+        fake = _write_fake_cli(d, FAKE_FAILING_SLACKCLI)
+        old = _set_ids_env(os.path.join(d, "nope.json"))
+        try:
+            check("missing ids.json: default -> None",
+                  mod.self_user_id("", fake) is None)
+            check("missing ids.json: muse-board -> None",
+                  mod.self_user_id("muse-board", fake) is None)
+        finally:
+            _restore_ids_env(old)
+
+
+def test_self_id_whoami_garbage_rejected():
+    # whoami が "(UNAUTHORIZED)" のようなゴミを exit 0 で出しても、
+    # 正規表現が拾わず ids.json にフォールバックする。
+    mod = load_mod()
+    with tempfile.TemporaryDirectory() as d:
+        body = ("#!/usr/bin/env python3\nimport sys\n"
+                "print('neiro (UNAUTHORIZED)'); sys.exit(0)\n")
+        fake = _write_fake_cli(d, body)
+        ids_path = _write_ids(d, IDS_FIXTURE)
+        old = _set_ids_env(ids_path)
+        try:
+            check("whoami garbage -> ids.json fallback (muse-board)",
+                  mod.self_user_id("muse-board", fake) == BOT_MUSE)
+        finally:
+            _restore_ids_env(old)
+
+
+def test_self_id_whoami_w_shape():
+    # Grid の W... ユーザーID も whoami からそのまま返る。
+    mod = load_mod()
+    w_id = make_id("W", "TESTWUSER1")
+    with tempfile.TemporaryDirectory() as d:
+        body = ("#!/usr/bin/env python3\nimport sys\n"
+                "print('neiro (" + w_id + ")'); sys.exit(0)\n")
+        fake = _write_fake_cli(d, body)
+        old = _set_ids_env(os.path.join(d, "nope.json"))
+        try:
+            check("whoami W... id is returned as-is",
+                  mod.self_user_id("muse-board", fake) == w_id)
+        finally:
+            _restore_ids_env(old)
+
+
+def test_cli_self_id_unknown_cannot_verify():
+    # whoami が失敗し ids.json も無ければ、CLI は照合せず
+    # cannot_verify で終了コード 2（fail-closed）。訂正も追加しない。
+    with tempfile.TemporaryDirectory() as tmp:
+        amb_path = os.path.join(tmp, "amb.jsonl")
+        last_path = os.path.join(tmp, "last.json")
+        with open(amb_path, "w", encoding="utf-8") as f:
+            f.write(json.dumps(amb(), ensure_ascii=False) + "\n")
+        msg = {"ts": "1794594100.000000", "user": SELF, "text": TEXT}
+        body = (
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            "if sys.argv[1:3] == ['auth', 'whoami']:\n"
+            "    sys.exit(1)\n"
+            "print(json.dumps({'messages': ["
+            "{'ts': '1794594100.000000', 'user': '" + SELF + "', "
+            "'text': '" + TEXT + "'}], 'has_more': False, "
+            "'next_oldest': None}, ensure_ascii=False))\n")
+        cli = _write_fake_cli(tmp, body)
+        env = dict(os.environ)
+        env["NEIRO_SLACK_IDS_PATH"] = os.path.join(tmp, "nope.json")
+        cmd = [sys.executable, RECONCILE_PY,
+               "--ambiguous-file", amb_path,
+               "--last-run-file", last_path,
+               "--runs-file", os.path.join(tmp, "runs.jsonl"),
+               "--last-summary-file", os.path.join(tmp, "last-run.json"),
+               "--lock-file", os.path.join(tmp, "reconcile.lock"),
+               "--slackcli", cli, "--force"]
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=60, env=env)
+        out = json.loads(r.stdout[r.stdout.find("{"):])
+        lines = open(amb_path, encoding="utf-8").read().strip().split("\n")
+        check("CLI: self id unknown -> exit 2, cannot_verify, no append",
+              r.returncode == 2 and len(out["cannot_verify"]) == 1
+              and len(lines) == 1,
+              f"rc={r.returncode} out={r.stdout} err={r.stderr}")
+
+
+
 def main():
     test_exact_match_resolves()
     test_normalized_whitespace_match_resolves()
@@ -803,6 +976,11 @@ def main():
     test_same_text_different_marks_are_separate_targets()
     test_mark_lookup_failure_is_cannot_verify()
     test_cli_mark_guard_end_to_end()
+    test_self_id_fallback_from_ids()
+    test_self_id_missing_ids_fails_closed()
+    test_self_id_whoami_garbage_rejected()
+    test_self_id_whoami_w_shape()
+    test_cli_self_id_unknown_cannot_verify()
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 

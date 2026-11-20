@@ -130,8 +130,14 @@ except ImportError:  # pragma: no cover - POSIX 環境では常に使える
 
 SLACKCLI = "/home/hatch/workspace/bin/slackcli"
 READ_META = "/home/hatch/hooks/scripts/slack-read-metadata.py"
-SELF_IDS = {"muse-board": "U0CH1B19D4J", "T0CGV6V7161": "U0CH1B19D4J"}
-DEFAULT_SELF_ID = "U0CH32D1P5F"  # Neiro Task Board
+IDS_PATH_ENV = "NEIRO_SLACK_IDS_PATH"
+DEFAULT_IDS_PATH = "~/.config/neiro-slack/ids.json"
+ID_SHAPE = re.compile(r"[UWBCTGDA]0[A-Z0-9]{8,}")
+# メッセージの user フィールドに入るのはユーザーIDだけ（U... / Grid の
+# W...）。Bot ID（B...）が self_id に入ると自分の投稿と一致せず、
+# 常に照合できないので、ユーザーID専用の形状で検証する
+# （2026-11-19、answered-check 第3本の agyレビュー指摘と同じ考え）。
+USER_ID_SHAPE = re.compile(r"[UW]0[A-Z0-9]{8,}")
 WORKSPACES = ("muse-board", "")  # チャンネルIDはワークスペースごとに
 # 一意なので、読めた方が正しいワークスペース。muse-board から試す。
 HISTORY_ATTEMPTS = 5  # slack-send-once.sh / slack-answered-check.py と同じ回数
@@ -204,21 +210,81 @@ def parse_slack_json(raw):
         return None
 
 
+def load_ids():
+    """ids.json を読む。読めなければ None（fail-closed）。
+
+    slack-ids.sh と answered-check.py と同じ前提：ファイルが無い・
+    JSON が壊れている・オブジェクトでない・他ユーザーに読める権限
+    （0600 でない）のいずれも None を返す。パスは環境変数
+    NEIRO_SLACK_IDS_PATH で差し替えられる（テスト用）。
+    """
+    path = os.path.expanduser(
+        os.environ.get(IDS_PATH_ENV) or DEFAULT_IDS_PATH)
+    try:
+        if os.stat(path).st_mode & 0o077:
+            return None
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def ids_value(ids, key, shape=ID_SHAPE):
+    """ids から ID 形状の値だけを取り出す。無ければ None。
+
+    Bot のユーザーIDを読むときは shape=USER_ID_SHAPE を渡すこと
+    （B... の Bot ID が誤登録されていても使わない）。
+    """
+    value = ids.get(key) if ids else None
+    if isinstance(value, str) and shape.fullmatch(value):
+        return value
+    return None
+
+
 def self_user_id(workspace, slackcli=SLACKCLI):
-    """自分のユーザーID。whoami が取れなければ既知の対応表にフォールバック。"""
-    import re
+    """自分のユーザーID。whoami が取れなければ ids.json にフォールバック。
+
+    ワークスペースは名前（muse-board）でもIDでも渡されることがある
+    ので、IDの方は ids.json の値と突き合わせて判別する。未知の
+    ワークスペース名・IDや、ids.json が読めない場合は None を返し、
+    呼び出し側が fail-closed で止める（既定の Bot ID への
+    フォールスルーは誤照合のもとになる。2026-11-19、第2本の
+    agyレビュー指摘と同じ考え）。
+    """
     try:
         args = [slackcli, "auth", "whoami"]
         if workspace:
             args += ["--workspace", workspace]
-        out = subprocess.run(args, capture_output=True, text=True,
-                             timeout=30).stdout
-        m = re.search(r"\(U[A-Z0-9]+", out)
-        if m:
-            return m.group(0)[1:]
+        proc = subprocess.run(args, capture_output=True, text=True,
+                              timeout=30)
+        # 終了コードも抽出結果の形状も確認する（2026-11-19、agyレビュー
+        # 指摘）。whoami が失敗時に "(UNAUTHORIZED)" のような文字列を
+        # stdout に出しても、正規表現が U 始まりに前方一致して誤った
+        # ID として返さないようにする。
+        if proc.returncode == 0:
+            m = re.search(r"\([UW][A-Z0-9]+", proc.stdout)
+            if m:
+                candidate = m.group(0)[1:]
+                if USER_ID_SHAPE.fullmatch(candidate):
+                    return candidate
     except Exception:
         pass
-    return SELF_IDS.get(workspace or "", DEFAULT_SELF_ID)
+    ids = load_ids()
+    if ids is None:
+        return None
+    ws = workspace or ""
+    if ws == "":
+        key = "bot_neiro_neiro_task_board"
+    elif ws == "muse-board":
+        key = "bot_neiro_muse_torishimariyakai"
+    elif ws == ids_value(ids, "workspace_muse_torishimariyakai"):
+        key = "bot_neiro_muse_torishimariyakai"
+    elif ws == ids_value(ids, "workspace_neiro_task_board"):
+        key = "bot_neiro_neiro_task_board"
+    else:
+        return None
+    return ids_value(ids, key, USER_ID_SHAPE)
 
 
 def record_mark(rec):
@@ -722,7 +788,17 @@ def main(argv):
                 def page_reader(ch, th, cur, ws=workspace):
                     return read_page_retry(slackcli, ch, cur, th, ws)
                 messages = read_all(page_reader, channel, thread_ts, oldest)
-                return messages, self_user_id(workspace, slackcli)
+                self_id = self_user_id(workspace, slackcli)
+                if self_id is None:
+                    # 自分のIDが特定できないまま照合すると、自分の投稿
+                    # を1件も拾えず「届いていない」と誤って残してしまう
+                    # ので、履歴が読めなかったのと同じ扱いにする
+                    # （fail-closed：その対象は cannot_verify になり、
+                    # 次の定期実行で拾い直す）。
+                    raise RuntimeError(
+                        "self user id unknown for workspace %r "
+                        "(whoami and ids.json both failed)" % (workspace,))
+                return messages, self_id
             except Exception as exc:  # noqa: BLE001 - 次のワークスペースを試す
                 last_exc = exc
         raise RuntimeError(f"history unreadable in all workspaces: {last_exc}")
