@@ -271,6 +271,27 @@ def main():
               rc == 1, f"rc={rc}")
         check("ledger different text: history read happens",
               len(reads) == 1, f"reads={reads}")
+
+        # 10. broken ledger line: skipped with a stderr warning, and the
+        #     good record still catches the duplicate (2026-11-22)
+        with open(env.history_path, "w", encoding="utf-8") as f:
+            json.dump(empty, f, ensure_ascii=False)
+        with open(env.ledger_path, "w", encoding="utf-8") as f:
+            f.write("{broken json line\n")
+            f.write(json.dumps(ledger_entry(CANDIDATE),
+                               ensure_ascii=False) + "\n")
+        if os.path.exists(env.log):
+            os.remove(env.log)
+        proc = subprocess.run(
+            ["bash", SCRIPT, "--channel", CHANNEL,
+             "--message", CANDIDATE, "--thread-ts", THREAD_TS,
+             "--check-only"],
+            env=env.env, capture_output=True, text=True, timeout=120)
+        check("broken ledger line: duplicate still caught",
+              proc.returncode == 0, f"rc={proc.returncode}")
+        check("broken ledger line: warning on stderr",
+              "broken ledger line" in proc.stderr,
+              f"stderr={proc.stderr!r}")
     finally:
         env.close()
 

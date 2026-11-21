@@ -585,11 +585,15 @@ PYEOF
 # 照合は再送ヘッダー除去＋空白・改行の正規化のうえでの完全一致
 # （parroting防止、2026-11-14、Yamaさんの提案）。スレッド返信の
 # 送信前チェック（11）でも、cannot-verify 時のフォールバックでも使う。
+# 壊れた行は飛ばして良い行を読むが、黙って飛ばさず stderr へ警告を出す
+# （2026-11-22）。stderr は捨てないこと（この python 呼び出しと、
+# 呼び出し元の ledger_ts=$(check_ledger) の両方に 2>/dev/null を
+# 付けると警告が見えなくなる）。
 # --event-id / --request-id があるときは印の一致を文面より先に見る
 # （metadata 優先、2026-11-14、ヘッダーの 12）。印が無い古い記録は
 # 対象外で、文面照合へ進む。
 check_ledger() {
-  python3 - "$CHANNEL" "$THREAD_TS" "$TMP_MSG" "$LEDGER_FILE" "$EVENT_ID" "$REQUEST_ID" <<'PYEOF' 2>/dev/null
+  python3 - "$CHANNEL" "$THREAD_TS" "$TMP_MSG" "$LEDGER_FILE" "$EVENT_ID" "$REQUEST_ID" <<'PYEOF'
 import json, re, sys
 channel, thread_ts, msg_path, ledger_path, event_id, request_id = sys.argv[1:7]
 # 再送ヘッダー（新旧どちらの文言でも）で始まる文面は、ヘッダー1行を除いて
@@ -612,10 +616,16 @@ except OSError:
     sys.exit(1)
 found = None
 with f:
-    for line in f:
+    for lineno, line in enumerate(f, 1):
         try:
             rec = json.loads(line)
         except ValueError:
+            # 壊れた行は飛ばすが、黙って飛ばさない。台帳の欠損に気づける
+            # よう stderr へ警告を出す（2026-11-22、Yama さんの指摘を
+            # Yanayana さんが直したのと同じ形。良い行は従来どおり読む）。
+            print('warning: skipping broken ledger line %s:%d: %s'
+                  % (ledger_path, lineno, line[:120].rstrip()),
+                  file=sys.stderr)
             continue
         if rec.get('channel') != channel:
             continue
@@ -1094,7 +1104,7 @@ except Exception:
 # 台帳が読めなければ fail-closed で送らない（終了コード3）。
 # チャンネルへの直投稿は対象外（15分窓＋直近50件のまま）。
 if [ -n "$THREAD_TS" ]; then
-  ledger_ts=$(check_ledger 2>/dev/null)
+  ledger_ts=$(check_ledger)
   ledger_rc=$?
   if [ "$ledger_rc" -eq 0 ]; then
     FOUND_TS="$ledger_ts"

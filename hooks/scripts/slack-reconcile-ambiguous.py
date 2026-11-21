@@ -377,13 +377,19 @@ def load_records(path):
     records = []
     try:
         with open(path, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
+            for lineno, raw in enumerate(f, 1):
+                line = raw.strip()
                 if not line:
                     continue
                 try:
                     records.append(json.loads(line))
                 except json.JSONDecodeError:
+                    # 壊れた行は飛ばすが、黙って飛ばさない。台帳の欠損に
+                    # 気づけるよう stderr へ警告を出す（2026-11-22、Yama
+                    # さんの指摘を Yanayana さんが直したのと同じ形）。
+                    print("warning: skipping broken ambiguous record "
+                          "%s:%d: %s" % (path, lineno, line[:120]),
+                          file=sys.stderr)
                     continue
     except OSError:
         pass

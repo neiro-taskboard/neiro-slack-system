@@ -71,6 +71,8 @@ Covered:
       the mark), and does not resolve when the dump says a different mark
 """
 import importlib.util
+import contextlib
+import io
 import json
 import os
 import stat
@@ -289,6 +291,24 @@ def test_append_closed_no_text_roundtrip():
               and out["closed_no_text"] == []
               and out["skipped_no_text"] == 2,
               f"lines={len(lines)} entry={entry} out={out}")
+
+
+def test_load_records_broken_line_warns():
+    mod = load_mod()
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "amb.jsonl")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("{broken json line\n")
+            f.write(json.dumps(amb(), ensure_ascii=False) + "\n")
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            recs = mod.load_records(path)
+        check("load_records skips a broken line but keeps good records",
+              len(recs) == 1, f"recs={recs}")
+        check("load_records warns on stderr with file and line number",
+              "broken ambiguous record" in buf.getvalue()
+              and ":1:" in buf.getvalue(),
+              f"stderr={buf.getvalue()!r}")
 
 
 def test_already_resolved_found_ts_not_reused():
@@ -958,6 +978,7 @@ def main():
     test_no_text_already_closed_not_reclosed()
     test_no_text_after_close_forms_new_group()
     test_append_closed_no_text_roundtrip()
+    test_load_records_broken_line_warns()
     test_already_resolved_found_ts_not_reused()
     test_no_reuse_across_targets()
     test_channel_post_resolves()

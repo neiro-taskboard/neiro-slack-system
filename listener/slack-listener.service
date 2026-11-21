@@ -7,6 +7,7 @@ Wants=network-online.target
 Type=simple
 User=root
 WorkingDirectory=/home/hatch/workspace/slack-listener
+Environment="HOME=/home/hatch"
 ExecStart=/home/hatch/workspace/.venv-slack/bin/python /home/hatch/workspace/slack-listener/listener.py
 Restart=always
 RestartSec=10
