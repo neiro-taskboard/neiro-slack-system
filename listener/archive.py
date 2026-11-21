@@ -15,19 +15,31 @@ What it does (run monthly, e.g. 1st of the month):
   months-old events, so old "done" IDs are safe to forget.
 
 Safety:
-- Runs under the same flock as the hook poller (slack-events.lock), so it
-  never races with event dispatch.
+- Takes an flock on slack-events.lock AND on inbox.jsonl.lock for the
+  whole run, so it never races with event dispatch (slack-events.lock,
+  held by the hook poller while it updates the dedup state) or with
+  inbox appends (inbox.jsonl.lock, held by inbox_append across its
+  read-check-append step). Previously the docstring claimed the run
+  happened "under the same flock as the hook poller" but no flock was
+  ever taken (LOCK_FILE was defined and unused), so the monthly run
+  could os.replace inbox.jsonl / the state file while another process
+  was appending to them. If either lock cannot be taken within
+  LOCK_TIMEOUT_SECS the run exits 2 without changing anything
+  (fail-closed; the monthly cron reports a non-zero exit).
 - The listener opens inbox.jsonl in append mode per event, so replacing
   the file atomically (os.replace) cannot lose a message.
 - Use --dry-run to preview without changing anything.
 """
 import argparse
+import fcntl
 import gzip
 import json
 import os
 import shutil
 import sys
+import time
 from collections import Counter, defaultdict
+from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 
 BASE = "/home/hatch/workspace/slack-listener"
@@ -40,6 +52,7 @@ LOCK_FILE = "/home/hatch/hooks/state/slack-events.lock"
 RETENTION_DAYS = 30
 STATE_RETENTION_DAYS = 90
 LOG_MAX_BYTES = 1 * 1024 * 1024  # 1 MB
+LOCK_TIMEOUT_SECS = 60  # max wait for each flock before failing closed
 
 # Known users (display names). Unknown IDs are shown as-is.
 # 公開版では個人を特定しうる対応表を伏せている。実運用では
@@ -64,6 +77,33 @@ def month_key(dt):
     return dt.strftime("%Y-%m")
 
 
+class LockBusy(RuntimeError):
+    """Raised when a flock cannot be taken within LOCK_TIMEOUT_SECS."""
+
+
+def _acquire_lock(path, timeout=LOCK_TIMEOUT_SECS):
+    """Open path and take an exclusive flock, waiting up to timeout secs.
+
+    Returns the open file object, which must stay open (and be closed
+    by the caller) for as long as the lock is held. Raises LockBusy
+    instead of blocking forever, so a stuck holder cannot wedge the
+    monthly run. The lock file is created if missing.
+    """
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    f = open(path, "a")
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return f
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                f.close()
+                raise LockBusy(f"could not take flock on {path} "
+                               f"within {timeout}s")
+            time.sleep(0.5)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
@@ -72,6 +112,23 @@ def main():
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(days=RETENTION_DAYS)
     state_cutoff = now - timedelta(days=STATE_RETENTION_DAYS)
+    # Hold both locks for the whole run, state lock first (no other
+    # holder takes both, so this order cannot deadlock). A held lock
+    # means a poll or an inbox append is in flight; wait briefly, then
+    # fail closed without touching any file.
+    try:
+        locks = ExitStack()
+        locks.enter_context(_acquire_lock(LOCK_FILE, LOCK_TIMEOUT_SECS))
+        locks.enter_context(_acquire_lock(INBOX + ".lock",
+                                          LOCK_TIMEOUT_SECS))
+    except LockBusy as exc:
+        print(f"archive: {exc}; skipping run", file=sys.stderr)
+        sys.exit(2)
+    with locks:
+        _run(dry, now, cutoff, state_cutoff)
+
+
+def _run(dry, now, cutoff, state_cutoff):
     os.makedirs(ARCHIVE_DIR, exist_ok=True)
 
     # ---- inbox: split recent vs old, archive old by month ----
