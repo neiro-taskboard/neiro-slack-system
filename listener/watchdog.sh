@@ -12,6 +12,22 @@
 # Safe to run repeatedly; exits 0 in all expected cases.
 set -u
 
+# 警告先チャンネルは ids.json から読む（2026-11-21、実ID外部化の残り4件）。
+# fail-closed：読めなければ警告送信だけ skip し、空のチャンネルでは送らない。
+# 読めないときに状態ファイルだけ先に更新すると、復旧後も警告が出なくなる
+# （2026-11-19、sync-check-run.sh への agyレビュー指摘と同じ罠）ので、
+# 状態ファイルの更新は送信が成功したときだけ行う。
+IDS_LOADER="/home/hatch/hooks/scripts/slack-ids.sh"
+ALERT_CHANNEL=""
+if [ -f "$IDS_LOADER" ]; then
+  # shellcheck source=/dev/null
+  source "$IDS_LOADER"
+  ALERT_CHANNEL="$(slack_id channel_welcome_muse_torishimariyakai)" || ALERT_CHANNEL=""
+fi
+if [ -z "$ALERT_CHANNEL" ]; then
+  echo "watchdog.sh: 警告先チャンネルが読めないため警告送信を skip します（ids.json を確認してください）" >&2
+fi
+
 UNIT_SRC="/home/hatch/workspace/slack-listener/slack-listener.service"
 UNIT_DST="/etc/systemd/system/slack-listener.service"
 SERVICE="slack-listener.service"
@@ -147,9 +163,10 @@ if [ -x "$AJ_FAIL_CHECK" ]; then
   if ! AJ_FAIL_OUT="$("$AJ_FAIL_CHECK" 2>&1)"; then
     AJ_FAIL_SIG="$(printf '%s' "$AJ_FAIL_OUT" | md5sum | cut -d' ' -f1)"
     if [ ! -f "$AJ_FAIL_STATE" ] || [ "$(cat "$AJ_FAIL_STATE" 2>/dev/null)" != "$AJ_FAIL_SIG" ]; then
-      printf '%s' "$AJ_FAIL_SIG" > "$AJ_FAIL_STATE"
       AJ_FAIL_MSG="自動参加（slack-auto-join.service）が失敗しています。$(printf '%s' "$AJ_FAIL_OUT" | head -3 | tr '\n' ' ')"
-      /home/hatch/hooks/scripts/slack-send-locked.sh --channel C0CGYGT9V7G --workspace muse-board --request-id "auto-join-failed-$AJ_FAIL_SIG" --message "$AJ_FAIL_MSG" >/dev/null 2>&1 || true
+      if [ -n "$ALERT_CHANNEL" ] && /home/hatch/hooks/scripts/slack-send-locked.sh --channel "$ALERT_CHANNEL" --workspace muse-board --request-id "auto-join-failed-$AJ_FAIL_SIG" --message "$AJ_FAIL_MSG" >/dev/null 2>&1; then
+        printf '%s' "$AJ_FAIL_SIG" > "$AJ_FAIL_STATE"
+      fi
     fi
   else
     rm -f "$AJ_FAIL_STATE"
@@ -166,9 +183,10 @@ if [ -x "$AJ_FAIL_CHECK" ]; then
   if ! SC_FAIL_OUT="$(SERVICE=slack-sync-check.service FAIL_NOTE="同期チェックの実行が失敗しています。systemd の状態を確認してください。" "$AJ_FAIL_CHECK" 2>&1)"; then
     SC_FAIL_SIG="$(printf '%s' "$SC_FAIL_OUT" | md5sum | cut -d' ' -f1)"
     if [ ! -f "$SC_FAIL_STATE" ] || [ "$(cat "$SC_FAIL_STATE" 2>/dev/null)" != "$SC_FAIL_SIG" ]; then
-      printf '%s' "$SC_FAIL_SIG" > "$SC_FAIL_STATE"
       SC_FAIL_MSG="同期チェック（slack-sync-check.service）が失敗しています。$(printf '%s' "$SC_FAIL_OUT" | head -3 | tr '\n' ' ')"
-      /home/hatch/hooks/scripts/slack-send-locked.sh --channel C0CGYGT9V7G --workspace muse-board --request-id "sync-check-failed-$SC_FAIL_SIG" --message "$SC_FAIL_MSG" >/dev/null 2>&1 || true
+      if [ -n "$ALERT_CHANNEL" ] && /home/hatch/hooks/scripts/slack-send-locked.sh --channel "$ALERT_CHANNEL" --workspace muse-board --request-id "sync-check-failed-$SC_FAIL_SIG" --message "$SC_FAIL_MSG" >/dev/null 2>&1; then
+        printf '%s' "$SC_FAIL_SIG" > "$SC_FAIL_STATE"
+      fi
     fi
   else
     rm -f "$SC_FAIL_STATE"
@@ -197,9 +215,10 @@ if [ -x "$OLDEST_CHECK" ]; then
       printf '%s' "$OLDEST_ID" > "$OLDEST_FLAG"
       OLDEST_SIG="$(printf '%s' "$OLDEST_ID" | md5sum | cut -d' ' -f1)"
       if [ ! -f "$OLDEST_STATE" ] || [ "$(cat "$OLDEST_STATE" 2>/dev/null)" != "$OLDEST_SIG" ]; then
-        printf '%s' "$OLDEST_SIG" > "$OLDEST_STATE"
         OLDEST_MSG="最古の未処理イベントが180秒以上経っています：${OLDEST_ID}（${OLDEST_AGE}秒、未処理 ${OLDEST_COUNT}件）。フックのワーカーが起動していないか、処理が詰まっている可能性があります。"
-        /home/hatch/hooks/scripts/slack-send-locked.sh --channel C0CGYGT9V7G --workspace muse-board --request-id "oldest-unprocessed-$OLDEST_SIG" --message "$OLDEST_MSG" >/dev/null 2>&1 || true
+        if [ -n "$ALERT_CHANNEL" ] && /home/hatch/hooks/scripts/slack-send-locked.sh --channel "$ALERT_CHANNEL" --workspace muse-board --request-id "oldest-unprocessed-$OLDEST_SIG" --message "$OLDEST_MSG" >/dev/null 2>&1; then
+          printf '%s' "$OLDEST_SIG" > "$OLDEST_STATE"
+        fi
       fi
     else
       echo "oldest-unprocessed check output unparseable: $OLDEST_OUT" >&2
