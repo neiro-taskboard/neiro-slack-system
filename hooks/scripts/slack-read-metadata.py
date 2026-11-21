@@ -91,7 +91,7 @@ def resolve_token(workspace, path=None):
     """ワークスペース指定からボットトークンを取る。
 
     workspace はプロファイル名（muse-board）・ワークスペースID
-    （T0CGV6V7161）・None（デフォルト）のいずれか。見つからなければ None。
+    ・None（デフォルト）のいずれか。見つからなければ None。
     """
     data = load_workspaces(path)
     if not data:
