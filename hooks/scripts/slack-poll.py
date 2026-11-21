@@ -97,9 +97,19 @@ FASTPATH_RECLAIM_SECS = int(os.environ.get(
 # 優先順位は DM > ねいろ宛て（本文に ねいろ / Neiro を含む）> その他、
 # 同順位では古い順（dispatch_priority / ts_key を参照）。
 MAX_PER_WAKE = int(os.environ.get("SLACK_POLL_MAX_PER_WAKE", "4"))
+# 下位の飢餓防止（エージング、2026-11-21 追加）：DM・ねいろ宛ての
+# トラフィックが続くと「その他」は後回しにされ続ける。待ち時間
+# （received_at からの経過）で「その他」を段階的に昇格させる。
+# 5分（10ポール）を超えたら一段昇格（ねいろ宛て相当）、15分を超えたら
+# 最上位（DM相当）。昇格しても同順位では古い順を維持する。
+# （Yamaさんの質問 2026-11-21 への回答で決めた条件）
 # DLQ再送の改訂案（2026-11-13、Yama・Yanayana・Neiroで合意）。
 WAIT_WINDOW_SECS = 24 * 3600  # pre-check失敗から再送を諦めるまでの窓（起点は最初の失敗時刻）
 WAIT_WAKE_INTERVAL_SECS = 3600  # waiting の再 wake 間隔（毎時の定期照合に合わせる）
+
+
+AGING_PROMOTE_SECS = 300  # 5 minutes: 「その他」-> ねいろ宛て相当
+AGING_TOP_SECS = 900  # 15 minutes: 「その他」-> DM相当
 
 
 def now_iso():
@@ -144,13 +154,15 @@ def bot_ids():
     return _BOT_IDS
 
 
-def dispatch_priority(ev):
+def dispatch_priority(ev, now=None):
     """バースト時の dispatch 優先順位（小さいほど先に起こす）。
 
     DM（チャンネルIDが D 始まり）を最優先、次に ねいろ宛ての投稿
     （本文の ねいろ / Neiro、またはボットへのメンション <@ID>）、
     その他の順。宛てられた投稿が議論の長文の後ろで待たされ続けるのを
     防ぐための粗い振り分けで、同順位では ts の古い順にする。
+    さらに「その他」はエージングで段階的に昇格する（5分で一段、
+    15分で最上位）。received_at が読めないときは昇格しない。
     """
     if str(ev.get("channel", "")).startswith("D"):
         return 0
@@ -159,6 +171,18 @@ def dispatch_priority(ev):
         return 1
     if any(f"<@{bid}>" in text for bid in bot_ids()):
         return 1
+    if now is not None:
+        received = parse_iso(ev.get("received_at"))
+        if received.tzinfo is None:
+            # タイムゾーンなしの received_at は UTC として扱う（naive の
+            # まま aware と比べると TypeError でポーラー全体が落ちる）。
+            received = received.replace(tzinfo=timezone.utc)
+        if received > datetime.min.replace(tzinfo=timezone.utc):
+            age = (now - received).total_seconds()
+            if age > AGING_TOP_SECS:
+                return 0
+            if age > AGING_PROMOTE_SECS:
+                return 1
     return 2
 
 
@@ -310,7 +334,7 @@ def main():
                 state[eid] = {"event_id": eid, "status": "processing",
                               "attempts": 1, "updated_at": now_iso(),
                               "last_error": "", "first_wake_at": now_iso()}
-            candidates.append((dispatch_priority(ev), ts_key(ev), ev, claim_new))
+            candidates.append((dispatch_priority(ev, now), ts_key(ev), ev, claim_new))
             continue
         status = rec.get("status", "pending")
         if status == "done" or status == "dead":
@@ -362,7 +386,7 @@ def main():
                     rec["status"] = "processing"
                     rec["updated_at"] = now_iso()
                     rec["next_wake_at"] = (now + timedelta(seconds=WAIT_WAKE_INTERVAL_SECS)).isoformat()
-                candidates.append((dispatch_priority(ev), ts_key(ev),
+                candidates.append((dispatch_priority(ev, now), ts_key(ev),
                                    resend_ev, claim_waiting))
             continue
         attempts = int(rec.get("attempts", 0))
@@ -381,7 +405,7 @@ def main():
 
                 def claim_reclaim(rec=rec):
                     rec["updated_at"] = now_iso()
-                candidates.append((dispatch_priority(ev), ts_key(ev),
+                candidates.append((dispatch_priority(ev, now), ts_key(ev),
                                    reclaim_ev, claim_reclaim))
             continue
         stale = (now - updated) > timedelta(seconds=TIMEOUT_SECS)
@@ -403,7 +427,7 @@ def main():
                     rec["status"] = "processing"
                     rec["attempts"] = attempts + 1
                     rec["updated_at"] = now_iso()
-                candidates.append((dispatch_priority(ev), ts_key(ev),
+                candidates.append((dispatch_priority(ev, now), ts_key(ev),
                                    ev, claim_retry))
             else:
                 rec["status"] = "dead"

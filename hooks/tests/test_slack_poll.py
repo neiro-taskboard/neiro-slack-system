@@ -44,6 +44,10 @@ Covered:
      is handed to the cron sweeper even inside the start grace, with a
      fastpath_reclaim annotation; attempts and first_wake_at are left
      untouched. Without the env var the grace behaviour is unchanged.
+ 14. burst aging (2026-11-21): a plain (\"その他\") event waiting over
+     5 minutes is promoted to the Neiro-addressed tier, and over
+     15 minutes to the DM tier, so lower-priority traffic cannot starve
+     while DMs and mentions keep flowing; within a tier, oldest first.
 """
 import json
 import os
@@ -614,6 +618,78 @@ def test_burst_priority_bot_mention():
           len(due) == 1 and due[0]["ts"] == mention["ts"], due)
 
 
+def test_burst_priority_aging_promotes_old_plain():
+    # エージング（2026-11-21）：「その他」は待ち時間で段階的に昇格する。
+    # 5分を超えたらねいろ宛て相当（優先度1）になり、同順位では古い順
+    # なので、新しい ねいろ宛てより先に起こされる。
+    env = Env()
+    env.env["SLACK_POLL_MAX_PER_WAKE"] = "2"
+    now = datetime.now(timezone.utc)
+    plain_old = make_event(ts="1794476892.000000")
+    plain_old["text"] = "設計の話"
+    plain_old["received_at"] = now_iso(now - timedelta(minutes=6))
+    mention = make_event(ts="1794476892.000001")
+    mention["text"] = "Neiroさん、質問です"
+    mention["received_at"] = now_iso(now)
+    plain_new = make_event(ts="1794476892.000002")
+    plain_new["text"] = "設計の話2"
+    plain_new["received_at"] = now_iso(now)
+    env.write_inbox([plain_new, mention, plain_old])
+    out = env.run()
+    due = out["payload"]["events"]
+    order = [e["ts"] for e in due]
+    check("aging -> 6min old plain promoted above newer mention",
+          order == [plain_old["ts"], mention["ts"]], order)
+    check("aging -> newest plain left queued",
+          out["payload"].get("queue_remaining") == 1, out["payload"])
+
+
+def test_burst_priority_aging_top_after_15min():
+    # 15分を超えた「その他」は最上位（DM相当）になり、DMより ts が
+    # 古ければ DM より先に起こされる。5分未満のものは昇格しない。
+    env = Env()
+    env.env["SLACK_POLL_MAX_PER_WAKE"] = "2"
+    now = datetime.now(timezone.utc)
+    plain_old = make_event(ts="1794476892.000000")
+    plain_old["text"] = "設計の話"
+    plain_old["received_at"] = now_iso(now - timedelta(minutes=16))
+    dm = make_event(ts="1794476892.000001",
+                    channel=make_id("D", "TESTDM0001"))
+    dm["text"] = "dm question"
+    dm["received_at"] = now_iso(now)
+    plain_young = make_event(ts="1794476892.000002")
+    plain_young["text"] = "設計の話2"
+    plain_young["received_at"] = now_iso(now - timedelta(minutes=4))
+    env.write_inbox([plain_young, dm, plain_old])
+    out = env.run()
+    due = out["payload"]["events"]
+    order = [e["ts"] for e in due]
+    check("aging -> 16min old plain promoted to top, before DM",
+          order == [plain_old["ts"], dm["ts"]], order)
+    check("aging -> 4min old plain not promoted, left queued",
+          out["payload"].get("queue_remaining") == 1, out["payload"])
+
+
+def test_burst_priority_aging_naive_received_at():
+    # タイムゾーンなしの received_at でも落ちず、UTC として扱って昇格する
+    # （agy レビュー指摘、2026-11-21）。
+    env = Env()
+    env.env["SLACK_POLL_MAX_PER_WAKE"] = "1"
+    now = datetime.now(timezone.utc)
+    plain_old = make_event(ts="1794476892.000000")
+    plain_old["text"] = "設計の話"
+    plain_old["received_at"] = (now - timedelta(minutes=6)).replace(
+        tzinfo=None).isoformat()
+    plain_new = make_event(ts="1794476892.000001")
+    plain_new["text"] = "Neiroさん、質問です"
+    plain_new["received_at"] = now_iso(now)
+    env.write_inbox([plain_new, plain_old])
+    out = env.run()
+    due = out["payload"]["events"]
+    check("aging naive received_at -> promoted, no crash",
+          len(due) == 1 and due[0]["ts"] == plain_old["ts"], due)
+
+
 def main():
     global FAIL
     tests = [test_new_event_wakes_once,
@@ -631,6 +707,9 @@ def main():
              test_burst_priority_dm_and_mention_first,
              test_burst_duplicate_lines_dispatched_once,
              test_burst_priority_bot_mention,
+             test_burst_priority_aging_promotes_old_plain,
+             test_burst_priority_aging_top_after_15min,
+             test_burst_priority_aging_naive_received_at,
              test_parallel_claims_single_flight]
     for t in tests:
         try:
