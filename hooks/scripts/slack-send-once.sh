@@ -199,6 +199,29 @@
 #       が返ってこないため）。dump の窓（直近100件）に入らない古い
 #       候補は印が分からないので文面で拾う（従来どおり）。
 #
+#   15. 重複チェックの Python 片の fail-open 潰し（2026-11-21、中-1。
+#       Yama さんの指摘を取り入れ）。check_bounded・check_metadata・
+#       check_duplicate_thread_marked・check_duplicate_thread・
+#       check_duplicate の窓・check_other_duplicate・check_other_bounded
+#       の 7つの python3 -c は「0=見つかった／1=なし／2=読めなかった」
+#       を返す契約だが、json.loads 以外が捕まえていない例外（文面
+#       ファイルの UnicodeDecodeError など）でも Python は終了コード1
+#       を返すため、想定外の例外がすべて「重複なし」になって送信へ
+#       進んでいた。本体を try: ... except Exception: sys.exit(2) で
+#       包み、「なし」は明示の sys.exit(1) だけにした（sys.exit は
+#       SystemExit なので except Exception には捕まらず、0/1/3 の
+#       意味は変わらない）。try/except はコンパイル時の SyntaxError
+#       を捕まえられないので、CLI由来の値（--event-id / --request-id・
+#       --window-mins 由来の cutoff）は Python ソースに埋め込まず
+#       環境変数で渡す（' が入ると SyntaxError で終了コード1になる
+#       ため）。TMP_MSG（mktemp 生成）・SELF_ID（whoami 由来）は
+#       引用符を含み得ないので従来どおり埋め込みのまま。同じ pass で
+#       check_ledger の文面読み取りも except OSError だけでは
+#       UnicodeDecodeError（ValueError 系）を捕まえられず終了コード1
+#       （＝台帳に無し）になっていたので、except (OSError,
+#       UnicodeDecodeError) に直した（下流の履歴チェックが fail-closed
+#       になったので実害は無いが、台帳チェック単体でも正しく止まる）。
+#
 # 使い方:
 #   slack-send-once.sh --channel C... --message '...' [--workspace muse-board]
 #   slack-send-once.sh --permalink <url> --message '...' [--workspace muse-board]
@@ -581,7 +604,7 @@ def _norm(t):
 try:
     with open(msg_path, encoding='utf-8') as f:
         target = _norm(f.read())
-except OSError:
+except (OSError, UnicodeDecodeError):
     sys.exit(2)
 try:
     f = open(ledger_path, encoding='utf-8')
@@ -644,26 +667,29 @@ check_bounded() {
     attempt=$((attempt + 1))
     raw=$("$SLACKCLI" conversations read "$CHANNEL" --limit "$BOUNDED_N" --json "${WS_ARGS[@]}" 2>/dev/null || true)
     found=$(printf '%s' "$raw" | python3 -c "
-import sys, json, re
-raw = sys.stdin.read()
-i = raw.find('{')
-if i < 0:
-    sys.exit(2)
 try:
-    d = json.loads(raw[i:])
+    import sys, json, re
+    raw = sys.stdin.read()
+    i = raw.find('{')
+    if i < 0:
+        sys.exit(2)
+    try:
+        d = json.loads(raw[i:])
+    except Exception:
+        sys.exit(2)
+    # 再送ヘッダー（新旧どちらの文言でも）で始まる文面は、ヘッダー1行を除いて
+    # 比較する（2026-11-14、再送ヘッダーの文言統一）。
+    _RESEND_HEAD = re.compile(r'^遅れての再送（(?:元の失敗時刻|最初の試行)：\d{4}-\d{2}-\d{2} \d{2}:\d{2} JST）\n(?=.)')
+    def _norm_resend(t):
+        return _RESEND_HEAD.sub('', t.strip(), count=1)
+    target = _norm_resend(open('$TMP_MSG', encoding='utf-8').read())
+    for m in d.get('messages', []):
+        if m.get('user') == '$SELF_ID' and _norm_resend(m.get('text') or '') == target:
+            print('FOUND ' + str(m.get('ts', '')))
+            sys.exit(0)
+    sys.exit(1)
 except Exception:
     sys.exit(2)
-# 再送ヘッダー（新旧どちらの文言でも）で始まる文面は、ヘッダー1行を除いて
-# 比較する（2026-11-14、再送ヘッダーの文言統一）。
-_RESEND_HEAD = re.compile(r'^遅れての再送（(?:元の失敗時刻|最初の試行)：\d{4}-\d{2}-\d{2} \d{2}:\d{2} JST）\n(?=.)')
-def _norm_resend(t):
-    return _RESEND_HEAD.sub('', t.strip(), count=1)
-target = _norm_resend(open('$TMP_MSG', encoding='utf-8').read())
-for m in d.get('messages', []):
-    if m.get('user') == '$SELF_ID' and _norm_resend(m.get('text') or '') == target:
-        print('FOUND ' + str(m.get('ts', '')))
-        sys.exit(0)
-sys.exit(1)
 " 2>/dev/null)
     rc=$?
     if [ "$rc" -eq 0 ]; then
@@ -705,18 +731,21 @@ check_metadata() {
   if [ -n "$EVENT_ID" ]; then meta_args+=(--oldest "${EVENT_ID##*:}"); fi
   out=$(python3 "$READ_META" "${meta_args[@]}" 2>/dev/null || true)
   found_ts=$(printf '%s' "$out" | python3 -c "
-import sys, json
-raw = sys.stdin.read()
 try:
-    d = json.loads(raw)
+    import sys, json
+    raw = sys.stdin.read()
+    try:
+        d = json.loads(raw)
+    except Exception:
+        sys.exit(2)
+    if not d.get('ok'):
+        sys.exit(2)
+    if d.get('found'):
+        print('FOUND ' + str(d.get('ts', '')))
+        sys.exit(0)
+    sys.exit(1)
 except Exception:
     sys.exit(2)
-if not d.get('ok'):
-    sys.exit(2)
-if d.get('found'):
-    print('FOUND ' + str(d.get('ts', '')))
-    sys.exit(0)
-sys.exit(1)
 " 2>/dev/null)
   rc=$?
   if [ "$rc" -eq 0 ]; then
@@ -753,33 +782,36 @@ check_duplicate_thread_marked() {
     # イベントの ts より後の投稿だけ読む（check_metadata と同じ理由）。
     if [ -n "$EVENT_ID" ]; then dump_args+=(--oldest "${EVENT_ID##*:}"); fi
     raw=$(python3 "$READ_META" "${dump_args[@]}" 2>/dev/null || true)
-    found=$(printf '%s' "$raw" | python3 -c "
-import sys, json, re
-raw = sys.stdin.read()
+    found=$(printf '%s' "$raw" | EVENT_ID="$EVENT_ID" REQUEST_ID="$REQUEST_ID" python3 -c "
 try:
-    d = json.loads(raw)
+    import sys, json, re, os
+    raw = sys.stdin.read()
+    try:
+        d = json.loads(raw)
+    except Exception:
+        sys.exit(2)
+    if not d.get('ok'):
+        sys.exit(2)
+    _RESEND_HEAD = re.compile(r'^遅れての再送（(?:元の失敗時刻|最初の試行)：\d{4}-\d{2}-\d{2} \d{2}:\d{2} JST）\n(?=.)')
+    def _norm_resend(t):
+        return _RESEND_HEAD.sub('', t.strip(), count=1)
+    target = _norm_resend(open('$TMP_MSG', encoding='utf-8').read())
+    if os.environ.get('EVENT_ID'):
+        cur_mark = ('event_id', os.environ.get('EVENT_ID'))
+    else:
+        cur_mark = ('request_id', os.environ.get('REQUEST_ID'))
+    for m in d.get('messages', []):
+        if m.get('user') != '$SELF_ID':
+            continue
+        mark = m.get('mark')
+        if mark is not None and (mark.get('kind'), mark.get('value')) != cur_mark:
+            continue
+        if _norm_resend(m.get('text') or '') == target:
+            print('FOUND ' + str(m.get('ts', '')))
+            sys.exit(0)
+    sys.exit(1)
 except Exception:
     sys.exit(2)
-if not d.get('ok'):
-    sys.exit(2)
-_RESEND_HEAD = re.compile(r'^遅れての再送（(?:元の失敗時刻|最初の試行)：\d{4}-\d{2}-\d{2} \d{2}:\d{2} JST）\n(?=.)')
-def _norm_resend(t):
-    return _RESEND_HEAD.sub('', t.strip(), count=1)
-target = _norm_resend(open('$TMP_MSG', encoding='utf-8').read())
-if '$EVENT_ID':
-    cur_mark = ('event_id', '$EVENT_ID')
-else:
-    cur_mark = ('request_id', '$REQUEST_ID')
-for m in d.get('messages', []):
-    if m.get('user') != '$SELF_ID':
-        continue
-    mark = m.get('mark')
-    if mark is not None and (mark.get('kind'), mark.get('value')) != cur_mark:
-        continue
-    if _norm_resend(m.get('text') or '') == target:
-        print('FOUND ' + str(m.get('ts', '')))
-        sys.exit(0)
-sys.exit(1)
 " 2>/dev/null)
     rc=$?
     if [ "$rc" -eq 0 ]; then
@@ -812,24 +844,27 @@ check_duplicate_thread() {
     attempt=$((attempt + 1))
     raw=$("$SLACKCLI" conversations read "$CHANNEL" --limit "$THREAD_CHECK_N" --json --thread-ts "$THREAD_TS" "${WS_ARGS[@]}" 2>/dev/null || true)
     found=$(printf '%s' "$raw" | python3 -c "
-import sys, json, re
-raw = sys.stdin.read()
-i = raw.find('{')
-if i < 0:
-    sys.exit(2)
 try:
-    d = json.loads(raw[i:])
+    import sys, json, re
+    raw = sys.stdin.read()
+    i = raw.find('{')
+    if i < 0:
+        sys.exit(2)
+    try:
+        d = json.loads(raw[i:])
+    except Exception:
+        sys.exit(2)
+    _RESEND_HEAD = re.compile(r'^遅れての再送（(?:元の失敗時刻|最初の試行)：\d{4}-\d{2}-\d{2} \d{2}:\d{2} JST）\n(?=.)')
+    def _norm_resend(t):
+        return _RESEND_HEAD.sub('', t.strip(), count=1)
+    target = _norm_resend(open('$TMP_MSG', encoding='utf-8').read())
+    for m in d.get('messages', []):
+        if m.get('user') == '$SELF_ID' and _norm_resend(m.get('text') or '') == target:
+            print('FOUND ' + str(m.get('ts', '')))
+            sys.exit(0)
+    sys.exit(1)
 except Exception:
     sys.exit(2)
-_RESEND_HEAD = re.compile(r'^遅れての再送（(?:元の失敗時刻|最初の試行)：\d{4}-\d{2}-\d{2} \d{2}:\d{2} JST）\n(?=.)')
-def _norm_resend(t):
-    return _RESEND_HEAD.sub('', t.strip(), count=1)
-target = _norm_resend(open('$TMP_MSG', encoding='utf-8').read())
-for m in d.get('messages', []):
-    if m.get('user') == '$SELF_ID' and _norm_resend(m.get('text') or '') == target:
-        print('FOUND ' + str(m.get('ts', '')))
-        sys.exit(0)
-sys.exit(1)
 " 2>/dev/null)
     rc=$?
     if [ "$rc" -eq 0 ]; then
@@ -876,38 +911,41 @@ check_duplicate() {
     while :; do
       local read_args=("$CHANNEL" --limit 50 --json --oldest "$oldest")
       raw=$("$SLACKCLI" conversations read "${read_args[@]}" "${WS_ARGS[@]}" 2>/dev/null || true)
-      page_out=$(printf '%s' "$raw" | python3 -c "
-import sys, json, re, time
-raw = sys.stdin.read()
-i = raw.find('{')
-if i < 0:
-    sys.exit(2)
+      page_out=$(printf '%s' "$raw" | CUTOFF="$cutoff" python3 -c "
 try:
-    d = json.loads(raw[i:])
+    import sys, json, re, time, os
+    raw = sys.stdin.read()
+    i = raw.find('{')
+    if i < 0:
+        sys.exit(2)
+    try:
+        d = json.loads(raw[i:])
+    except Exception:
+        sys.exit(2)
+    # 再送ヘッダー（新旧どちらの文言でも）で始まる文面は、ヘッダー1行を除いて
+    # 比較する（2026-11-14、再送ヘッダーの文言統一）。
+    _RESEND_HEAD = re.compile(r'^遅れての再送（(?:元の失敗時刻|最初の試行)：\d{4}-\d{2}-\d{2} \d{2}:\d{2} JST）\n(?=.)')
+    def _norm_resend(t):
+        return _RESEND_HEAD.sub('', t.strip(), count=1)
+    target = _norm_resend(open('$TMP_MSG', encoding='utf-8').read())
+    cutoff = float(os.environ['CUTOFF'])
+    for m in d.get('messages', []):
+        if m.get('user') != '$SELF_ID':
+            continue
+        try:
+            ts = float(m.get('ts', '0'))
+        except ValueError:
+            continue
+        if ts >= cutoff and _norm_resend(m.get('text') or '') == target:
+            print('FOUND ' + m.get('ts', ''))
+            sys.exit(0)
+    if d.get('has_more') and d.get('next_oldest'):
+        print('MORE ' + str(d['next_oldest']))
+        sys.exit(3)
+    print('DONE')
+    sys.exit(1)
 except Exception:
     sys.exit(2)
-# 再送ヘッダー（新旧どちらの文言でも）で始まる文面は、ヘッダー1行を除いて
-# 比較する（2026-11-14、再送ヘッダーの文言統一）。
-_RESEND_HEAD = re.compile(r'^遅れての再送（(?:元の失敗時刻|最初の試行)：\d{4}-\d{2}-\d{2} \d{2}:\d{2} JST）\n(?=.)')
-def _norm_resend(t):
-    return _RESEND_HEAD.sub('', t.strip(), count=1)
-target = _norm_resend(open('$TMP_MSG', encoding='utf-8').read())
-cutoff = $cutoff
-for m in d.get('messages', []):
-    if m.get('user') != '$SELF_ID':
-        continue
-    try:
-        ts = float(m.get('ts', '0'))
-    except ValueError:
-        continue
-    if ts >= cutoff and _norm_resend(m.get('text') or '') == target:
-        print('FOUND ' + m.get('ts', ''))
-        sys.exit(0)
-if d.get('has_more') and d.get('next_oldest'):
-    print('MORE ' + str(d['next_oldest']))
-    sys.exit(3)
-print('DONE')
-sys.exit(1)
 ")
       local rc=$?
       if [ "$rc" -eq 0 ]; then
@@ -960,23 +998,26 @@ check_other_duplicate() {
     attempt=$((attempt + 1))
     raw=$("$SLACKCLI" conversations read "$CHANNEL" --limit "$THREAD_CHECK_N" --json --thread-ts "$THREAD_TS" "${WS_ARGS[@]}" 2>/dev/null || true)
     found=$(printf '%s' "$raw" | python3 -c "
-import sys, json
-raw = sys.stdin.read()
-i = raw.find('{')
-if i < 0:
-    sys.exit(2)
 try:
-    d = json.loads(raw[i:])
+    import sys, json
+    raw = sys.stdin.read()
+    i = raw.find('{')
+    if i < 0:
+        sys.exit(2)
+    try:
+        d = json.loads(raw[i:])
+    except Exception:
+        sys.exit(2)
+    target = open('$TMP_MSG', encoding='utf-8').read().strip()
+    for m in d.get('messages', []):
+        if m.get('user') == '$SELF_ID':
+            continue
+        if (m.get('text') or '').strip() == target:
+            print('OTHER_DUP ' + str(m.get('ts', '')))
+            sys.exit(0)
+    sys.exit(1)
 except Exception:
     sys.exit(2)
-target = open('$TMP_MSG', encoding='utf-8').read().strip()
-for m in d.get('messages', []):
-    if m.get('user') == '$SELF_ID':
-        continue
-    if (m.get('text') or '').strip() == target:
-        print('OTHER_DUP ' + str(m.get('ts', '')))
-        sys.exit(0)
-sys.exit(1)
 " 2>/dev/null)
     rc=$?
     if [ "$rc" -eq 0 ]; then
@@ -1009,23 +1050,26 @@ check_other_bounded() {
     attempt=$((attempt + 1))
     raw=$("$SLACKCLI" conversations read "$CHANNEL" --limit "$BOUNDED_N" --json "${WS_ARGS[@]}" 2>/dev/null || true)
     found=$(printf '%s' "$raw" | python3 -c "
-import sys, json
-raw = sys.stdin.read()
-i = raw.find('{')
-if i < 0:
-    sys.exit(2)
 try:
-    d = json.loads(raw[i:])
+    import sys, json
+    raw = sys.stdin.read()
+    i = raw.find('{')
+    if i < 0:
+        sys.exit(2)
+    try:
+        d = json.loads(raw[i:])
+    except Exception:
+        sys.exit(2)
+    target = open('$TMP_MSG', encoding='utf-8').read().strip()
+    for m in d.get('messages', []):
+        if m.get('user') == '$SELF_ID':
+            continue
+        if (m.get('text') or '').strip() == target:
+            print('OTHER_DUP ' + str(m.get('ts', '')))
+            sys.exit(0)
+    sys.exit(1)
 except Exception:
     sys.exit(2)
-target = open('$TMP_MSG', encoding='utf-8').read().strip()
-for m in d.get('messages', []):
-    if m.get('user') == '$SELF_ID':
-        continue
-    if (m.get('text') or '').strip() == target:
-        print('OTHER_DUP ' + str(m.get('ts', '')))
-        sys.exit(0)
-sys.exit(1)
 " 2>/dev/null)
     rc=$?
     if [ "$rc" -eq 0 ]; then
