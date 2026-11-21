@@ -49,9 +49,15 @@ USER_NAMES = {}
 
 def parse_iso(s):
     try:
-        return datetime.fromisoformat(s)
+        dt = datetime.fromisoformat(s)
     except (TypeError, ValueError):
         return None
+    if dt.tzinfo is None:
+        # タイムゾーンなしは UTC として扱う。naive のまま aware な
+        # cutoff / state_cutoff と比べると TypeError で落ちる
+        #（Yanayana さんの msgstate.py _parse_ts と同じ穴。2026-11-21）。
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 def month_key(dt):
