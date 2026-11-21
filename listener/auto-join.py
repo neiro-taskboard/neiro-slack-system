@@ -80,6 +80,9 @@ DRY_RUN = os.environ.get("AUTO_JOIN_DRY_RUN") == "1"
 SEED_WINDOW_SECS = int(os.environ.get("AUTO_JOIN_SEED_WINDOW_SECS", "900"))
 SEED_LIMIT = 20
 SEED_TEST_CHANNEL = os.environ.get("AUTO_JOIN_SEED_TEST_CHANNEL", "")
+IDS_PATH_ENV = "NEIRO_SLACK_IDS_PATH"
+DEFAULT_IDS_PATH = "~/.config/neiro-slack/ids.json"
+ID_SHAPE = re.compile(r"[UWBCTGDA]0[A-Z0-9]{8,}")
 SKIP_SUBTYPES = {"message_changed", "message_deleted", "channel_join", "channel_leave"}
 # slackcli's `conversations read --json` strips the subtype field, so a
 # channel_join / channel_leave message arrives looking like an ordinary
@@ -95,6 +98,35 @@ SYSTEM_TEXT_RE = re.compile(
 def load_json(path):
     with open(path) as f:
         return json.load(f)
+
+
+def load_ids():
+    """ids.json を読む。読めなければ None（fail-closed）。
+
+    slack-ids.sh と同じ前提：ファイルが無い・JSON が壊れている・
+    オブジェクトでない・他ユーザーに読める権限（0600 でない）の
+    いずれも None を返す。パスは環境変数 NEIRO_SLACK_IDS_PATH で
+    差し替えられる（テスト用）。2026-11-21、実ID外部化の残り4件
+    （DRY_RUN seed 判定のワークスペースID）で追加。
+    """
+    path = os.path.expanduser(
+        os.environ.get(IDS_PATH_ENV) or DEFAULT_IDS_PATH)
+    try:
+        if os.stat(path).st_mode & 0o077:
+            return None
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def ids_value(ids, key, shape=ID_SHAPE):
+    """ids から ID 形状の値だけを取り出す。無ければ None。"""
+    value = ids.get(key) if ids else None
+    if isinstance(value, str) and shape.fullmatch(value):
+        return value
+    return None
 
 
 def log(msg):
@@ -573,12 +605,21 @@ def main():
     if not DRY_RUN:
         save_join_state(STATE_PATH, joined_keys, removed_keys)
     if DRY_RUN and SEED_TEST_CHANNEL:
-        for ws in config.get("workspaces", []):
-            if ws.get("workspace_id") == "T0CGV6V7161":
-                seeded += seed_channel(
-                    ws, SEED_TEST_CHANNEL, ws.get("slackcli_key", ""),
-                    own_ids, seen, domains, thread_counts, inbox_path,
-                    dry=True)
+        # seed 対象のワークスペースは ids.json から読む（2026-11-21、
+        # 実ID外部化の残り4件）。読めなければ seed を見送り（fail-closed）、
+        # 直書きのワークスペースIDには戻さない。
+        ids = load_ids()
+        board_ws = ids_value(ids, "workspace_muse_torishimariyakai")
+        if board_ws is None:
+            log("DRY-RUN seed skipped: board workspace id unreadable "
+                "(ids.json を確認してください)")
+        else:
+            for ws in config.get("workspaces", []):
+                if ws.get("workspace_id") == board_ws:
+                    seeded += seed_channel(
+                        ws, SEED_TEST_CHANNEL, ws.get("slackcli_key", ""),
+                        own_ids, seen, domains, thread_counts, inbox_path,
+                        dry=True)
     log(f"done: checked {checked} channels, joined {joined}, "
         f"seeded {seeded} messages"
         + (" (dry run)" if DRY_RUN else ""))
