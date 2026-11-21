@@ -65,6 +65,9 @@ import sys
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from inbox_append import append_events  # noqa: E402  (shared flock append-if-absent)
+
 BASE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE, "config.json")
 SLACKCLI_STORE = "/home/hatch/.config/slackcli/workspaces.json"
@@ -451,14 +454,16 @@ def main():
                         f"{ev['channel']} {ev['ts']} {ev['user']}: "
                         f"{ev['text'][:60]}")
             else:
-                with open(inbox_path, "a", encoding="utf-8") as f:
-                    for ev in new_events:
-                        f.write(json.dumps(ev, ensure_ascii=False) + "\n")
-                        seen.add((ev["workspace_id"], ev["channel"], ev["ts"]))
+                added_events, skipped_now = append_events(inbox_path, new_events)
                 for ev in new_events:
+                    seen.add((ev["workspace_id"], ev["channel"], ev["ts"]))
+                if skipped_now:
+                    log(f"skipped {skipped_now} already-in-inbox events "
+                        f"for {channel}")
+                for ev in added_events:
                     log(f"added [{ev['workspace_id']}] {ev['channel']} "
                         f"{ev['ts']} {ev['user']}: {ev['text'][:60]}")
-            added += len(new_events)
+            added += len(added_events) if not DRY_RUN else len(new_events)
 
     log(f"done: checked {checked} channels, added {added} missed messages"
         + (" (dry run)" if DRY_RUN else ""))

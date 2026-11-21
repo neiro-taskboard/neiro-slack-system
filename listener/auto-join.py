@@ -70,6 +70,9 @@ import time
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from inbox_append import append_events  # noqa: E402  (shared flock append-if-absent)
+
 BASE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE, "config.json")
 STATE_PATH = os.path.join(BASE, "events", "auto_join_state.json")
@@ -491,15 +494,14 @@ def seed_channel(ws, channel_id, bot_key, own_ids, seen, domains,
                     f"{channel_id} {ev['ts']} {ev['user']}: "
                     f"{ev['text'][:60]}")
         else:
-            with open(inbox_path, "a", encoding="utf-8") as f:
-                for ev in new_events:
-                    f.write(json.dumps(ev, ensure_ascii=False) + "\n")
-                    seen.add((wid, channel_id, ev["ts"]))
+            added_events, _skipped = append_events(inbox_path, new_events)
             for ev in new_events:
+                seen.add((wid, channel_id, ev["ts"]))
+            for ev in added_events:
                 log(f"seeded [{ws.get('workspace_name', '')}] "
                     f"{channel_id} {ev['ts']} {ev['user']}: "
                     f"{ev['text'][:60]}")
-        return len(new_events)
+        return len(added_events) if not dry else len(new_events)
     except Exception as e:  # noqa: BLE001 - best effort, never fail watchdog
         log(f"seed failed for {channel_id}: {e}")
         return 0

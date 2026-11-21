@@ -29,6 +29,9 @@ import threading
 import time
 from datetime import datetime, timezone
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from inbox_append import append_events  # noqa: E402  (shared flock append-if-absent)
+
 from slack_sdk.socket_mode import SocketModeClient
 from slack_sdk.socket_mode.request import SocketModeRequest
 from slack_sdk.socket_mode.response import SocketModeResponse
@@ -73,12 +76,13 @@ def fetch_im_channels(web):
 
 
 def append_event(config, event):
-    """Append one event JSON object to the inbox file (atomic-ish)."""
-    line = json.dumps(event, ensure_ascii=False)
-    inbox = config["inbox_path"]
-    os.makedirs(os.path.dirname(inbox), exist_ok=True)
-    with open(inbox, "a") as f:
-        f.write(line + "\n")
+    """Append one event JSON object to the inbox file.
+
+    Atomic append-if-absent (see inbox_append.py): the check and the
+    append happen under one flock, so the socket listener, backfill
+    and auto-join cannot land the same post twice.
+    """
+    append_events(config["inbox_path"], [event])
 
 
 def write_heartbeat(config, status):
