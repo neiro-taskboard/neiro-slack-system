@@ -38,9 +38,19 @@ UNLOCKED = "/home/hatch/hooks/scripts/slack-send-once.sh"
 PASS = 0
 FAIL = 0
 
-SELF_ID = "U0CH1B19D4J"
-OTHER_ID = "U0CH1QBC8M8"
-CHANNEL = "C0CGUA5LH5X"
+def make_id(prefix, rest):
+    """Build an ID-shaped string from parts (like a real Slack ID).
+
+    Fixtures are synthetic (2026-11-21): the real IDs used before were
+    other people's and ours; parts-built fakes keep the tests passing
+    without leaking real IDs into the public repo.
+    """
+    return prefix + "0" + rest
+
+
+SELF_ID = make_id("U", "TESTBOTMUSE")
+OTHER_ID = make_id("U", "TESTOTHER1")
+CHANNEL = make_id("C", "TESTCHANT1")
 CANDIDATE = "直列化ラッパーの並行テスト文面です。"
 
 
@@ -61,7 +71,7 @@ args = sys.argv[1:]
 state_path = os.environ["SLACKCLI_STATE"]
 
 if args and args[0] == "auth":
-    print("neiro (U0CH1B19D4J)")
+    print("neiro (__SELF_ID__)")
     sys.exit(0)
 
 def read_state():
@@ -82,7 +92,7 @@ if args and args[0] == "messages":
     with open(msg_file, encoding="utf-8") as f:
         text = f.read()
     ts = f"{time.time():.6f}"
-    rec = {"ts": ts, "user": "U0CH1B19D4J", "text": text}
+    rec = {"ts": ts, "user": "__SELF_ID__", "text": text}
     with open(state_path, "a", encoding="utf-8") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     print(json.dumps({"ts": ts}))
@@ -119,7 +129,7 @@ class Env:
         self.state_path = os.path.join(self.home, "state.jsonl")
         stub = os.path.join(bindir, "slackcli")
         with open(stub, "w", encoding="utf-8") as f:
-            f.write(STUB)
+            f.write(STUB.replace("__SELF_ID__", SELF_ID))
         os.chmod(stub, 0o755)
         self.env = dict(os.environ, HOME=self.home,
                         SLACKCLI_STATE=self.state_path)

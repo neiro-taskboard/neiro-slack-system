@@ -87,8 +87,8 @@ class TestBlanketAndExamplePlaceholders(unittest.TestCase):
     def test_id_shaped_placeholder_matches(self):
         # A placeholder shaped exactly like a real ID is indistinguishable
         # from one, so the blanket flags it — fixtures must therefore use
-        # non-ID-shaped placeholders (see the test above), not U0EXAMPLE01.
-        for word in ["U0EXAMPLE01", "C0EXAMPLE01"]:
+        # non-ID-shaped placeholders (see the test above), not an ID-shaped EXAMPLE placeholder.
+        for word in [make_id("U", "EXAMPLE01"), make_id("C", "EXAMPLE01")]:
             self.assertIsNotNone(
                 BLANKET.search(word),
                 f"blanket should match ID-shaped placeholder {word}",

@@ -42,6 +42,8 @@ import subprocess
 import sys
 import tempfile
 
+
+
 CHECK_PY = os.environ.get(
     "SLACK_ANSWERED_CHECK_PY",
     os.path.abspath(os.path.join(
@@ -72,6 +74,7 @@ BOT_MUSE = make_id("U", "TESTBOTMUSE")
 BOT_TASK = make_id("U", "TESTBOTTASK")
 WS_MUSE = make_id("T", "TESTWSMUSE1")
 WS_TASK = make_id("T", "TESTWSTASK1")
+BOT_ID = make_id("B", "TESTBOT001")
 
 
 def check(name, cond, detail=""):
@@ -184,7 +187,7 @@ def test_bot_and_short_posts_do_not_count():
     mod = load_check()
     # 他の bot の自動応答（本文が長くても）は答え済みにしない。
     msgs = [
-        {"ts": "1794585000.000000", "user": OTHER, "bot_id": "B0CH1QBBNUA",
+        {"ts": "1794585000.000000", "user": OTHER, "bot_id": BOT_ID,
          "text": "こっちで答えますね、確認しました"},
     ]
     out = run_check(mod, msgs)

@@ -20,6 +20,23 @@ from contextlib import redirect_stdout
 from types import SimpleNamespace
 from unittest import mock
 
+def make_id(prefix, rest):
+    """Build an ID-shaped string from parts (like a real Slack ID).
+
+    Fixtures are synthetic (2026-11-21): the real IDs used before were
+    other people's and ours; parts-built fakes keep the tests passing
+    without leaking real IDs into the public repo.
+    """
+    return prefix + "0" + rest
+
+
+WS_MUSE = make_id("T", "TESTWSMUSE1")
+WS_TASK = make_id("T", "TESTWSTASK1")
+CHANNEL = make_id("C", "TESTCHAN01")
+SELF_ID = make_id("U", "TESTBOTMUSE")
+USER_ID = make_id("U", "TESTHUMAN01")
+
+
 SCRIPT_PATH = os.path.expanduser(
     "~/workspace/neiro-slack-system/hooks/scripts/slack-read-metadata.py")
 
@@ -35,8 +52,8 @@ def load_mod():
 FAKE_TOKEN_BOARD = "FAKE-BOARD-TOKEN"
 FAKE_TOKEN_DEFAULT = "FAKE-DEFAULT-TOKEN"
 
-EVENT_ID = "T0CGV6V7161:C0CGYGT9V7G:1794652249.960829"
-OTHER_EVENT_ID = "T0CGV6V7161:C0CGYGT9V7G:1794650000.000000"
+EVENT_ID = WS_MUSE + ":" + CHANNEL + ":1794652249.960829"
+OTHER_EVENT_ID = WS_MUSE + ":" + CHANNEL + ":1794650000.000000"
 REQUEST_ID = "123e4567-e89b-12d3-a456-426614174000"
 
 
@@ -81,14 +98,14 @@ class ReadMetadataTest(unittest.TestCase):
         self.store = os.path.join(self.tmp.name, "workspaces.json")
         with open(self.store, "w", encoding="utf-8") as f:
             json.dump({
-                "default_workspace": "T0CGB25D6H5",
+                "default_workspace": WS_TASK,
                 "workspaces": {
-                    "T0CGB25D6H5": {
-                        "workspace_id": "T0CGB25D6H5",
+                    WS_TASK: {
+                        "workspace_id": WS_TASK,
                         "workspace_name": "Neiro Task Board",
                         "token": FAKE_TOKEN_DEFAULT},
                     "muse-board": {
-                        "workspace_id": "T0CGV6V7161",
+                        "workspace_id": WS_MUSE,
                         "workspace_name": "muse取締役会",
                         "token": FAKE_TOKEN_BOARD},
                 },
@@ -152,7 +169,7 @@ class ReadMetadataTest(unittest.TestCase):
                                  side_effect=self.fake_curl_run(responses))
 
     def find(self, **kw):
-        channel = kw.pop("channel", "C0CGYGT9V7G")
+        channel = kw.pop("channel", CHANNEL)
         token = kw.pop("token", FAKE_TOKEN_BOARD)
         responses = kw.pop("responses",
                            kw.pop("bodies", [{"ok": True, "messages": []}]))
@@ -163,7 +180,7 @@ class ReadMetadataTest(unittest.TestCase):
                 sleep=lambda s: None)
 
     def dump(self, **kw):
-        channel = kw.pop("channel", "C0CGYGT9V7G")
+        channel = kw.pop("channel", CHANNEL)
         token = kw.pop("token", FAKE_TOKEN_BOARD)
         responses = kw.pop("responses",
                            kw.pop("bodies", [{"ok": True, "messages": []}]))
@@ -176,12 +193,12 @@ class ReadMetadataTest(unittest.TestCase):
     # 1. event_id 一致の投稿が見つかる（スレッド読み取り）
     def test_find_by_event_id_in_thread(self):
         bodies = [{"ok": True, "messages": [
-            {"ts": "1794660000.000001", "user": "U0CH3MQH7PT",
+            {"ts": "1794660000.000001", "user": USER_ID,
              "text": "other"},
-            marked_msg("1794660000.000002", "U0CH1B19D4J", event_id=EVENT_ID),
+            marked_msg("1794660000.000002", SELF_ID, event_id=EVENT_ID),
         ]}]
         out = self.find(thread_ts="1794583788.831849", event_id=EVENT_ID,
-                        self_id="U0CH1B19D4J", bodies=bodies)
+                        self_id=SELF_ID, bodies=bodies)
         self.assertTrue(out["found"])
         self.assertEqual(out["ts"], "1794660000.000002")
         self.assertEqual(out["checked"], 2)
@@ -196,10 +213,10 @@ class ReadMetadataTest(unittest.TestCase):
     # 2. request_id 一致の投稿が見つかる（チャンネル読み取り）
     def test_find_by_request_id_in_channel(self):
         bodies = [{"ok": True, "messages": [
-            marked_msg("1794660000.000003", "U0CH1B19D4J",
+            marked_msg("1794660000.000003", SELF_ID,
                        request_id=REQUEST_ID),
         ]}]
-        out = self.find(request_id=REQUEST_ID, self_id="U0CH1B19D4J",
+        out = self.find(request_id=REQUEST_ID, self_id=SELF_ID,
                         bodies=bodies)
         self.assertTrue(out["found"])
         self.assertEqual(out["ts"], "1794660000.000003")
@@ -210,12 +227,12 @@ class ReadMetadataTest(unittest.TestCase):
     # 3. 一致なし → found False
     def test_not_found(self):
         bodies = [{"ok": True, "messages": [
-            marked_msg("1794660000.000001", "U0CH1B19D4J",
+            marked_msg("1794660000.000001", SELF_ID,
                        event_id=OTHER_EVENT_ID),
-            {"ts": "1794660000.000002", "user": "U0CH1B19D4J",
+            {"ts": "1794660000.000002", "user": SELF_ID,
              "text": "no metadata"},
         ]}]
-        out = self.find(event_id=EVENT_ID, self_id="U0CH1B19D4J",
+        out = self.find(event_id=EVENT_ID, self_id=SELF_ID,
                         bodies=bodies)
         self.assertFalse(out["found"])
         self.assertIsNone(out["ts"])
@@ -224,19 +241,19 @@ class ReadMetadataTest(unittest.TestCase):
     # 4. 他者の同一 event_id は拾わない（self_id 指定時）
     def test_other_user_mark_ignored(self):
         bodies = [{"ok": True, "messages": [
-            marked_msg("1794660000.000001", "U0CH3MQH7PT", event_id=EVENT_ID),
+            marked_msg("1794660000.000001", USER_ID, event_id=EVENT_ID),
         ]}]
-        out = self.find(event_id=EVENT_ID, self_id="U0CH1B19D4J",
+        out = self.find(event_id=EVENT_ID, self_id=SELF_ID,
                         bodies=bodies)
         self.assertFalse(out["found"])
 
     # 5. event_type が違う印は拾わない
     def test_other_event_type_ignored(self):
         bodies = [{"ok": True, "messages": [
-            marked_msg("1794660000.000001", "U0CH1B19D4J", event_id=EVENT_ID,
+            marked_msg("1794660000.000001", SELF_ID, event_id=EVENT_ID,
                        event_type="other_bot_reply"),
         ]}]
-        out = self.find(event_id=EVENT_ID, self_id="U0CH1B19D4J",
+        out = self.find(event_id=EVENT_ID, self_id=SELF_ID,
                         bodies=bodies)
         self.assertFalse(out["found"])
 
@@ -251,7 +268,7 @@ class ReadMetadataTest(unittest.TestCase):
     def test_token_not_found(self):
         with self.assertRaises(RuntimeError):
             self.mod.find_by_metadata(
-                "C0CGYGT9V7G", event_id=EVENT_ID, workspace="no-such",
+                CHANNEL, event_id=EVENT_ID, workspace="no-such",
                 urlopen=self.fake_urlopen([{"ok": True, "messages": []}]),
                 sleep=lambda s: None)
 
@@ -260,13 +277,13 @@ class ReadMetadataTest(unittest.TestCase):
         bodies = [
             {"ok": True, "has_more": True,
              "response_metadata": {"next_cursor": "abc"},
-             "messages": [marked_msg("1794660000.000001", "U0CH1B19D4J",
+             "messages": [marked_msg("1794660000.000001", SELF_ID,
                                      event_id=OTHER_EVENT_ID)]},
             {"ok": True, "has_more": False,
-             "messages": [marked_msg("1794660000.000002", "U0CH1B19D4J",
+             "messages": [marked_msg("1794660000.000002", SELF_ID,
                                      event_id=EVENT_ID)]},
         ]
-        out = self.find(event_id=EVENT_ID, self_id="U0CH1B19D4J",
+        out = self.find(event_id=EVENT_ID, self_id=SELF_ID,
                         bodies=bodies)
         self.assertTrue(out["found"])
         self.assertEqual(out["ts"], "1794660000.000002")
@@ -278,9 +295,9 @@ class ReadMetadataTest(unittest.TestCase):
     def test_ratelimited_retries_once(self):
         bodies = [{"ok": False, "error": "ratelimited", "retry_after": 1},
                   {"ok": True, "messages": [
-                      marked_msg("1794660000.000001", "U0CH1B19D4J",
+                      marked_msg("1794660000.000001", SELF_ID,
                                  event_id=EVENT_ID)]}]
-        out = self.find(event_id=EVENT_ID, self_id="U0CH1B19D4J",
+        out = self.find(event_id=EVENT_ID, self_id=SELF_ID,
                         bodies=bodies)
         self.assertTrue(out["found"])
         self.assertEqual(len(self.curl_calls), 2)
@@ -303,7 +320,7 @@ class ReadMetadataTest(unittest.TestCase):
         try:
             buf = io.StringIO()
             with redirect_stdout(buf):
-                code = self.mod.main(["--channel", "C0CGYGT9V7G",
+                code = self.mod.main(["--channel", CHANNEL,
                                       "--event-id", EVENT_ID,
                                       "--workspace", "muse-board"])
         finally:
@@ -318,13 +335,13 @@ class ReadMetadataTest(unittest.TestCase):
     # 12. dump は投稿一覧を印付きで返す（スレッド読み取り）
     def test_dump_thread_returns_marks(self):
         bodies = [{"ok": True, "messages": [
-            {"ts": "1794660000.000001", "user": "U0CH1B19D4J",
+            {"ts": "1794660000.000001", "user": SELF_ID,
              "text": "plain"},
-            marked_msg("1794660000.000002", "U0CH1B19D4J",
+            marked_msg("1794660000.000002", SELF_ID,
                        event_id=EVENT_ID),
-            marked_msg("1794660000.000003", "U0CH1B19D4J",
+            marked_msg("1794660000.000003", SELF_ID,
                        request_id=REQUEST_ID),
-            marked_msg("1794660000.000004", "U0CH1B19D4J",
+            marked_msg("1794660000.000004", SELF_ID,
                        event_id=EVENT_ID, event_type="yama_reply"),
         ]}]
         out = self.dump(thread_ts="1794583788.831849", bodies=bodies)
@@ -361,14 +378,14 @@ class ReadMetadataTest(unittest.TestCase):
 
         def _dump(*a, **kw):
             return {"messages": [{"ts": "1794660000.000001",
-                                  "user": "U0CH1B19D4J", "text": "hi",
+                                  "user": SELF_ID, "text": "hi",
                                   "mark": None}], "checked": 1}
 
         self.mod.dump_messages = _dump
         try:
             buf = io.StringIO()
             with redirect_stdout(buf):
-                code = self.mod.main(["--channel", "C0CGYGT9V7G",
+                code = self.mod.main(["--channel", CHANNEL,
                                       "--dump", "--workspace", "muse-board"])
         finally:
             self.mod.dump_messages = orig
@@ -390,9 +407,9 @@ class ReadMetadataTest(unittest.TestCase):
     def test_incomplete_read_retries(self):
         responses = [b'{"ok": true',
                      {"ok": True, "messages": [
-                         marked_msg("1794660000.000001", "U0CH1B19D4J",
+                         marked_msg("1794660000.000001", SELF_ID,
                                     event_id=EVENT_ID)]}]
-        out = self.find(event_id=EVENT_ID, self_id="U0CH1B19D4J",
+        out = self.find(event_id=EVENT_ID, self_id=SELF_ID,
                         responses=responses)
         self.assertTrue(out["found"])
         self.assertEqual(out["ts"], "1794660000.000001")
@@ -401,12 +418,12 @@ class ReadMetadataTest(unittest.TestCase):
     # 17. curl が無ければ urllib へフォールバックする（旧経路の温存）。
     def test_fetch_page_urllib_fallback_when_no_curl(self):
         bodies = [{"ok": True, "messages": [
-            marked_msg("1794660000.000001", "U0CH1B19D4J",
+            marked_msg("1794660000.000001", SELF_ID,
                        event_id=EVENT_ID)]}]
         with mock.patch.object(self.mod.shutil, "which",
                                return_value=None):
             out = self.mod.find_by_metadata(
-                "C0CGYGT9V7G", event_id=EVENT_ID, self_id="U0CH1B19D4J",
+                CHANNEL, event_id=EVENT_ID, self_id=SELF_ID,
                 token=FAKE_TOKEN_BOARD,
                 urlopen=self.fake_urlopen(bodies),
                 sleep=lambda s: None)

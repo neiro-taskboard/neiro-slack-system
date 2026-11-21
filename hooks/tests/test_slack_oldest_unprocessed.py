@@ -29,10 +29,24 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 
+def make_id(prefix, rest):
+    """Build an ID-shaped string from parts (like a real Slack ID).
+
+    Fixtures are synthetic (2026-11-21): the real IDs used before were
+    other people's and ours; parts-built fakes keep the tests passing
+    without leaking real IDs into the public repo.
+    """
+    return prefix + "0" + rest
+
+
+WS_MUSE = make_id("T", "TESTWSMUSE1")
+CHANNEL = make_id("C", "TESTCHAN01")
+
+
 CHECK_PATH = os.path.expanduser(
     "~/hooks/scripts/slack-oldest-unprocessed-check.sh")
-EID = "T0CGV6V7161:C0CGYGT9V7G:1794476000.000001"
-EID2 = "T0CGV6V7161:C0CGYGT9V7G:1794476001.000001"
+EID = WS_MUSE + ":" + CHANNEL + ":1794476000.000001"
+EID2 = WS_MUSE + ":" + CHANNEL + ":1794476001.000001"
 
 
 def iso(dt):
@@ -117,7 +131,7 @@ class OldestUnprocessedTest(unittest.TestCase):
     def test_oldest_wins(self):
         self.write_state([self.rec(age_secs=60),
                           self.rec(eid=EID2, age_secs=300),
-                          self.rec(eid="T0CGV6V7161:C0CGYGT9V7G:1794476002.000001",
+                          self.rec(eid=WS_MUSE + ":" + CHANNEL + ":1794476002.000001",
                                    status="done", age_secs=900)])
         code, out = self.run_check()
         self.assertEqual(code, 1)

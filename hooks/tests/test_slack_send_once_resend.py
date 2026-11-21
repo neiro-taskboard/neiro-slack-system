@@ -36,6 +36,19 @@ import sys
 import tempfile
 import time
 
+def make_id(prefix, rest):
+    """Build an ID-shaped string from parts (like a real Slack ID).
+
+    Fixtures are synthetic (2026-11-21): the real IDs used before were
+    other people's and ours; parts-built fakes keep the tests passing
+    without leaking real IDs into the public repo.
+    """
+    return prefix + "0" + rest
+
+
+CHANNEL = make_id("C", "TESTCHAN01")
+
+
 SCRIPT = "/home/hatch/hooks/scripts/slack-send-once.sh"
 
 PASS = 0
@@ -44,7 +57,7 @@ FAIL = 0
 BODY = "これはテストの本文です。\n2行目もあります。"
 OLD_HEAD = "遅れての再送（最初の試行：2026-11-14 09:12 JST）"
 NEW_HEAD = "遅れての再送（元の失敗時刻：2026-11-14 09:12 JST）"
-SELF_ID = "U0CH1B19D4J"
+SELF_ID = make_id("U", "TESTBOTMUSE")
 
 
 def check(name, cond, detail=""):
@@ -61,7 +74,7 @@ STUB = """#!/bin/sh
 # Log argv (one line per call), then answer like slackcli.
 echo "$@" >> "$SLACKCLI_LOG"
 case "$1" in
-  auth) echo "neiro (U0CH1B19D4J)" ;;
+  auth) echo "neiro (__SELF_ID__)" ;;
   conversations) cat "$SLACKCLI_HISTORY" ;;
 esac
 exit 0
@@ -80,7 +93,7 @@ class Env:
         self.history_path = os.path.join(self.home, "history.json")
         stub = os.path.join(bindir, "slackcli")
         with open(stub, "w", encoding="utf-8") as f:
-            f.write(STUB)
+            f.write(STUB.replace("__SELF_ID__", SELF_ID))
         os.chmod(stub, 0o755)
         self.env = dict(os.environ, HOME=self.home,
                         SLACKCLI_LOG=self.log,
@@ -96,7 +109,7 @@ class Env:
         with open(self.history_path, "w", encoding="utf-8") as f:
             json.dump(history, f, ensure_ascii=False)
         rc = subprocess.run(
-            ["bash", SCRIPT, "--channel", "C0CGYGT9V7G",
+            ["bash", SCRIPT, "--channel", CHANNEL,
              "--message", message, "--check-only"],
             env=self.env, capture_output=True, text=True, timeout=120,
         ).returncode

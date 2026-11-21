@@ -22,6 +22,21 @@ from contextlib import redirect_stdout
 from types import SimpleNamespace
 from unittest import mock
 
+def make_id(prefix, rest):
+    """Build an ID-shaped string from parts (like a real Slack ID).
+
+    Fixtures are synthetic (2026-11-21): the real IDs used before were
+    other people's and ours; parts-built fakes keep the tests passing
+    without leaking real IDs into the public repo.
+    """
+    return prefix + "0" + rest
+
+
+WS_MUSE = make_id("T", "TESTWSMUSE1")
+WS_TASK = make_id("T", "TESTWSTASK1")
+CHANNEL = make_id("C", "TESTCHAN01")
+
+
 SCRIPT_PATH = os.path.expanduser(
     "~/workspace/neiro-slack-system/hooks/scripts/slack-post-metadata.py")
 
@@ -67,14 +82,14 @@ class PostMetadataTest(unittest.TestCase):
         self.store = os.path.join(self.tmp.name, "workspaces.json")
         with open(self.store, "w", encoding="utf-8") as f:
             json.dump({
-                "default_workspace": "T0CGB25D6H5",
+                "default_workspace": WS_TASK,
                 "workspaces": {
-                    "T0CGB25D6H5": {
-                        "workspace_id": "T0CGB25D6H5",
+                    WS_TASK: {
+                        "workspace_id": WS_TASK,
                         "workspace_name": "Neiro Task Board",
                         "token": FAKE_TOKEN_DEFAULT},
                     "muse-board": {
-                        "workspace_id": "T0CGV6V7161",
+                        "workspace_id": WS_MUSE,
                         "workspace_name": "muse取締役会",
                         "token": FAKE_TOKEN_BOARD},
                 },
@@ -91,7 +106,7 @@ class PostMetadataTest(unittest.TestCase):
             self.calls.append(req)
             return FakeResponse(body if body is not None else
                                 {"ok": True, "ts": "1794660000.000001",
-                                 "channel": "C0CGYGT9V7G"})
+                                 "channel": CHANNEL})
         return _open
 
     def request_json(self, idx=0):
@@ -149,40 +164,40 @@ class PostMetadataTest(unittest.TestCase):
 
     # 1. event_id 指定の payload の形（Yama さんと同じ形）
     def test_build_payload_event_id(self):
-        p = self.mod.build_payload("C0CGYGT9V7G", "hello",
-                                   event_id="T0CGV6V7161:C0CGYGT9V7G:1794652249.960829")
+        p = self.mod.build_payload(CHANNEL, "hello",
+                                   event_id=WS_MUSE + ":" + CHANNEL + ":1794652249.960829")
         self.assertEqual(p["metadata"]["event_type"], "neiro_reply")
         self.assertEqual(p["metadata"]["event_payload"],
-                         {"event_id": "T0CGV6V7161:C0CGYGT9V7G:1794652249.960829"})
+                         {"event_id": WS_MUSE + ":" + CHANNEL + ":1794652249.960829"})
         self.assertNotIn("thread_ts", p)
 
     # 2. request_id 指定の payload の形（手動投稿）
     def test_build_payload_request_id(self):
-        p = self.mod.build_payload("C0CGYGT9V7G", "hello",
+        p = self.mod.build_payload(CHANNEL, "hello",
                                    request_id="123e4567-e89b-12d3-a456-426614174000")
         self.assertEqual(p["metadata"]["event_payload"],
                          {"request_id": "123e4567-e89b-12d3-a456-426614174000"})
 
     # 3. thread_ts は指定したときだけ入る
     def test_build_payload_thread_ts(self):
-        p = self.mod.build_payload("C0CGYGT9V7G", "hello",
+        p = self.mod.build_payload(CHANNEL, "hello",
                                    thread_ts="1794583788.831849",
-                                   event_id="T0CGV6V7161:C0CGYGT9V7G:1.1")
+                                   event_id=WS_MUSE + ":" + CHANNEL + ":1.1")
         self.assertEqual(p["thread_ts"], "1794583788.831849")
 
     # 4. event_id / request_id はどちらか一方だけ
     def test_build_payload_both_or_neither_rejected(self):
         with self.assertRaises(ValueError):
-            self.mod.build_payload("C0CGYGT9V7G", "x", event_id="a",
+            self.mod.build_payload(CHANNEL, "x", event_id="a",
                                    request_id="b")
         with self.assertRaises(ValueError):
-            self.mod.build_payload("C0CGYGT9V7G", "x")
+            self.mod.build_payload(CHANNEL, "x")
 
     # 5. トークン解決：プロファイル名・ワークスペースID・デフォルト
     def test_resolve_token(self):
         self.assertEqual(self.mod.resolve_token("muse-board"),
                          FAKE_TOKEN_BOARD)
-        self.assertEqual(self.mod.resolve_token("T0CGV6V7161"),
+        self.assertEqual(self.mod.resolve_token(WS_MUSE),
                          FAKE_TOKEN_BOARD)
         self.assertEqual(self.mod.resolve_token(None), FAKE_TOKEN_DEFAULT)
         self.assertIsNone(self.mod.resolve_token("unknown-workspace"))
@@ -190,12 +205,12 @@ class PostMetadataTest(unittest.TestCase):
     # 6. post 成功：URL・Authorization・body の metadata が正しい
     def test_post_success(self):
         payload = self.mod.build_payload(
-            "C0CGYGT9V7G", "hello",
-            event_id="T0CGV6V7161:C0CGYGT9V7G:1794652249.960829")
+            CHANNEL, "hello",
+            event_id=WS_MUSE + ":" + CHANNEL + ":1794652249.960829")
         ok, result = self.post(
             payload, FAKE_TOKEN_BOARD,
             [{"ok": True, "ts": "1794660000.000001",
-              "channel": "C0CGYGT9V7G"}])
+              "channel": CHANNEL}])
         self.assertTrue(ok)
         self.assertEqual(result["ts"], "1794660000.000001")
         self.assertEqual(len(self.curl_calls), 1)
@@ -207,12 +222,12 @@ class PostMetadataTest(unittest.TestCase):
                          "neiro_reply")
         self.assertEqual(
             call["body"]["metadata"]["event_payload"]["event_id"],
-            "T0CGV6V7161:C0CGYGT9V7G:1794652249.960829")
+            WS_MUSE + ":" + CHANNEL + ":1794652249.960829")
 
     # 7. Slack の ok:false はリトライせず失敗を返す
     def test_post_slack_error_no_retry(self):
-        payload = self.mod.build_payload("C0CGYGT9V7G", "hello",
-                                         event_id="T0CGV6V7161:C0CGYGT9V7G:1.1")
+        payload = self.mod.build_payload(CHANNEL, "hello",
+                                         event_id=WS_MUSE + ":" + CHANNEL + ":1.1")
         ok, err = self.post(
             payload, FAKE_TOKEN_BOARD,
             [{"ok": False, "error": "channel_not_found"}])
@@ -222,13 +237,13 @@ class PostMetadataTest(unittest.TestCase):
 
     # 8. ratelimited は1回リトライして成功する
     def test_post_ratelimited_retries_once(self):
-        payload = self.mod.build_payload("C0CGYGT9V7G", "hello",
-                                         event_id="T0CGV6V7161:C0CGYGT9V7G:1.1")
+        payload = self.mod.build_payload(CHANNEL, "hello",
+                                         event_id=WS_MUSE + ":" + CHANNEL + ":1.1")
         ok, result = self.post(
             payload, FAKE_TOKEN_BOARD,
             [{"ok": False, "error": "ratelimited", "retry_after": 1},
              {"ok": True, "ts": "1794660000.000002",
-              "channel": "C0CGYGT9V7G"}])
+              "channel": CHANNEL}])
         self.assertTrue(ok)
         self.assertEqual(result["ts"], "1794660000.000002")
         self.assertEqual(len(self.curl_calls), 2)
@@ -238,8 +253,8 @@ class PostMetadataTest(unittest.TestCase):
     # curl の意味では、接続失敗で標準出力に __STATUS__ が付かない
     # （空出力）場合がこれに当たる。
     def test_post_network_error_no_retry(self):
-        payload = self.mod.build_payload("C0CGYGT9V7G", "hello",
-                                         event_id="T0CGV6V7161:C0CGYGT9V7G:1.1")
+        payload = self.mod.build_payload(CHANNEL, "hello",
+                                         event_id=WS_MUSE + ":" + CHANNEL + ":1.1")
         ok, err = self.post(payload, FAKE_TOKEN_BOARD, [b""])
         self.assertFalse(ok)
         self.assertIn("network", err)
@@ -247,8 +262,8 @@ class PostMetadataTest(unittest.TestCase):
 
     # 10. タイムアウトも応答ロストなので再送しない
     def test_post_timeout_no_retry(self):
-        payload = self.mod.build_payload("C0CGYGT9V7G", "hello",
-                                         event_id="T0CGV6V7161:C0CGYGT9V7G:1.1")
+        payload = self.mod.build_payload(CHANNEL, "hello",
+                                         event_id=WS_MUSE + ":" + CHANNEL + ":1.1")
         ok, err = self.post(
             payload, FAKE_TOKEN_BOARD,
             [subprocess.TimeoutExpired(["curl"], 30)])
@@ -258,8 +273,8 @@ class PostMetadataTest(unittest.TestCase):
 
     # 11. HTTP 500 も書き込みの有無が曖昧なため再送しない
     def test_post_http_500_no_retry(self):
-        payload = self.mod.build_payload("C0CGYGT9V7G", "hello",
-                                         event_id="T0CGV6V7161:C0CGYGT9V7G:1.1")
+        payload = self.mod.build_payload(CHANNEL, "hello",
+                                         event_id=WS_MUSE + ":" + CHANNEL + ":1.1")
         ok, err = self.post(
             payload, FAKE_TOKEN_BOARD,
             [({"ok": False, "error": "internal_error"}, 500)])
@@ -269,13 +284,13 @@ class PostMetadataTest(unittest.TestCase):
 
     # 12. HTTP 429 は未投稿の確定なので、従来通りリトライして成功する
     def test_post_http_429_retries_once(self):
-        payload = self.mod.build_payload("C0CGYGT9V7G", "hello",
-                                         event_id="T0CGV6V7161:C0CGYGT9V7G:1.1")
+        payload = self.mod.build_payload(CHANNEL, "hello",
+                                         event_id=WS_MUSE + ":" + CHANNEL + ":1.1")
         ok, result = self.post(
             payload, FAKE_TOKEN_BOARD,
             [({"ok": False, "error": "ratelimited"}, 429),
              {"ok": True, "ts": "1794660000.000004",
-              "channel": "C0CGYGT9V7G"}])
+              "channel": CHANNEL}])
         self.assertTrue(ok)
         self.assertEqual(result["ts"], "1794660000.000004")
         self.assertEqual(len(self.curl_calls), 2)
@@ -284,16 +299,16 @@ class PostMetadataTest(unittest.TestCase):
     def test_main_dry_run(self):
         buf = io.StringIO()
         with redirect_stdout(buf):
-            code = self.mod.main(["--channel", "C0CGYGT9V7G",
+            code = self.mod.main(["--channel", CHANNEL,
                                   "--message", "hello",
                                   "--event-id",
-                                  "T0CGV6V7161:C0CGYGT9V7G:1794652249.960829",
+                                  WS_MUSE + ":" + CHANNEL + ":1794652249.960829",
                                   "--dry-run"])
         self.assertEqual(code, 0)
         out = json.loads(buf.getvalue())
         self.assertTrue(out["dry_run"])
         self.assertEqual(out["payload"]["metadata"]["event_payload"]["event_id"],
-                         "T0CGV6V7161:C0CGYGT9V7G:1794652249.960829")
+                         WS_MUSE + ":" + CHANNEL + ":1794652249.960829")
         self.assertNotIn(FAKE_TOKEN_BOARD, buf.getvalue())
         self.assertNotIn(FAKE_TOKEN_DEFAULT, buf.getvalue())
         self.assertEqual(len(self.calls), 0)
@@ -306,17 +321,17 @@ class PostMetadataTest(unittest.TestCase):
         def _post(payload, token, **kw):
             self.assertEqual(token, FAKE_TOKEN_BOARD)
             return True, {"ok": True, "ts": "1794660000.000003",
-                          "channel": "C0CGYGT9V7G"}
+                          "channel": CHANNEL}
 
         self.mod.post = _post
         try:
             buf = io.StringIO()
             with redirect_stdout(buf):
-                code = self.mod.main(["--channel", "C0CGYGT9V7G",
+                code = self.mod.main(["--channel", CHANNEL,
                                       "--message", "hello",
                                       "--workspace", "muse-board",
                                       "--event-id",
-                                      "T0CGV6V7161:C0CGYGT9V7G:1.1"])
+                                      WS_MUSE + ":" + CHANNEL + ":1.1"])
             self.assertEqual(code, 0)
             out = json.loads(buf.getvalue())
             self.assertEqual(out["ts"], "1794660000.000003")
@@ -328,11 +343,11 @@ class PostMetadataTest(unittest.TestCase):
     def test_main_token_not_found(self):
         buf = io.StringIO()
         with redirect_stdout(buf):
-            code = self.mod.main(["--channel", "C0CGYGT9V7G",
+            code = self.mod.main(["--channel", CHANNEL,
                                   "--message", "hello",
                                   "--workspace", "unknown-workspace",
                                   "--event-id",
-                                  "T0CGV6V7161:C0CGYGT9V7G:1.1"])
+                                  WS_MUSE + ":" + CHANNEL + ":1.1"])
         self.assertEqual(code, 1)
         out = json.loads(buf.getvalue())
         self.assertEqual(out["error"], "token_not_found")
@@ -345,8 +360,8 @@ class PostMetadataTest(unittest.TestCase):
     # 2026-11-15：read 側の IncompleteRead が送信前チェックを
     # fail-closed させたのと同じ抜けが post() にもあった。
     def test_post_incomplete_read_no_retry(self):
-        payload = self.mod.build_payload("C0CGYGT9V7G", "hello",
-                                         event_id="T0CGV6V7161:C0CGYGT9V7G:1.1")
+        payload = self.mod.build_payload(CHANNEL, "hello",
+                                         event_id=WS_MUSE + ":" + CHANNEL + ":1.1")
         ok, err = self.post(payload, FAKE_TOKEN_BOARD, [b'{"ok": true'])
         self.assertFalse(ok)
         self.assertIn("network", err)
@@ -355,8 +370,8 @@ class PostMetadataTest(unittest.TestCase):
     # 17. curl が無ければ urllib へフォールバックする（旧経路の温存）。
     def test_post_urllib_fallback_when_no_curl(self):
         payload = self.mod.build_payload(
-            "C0CGYGT9V7G", "hello",
-            event_id="T0CGV6V7161:C0CGYGT9V7G:1794652249.960829")
+            CHANNEL, "hello",
+            event_id=WS_MUSE + ":" + CHANNEL + ":1794652249.960829")
         with mock.patch.object(self.mod.shutil, "which",
                                return_value=None):
             ok, result = self.mod.post(

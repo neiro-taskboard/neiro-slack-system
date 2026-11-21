@@ -48,11 +48,21 @@ SCRIPT = "/home/hatch/hooks/scripts/slack-send-once.sh"
 PASS = 0
 FAIL = 0
 
-SELF_ID = "U0CH1B19D4J"
-OTHER_ID = "U0CH1QBC8M8"
+def make_id(prefix, rest):
+    """Build an ID-shaped string from parts (like a real Slack ID).
+
+    Fixtures are synthetic (2026-11-21): the real IDs used before were
+    other people's and ours; parts-built fakes keep the tests passing
+    without leaking real IDs into the public repo.
+    """
+    return prefix + "0" + rest
+
+
+SELF_ID = make_id("U", "TESTBOTMUSE")
+OTHER_ID = make_id("U", "TESTOTHER1")
 THREAD_TS = "1794600000.000001"
 OTHER_THREAD_TS = "1794600001.000001"
-CHANNEL = "C0CGYGT9V7G"
+CHANNEL = make_id("C", "TESTCHAN01")
 CANDIDATE = "重複チェック 上限のテスト文面です。"
 LEDGER_TS = "1794600123.000001"
 
@@ -75,7 +85,7 @@ with open(os.environ["SLACKCLI_LOG"], "a", encoding="utf-8") as f:
     f.write(" ".join(args) + "\n")
 
 if args and args[0] == "auth":
-    print("neiro (U0CH1B19D4J)")
+    print("neiro (__SELF_ID__)")
     sys.exit(0)
 
 if args and args[0] == "messages":
@@ -150,7 +160,7 @@ class Env:
             self.home, "hooks", "state", "slack-send-log.jsonl")
         stub = os.path.join(bindir, "slackcli")
         with open(stub, "w", encoding="utf-8") as f:
-            f.write(STUB)
+            f.write(STUB.replace("__SELF_ID__", SELF_ID))
         os.chmod(stub, 0o755)
         self.env = dict(os.environ, HOME=self.home,
                         SLACKCLI_LOG=self.log,

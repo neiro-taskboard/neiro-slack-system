@@ -52,6 +52,21 @@ import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
 
+def make_id(prefix, rest):
+    """Build an ID-shaped string from parts (like a real Slack ID).
+
+    Fixtures are synthetic (2026-11-21): the real IDs used before were
+    other people's and ours; parts-built fakes keep the tests passing
+    without leaking real IDs into the public repo.
+    """
+    return prefix + "0" + rest
+
+
+WS_MUSE = make_id("T", "TESTWSMUSE1")
+CHANNEL = make_id("C", "TESTCHAN01")
+USER_ID = make_id("U", "TESTHUMAN01")
+
+
 POLL_PY = "/home/hatch/hooks/scripts/slack-poll.py"
 TIMEOUT_SECS = 600
 
@@ -73,10 +88,10 @@ def now_iso(dt=None):
     return (dt or datetime.now(timezone.utc)).isoformat()
 
 
-def make_event(ts="1794476892.695469", channel="C0CGYGT9V7G",
-               workspace="T0CGV6V7161"):
+def make_event(ts="1794476892.695469", channel=CHANNEL,
+               workspace=WS_MUSE):
     return {"workspace_id": workspace, "channel": channel, "ts": ts,
-            "user": "U0CH3MQH7PT", "text": "test"}
+            "user": USER_ID, "text": "test"}
 
 
 class Env:

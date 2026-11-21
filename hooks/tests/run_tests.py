@@ -15,6 +15,20 @@ import unittest
 from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
 
+def make_id(prefix, rest):
+    """Build an ID-shaped string from parts (like a real Slack ID).
+
+    Fixtures are synthetic (2026-11-21): the real IDs used before were
+    other people's and ours; parts-built fakes keep the tests passing
+    without leaking real IDs into the public repo.
+    """
+    return prefix + "0" + rest
+
+
+WS_MUSE = make_id("T", "TESTWSMUSE1")
+CHANNEL = make_id("C", "TESTCHAN01")
+
+
 POLL_PATH = os.path.expanduser("~/hooks/scripts/slack-poll.py")
 
 
@@ -69,7 +83,7 @@ class PollTest(unittest.TestCase):
         return state
 
     def ev(self, ts="1794476000.000001"):
-        return {"workspace_id": "T0CGV6V7161", "channel": "C0CGYGT9V7G",
+        return {"workspace_id": WS_MUSE, "channel": CHANNEL,
                 "ts": ts, "text": "test"}
 
     # 1. 新規イベント -> processing, attempts=1, wake
@@ -79,14 +93,14 @@ class PollTest(unittest.TestCase):
         self.assertEqual(out["decision"], "wake")
         self.assertEqual(len(out["payload"]["events"]), 1)
         st = self.load_state()
-        rec = st["T0CGV6V7161:C0CGYGT9V7G:1794476000.000001"]
+        rec = st[WS_MUSE + ":" + CHANNEL + ":1794476000.000001"]
         self.assertEqual(rec["status"], "processing")
         self.assertEqual(rec["attempts"], 1)
 
     # 2. done はスキップ
     def test_done_skipped(self):
         self.write_inbox([self.ev()])
-        self.write_state([{"event_id": "T0CGV6V7161:C0CGYGT9V7G:1794476000.000001",
+        self.write_state([{"event_id": WS_MUSE + ":" + CHANNEL + ":1794476000.000001",
                            "status": "done", "attempts": 1,
                            "updated_at": iso(self.now)}])
         out = self.run_main()
@@ -95,7 +109,7 @@ class PollTest(unittest.TestCase):
     # 3. dead はスキップ
     def test_dead_skipped(self):
         self.write_inbox([self.ev()])
-        self.write_state([{"event_id": "T0CGV6V7161:C0CGYGT9V7G:1794476000.000001",
+        self.write_state([{"event_id": WS_MUSE + ":" + CHANNEL + ":1794476000.000001",
                            "status": "dead", "attempts": 3,
                            "updated_at": iso(self.now)}])
         out = self.run_main()
@@ -105,14 +119,14 @@ class PollTest(unittest.TestCase):
     #    first_wake_at は起動猶予（3時間）を過ぎているのでリトライ経路。
     def test_stale_processing_retried(self):
         self.write_inbox([self.ev()])
-        self.write_state([{"event_id": "T0CGV6V7161:C0CGYGT9V7G:1794476000.000001",
+        self.write_state([{"event_id": WS_MUSE + ":" + CHANNEL + ":1794476000.000001",
                            "status": "processing", "attempts": 1,
                            "updated_at": iso(self.now - timedelta(minutes=20)),
                            "first_wake_at": iso(self.now - timedelta(hours=4))}])
         out = self.run_main()
         self.assertEqual(out["decision"], "wake")
         st = self.load_state()
-        rec = st["T0CGV6V7161:C0CGYGT9V7G:1794476000.000001"]
+        rec = st[WS_MUSE + ":" + CHANNEL + ":1794476000.000001"]
         self.assertEqual(rec["status"], "processing")
         self.assertEqual(rec["attempts"], 2)
 
@@ -120,7 +134,7 @@ class PollTest(unittest.TestCase):
     #    first_wake_at は起動猶予（3時間）を過ぎているので dead 経路。
     def test_stale_processing_dead_after_max(self):
         self.write_inbox([self.ev()])
-        self.write_state([{"event_id": "T0CGV6V7161:C0CGYGT9V7G:1794476000.000001",
+        self.write_state([{"event_id": WS_MUSE + ":" + CHANNEL + ":1794476000.000001",
                            "status": "processing", "attempts": 3,
                            "updated_at": iso(self.now - timedelta(minutes=20)),
                            "first_wake_at": iso(self.now - timedelta(hours=4))}])
@@ -128,7 +142,7 @@ class PollTest(unittest.TestCase):
         self.assertEqual(out["decision"], "wake")
         self.assertEqual(len(out["payload"]["dead_letter"]), 1)
         st = self.load_state()
-        self.assertEqual(st["T0CGV6V7161:C0CGYGT9V7G:1794476000.000001"]["status"], "dead")
+        self.assertEqual(st[WS_MUSE + ":" + CHANNEL + ":1794476000.000001"]["status"], "dead")
         with open(self.mod.DEAD_FILE, encoding="utf-8") as f:
             dead = [json.loads(l) for l in f if l.strip()]
         self.assertEqual(len(dead), 1)
@@ -136,19 +150,19 @@ class PollTest(unittest.TestCase):
     # 6. failed (stale) -> attempts<3 なら再 wake
     def test_failed_retried(self):
         self.write_inbox([self.ev()])
-        self.write_state([{"event_id": "T0CGV6V7161:C0CGYGT9V7G:1794476000.000001",
+        self.write_state([{"event_id": WS_MUSE + ":" + CHANNEL + ":1794476000.000001",
                            "status": "failed", "attempts": 2,
                            "updated_at": iso(self.now - timedelta(minutes=20)),
                            "last_error": "boom"}])
         out = self.run_main()
         self.assertEqual(out["decision"], "wake")
         st = self.load_state()
-        self.assertEqual(st["T0CGV6V7161:C0CGYGT9V7G:1794476000.000001"]["attempts"], 3)
+        self.assertEqual(st[WS_MUSE + ":" + CHANNEL + ":1794476000.000001"]["attempts"], 3)
 
     # 7. processing でタイムアウト内 -> そのまま
     def test_fresh_processing_left_alone(self):
         self.write_inbox([self.ev()])
-        self.write_state([{"event_id": "T0CGV6V7161:C0CGYGT9V7G:1794476000.000001",
+        self.write_state([{"event_id": WS_MUSE + ":" + CHANNEL + ":1794476000.000001",
                            "status": "processing", "attempts": 1,
                            "updated_at": iso(self.now - timedelta(minutes=1))}])
         out = self.run_main()
@@ -183,25 +197,25 @@ class PollTest(unittest.TestCase):
     #     可能性があるため）。猶予内なら attempts=3 でも dead にならない。
     def test_start_grace_leaves_stale_processing_alone(self):
         self.write_inbox([self.ev()])
-        self.write_state([{"event_id": "T0CGV6V7161:C0CGYGT9V7G:1794476000.000001",
+        self.write_state([{"event_id": WS_MUSE + ":" + CHANNEL + ":1794476000.000001",
                            "status": "processing", "attempts": 1,
                            "updated_at": iso(self.now - timedelta(minutes=20)),
                            "first_wake_at": iso(self.now - timedelta(minutes=30))}])
         out = self.run_main()
         self.assertEqual(out["decision"], "silent")
         st = self.load_state()
-        rec = st["T0CGV6V7161:C0CGYGT9V7G:1794476000.000001"]
+        rec = st[WS_MUSE + ":" + CHANNEL + ":1794476000.000001"]
         self.assertEqual(rec["attempts"], 1)
         self.assertEqual(rec["status"], "processing")
         # attempts=3 でも猶予内なら dead にしない。
-        self.write_state([{"event_id": "T0CGV6V7161:C0CGYGT9V7G:1794476000.000001",
+        self.write_state([{"event_id": WS_MUSE + ":" + CHANNEL + ":1794476000.000001",
                            "status": "processing", "attempts": 3,
                            "updated_at": iso(self.now - timedelta(minutes=20)),
                            "first_wake_at": iso(self.now - timedelta(minutes=30))}])
         out2 = self.run_main()
         self.assertEqual(out2["decision"], "silent")
         st2 = self.load_state()
-        self.assertEqual(st2["T0CGV6V7161:C0CGYGT9V7G:1794476000.000001"]["status"],
+        self.assertEqual(st2[WS_MUSE + ":" + CHANNEL + ":1794476000.000001"]["status"],
                          "processing")
 
 

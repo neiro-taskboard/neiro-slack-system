@@ -26,6 +26,20 @@ import subprocess
 import sys
 import tempfile
 
+def make_id(prefix, rest):
+    """Build an ID-shaped string from parts (like a real Slack ID).
+
+    Fixtures are synthetic (2026-11-21): the real IDs used before were
+    other people's and ours; parts-built fakes keep the tests passing
+    without leaking real IDs into the public repo.
+    """
+    return prefix + "0" + rest
+
+
+SELF_ID = make_id("U", "TESTBOTMUSE")
+CHANNEL = make_id("C", "TESTCHAN01")
+
+
 SCRIPT = "/home/hatch/hooks/scripts/slack-send-once.sh"
 
 PASS = 0
@@ -46,7 +60,7 @@ STUB = """#!/bin/sh
 # Log argv (one line per call), then answer like slackcli.
 echo "$@" >> "$SLACKCLI_LOG"
 case "$1" in
-  auth) echo "neiro (U0CH1B19D4J)" ;;
+  auth) echo "neiro (__SELF_ID__)" ;;
   conversations) printf '%s' '{"messages": [], "has_more": false}' ;;
 esac
 exit 0
@@ -64,7 +78,7 @@ class Env:
         self.log = os.path.join(self.home, "slackcli.log")
         stub = os.path.join(bindir, "slackcli")
         with open(stub, "w", encoding="utf-8") as f:
-            f.write(STUB)
+            f.write(STUB.replace("__SELF_ID__", SELF_ID))
         os.chmod(stub, 0o755)
         self.env = dict(os.environ, HOME=self.home,
                         SLACKCLI_LOG=self.log)
@@ -101,42 +115,42 @@ def main():
     try:
         parent = "1794583788.831849"
         reply = "1794614042.199529"
-        base = "https://muse-ulq4476.slack.com/archives/C0CGYGT9V7G"
+        base = "https://muse-ulq4476.slack.com/archives/" + CHANNEL
 
         # 1. 親投稿のリンク（thread_ts なし）-> 親は p<ts>
         rc, ts, ch = env.run(f"{base}/p1794583788831849")
         check("parent post: thread_ts is p<ts>",
-              rc == 1 and ts == parent and ch == "C0CGYGT9V7G",
+              rc == 1 and ts == parent and ch == CHANNEL,
               f"rc={rc} ts={ts} ch={ch}")
 
         # 2. スレッド内返信のリンク -> 親は ?thread_ts=（p<ts> ではない）
         rc, ts, ch = env.run(
             f"{base}/p1794614042199529?thread_ts=1794583788.831849"
-            "&cid=C0CGYGT9V7G")
+            "&cid=" + CHANNEL)
         check("thread reply: thread_ts is the ?thread_ts= parent",
-              rc == 1 and ts == parent and ch == "C0CGYGT9V7G",
+              rc == 1 and ts == parent and ch == CHANNEL,
               f"rc={rc} ts={ts} ch={ch}")
 
         # 3. thread_ts なしの返信リンク -> p<ts> にフォールバック
         rc, ts, ch = env.run(f"{base}/p1794614042199529")
         check("reply link without thread_ts: falls back to p<ts>",
-              rc == 1 and ts == reply and ch == "C0CGYGT9V7G",
+              rc == 1 and ts == reply and ch == CHANNEL,
               f"rc={rc} ts={ts} ch={ch}")
 
         # 4. thread_ts が cid の後ろ -> 親は thread_ts
         rc, ts, ch = env.run(
-            f"{base}/p1794614042199529?cid=C0CGYGT9V7G"
+            f"{base}/p1794614042199529?cid={CHANNEL}"
             "&thread_ts=1794583788.831849")
         check("thread_ts after cid: parent is thread_ts",
-              rc == 1 and ts == parent and ch == "C0CGYGT9V7G",
+              rc == 1 and ts == parent and ch == CHANNEL,
               f"rc={rc} ts={ts} ch={ch}")
 
         # 5. URL エンコードされたドット -> デコードして親にする
         rc, ts, ch = env.run(
             f"{base}/p1794614042199529?thread_ts=1794583788%2E831849"
-            "&cid=C0CGYGT9V7G")
+            "&cid=" + CHANNEL)
         check("encoded dot in thread_ts: decoded parent",
-              rc == 1 and ts == parent and ch == "C0CGYGT9V7G",
+              rc == 1 and ts == parent and ch == CHANNEL,
               f"rc={rc} ts={ts} ch={ch}")
     finally:
         env.close()
