@@ -21,11 +21,11 @@ import tempfile
 import unittest
 
 SCRIPT = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
     "scripts", "slack-ids.sh",
 )
 EXAMPLE = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))),
     "ids.example.json",
 )
 KEY = "channel_welcome_muse_torishimariyakai"

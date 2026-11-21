@@ -15,6 +15,21 @@
 #   2. 内容が一致すること（cmp）
 #   3. .py は両方とも py_compile を通り、.sh は両方とも bash -n を通ること
 #
+# tests/ も対象（2026-11-21、Yanayana さんの提案を取り込み）：
+#   - リポジトリの listener/tests/*.py は py_compile の対象にする。
+#     稼働中に同じテストがあれば cmp 比較＋py_compile も行う。
+#   - リポジトリにだけあるテストは MISSING にしない。テストは稼働中へ
+#     配置しない運用で、listener/tests/*.py はリポジトリ相対で読むため。
+#   - 稼働中にだけあるテストは UNPUBLISHED で拾う。
+#   - scrub 比較はしない。Neiro 側は外部化で live と repo をバイト同一に
+#     する方針（本番ファイルと同じ）のため、素の cmp で十分。Yanayana さん
+#     側の scrub.sed とは方針が違う。実ID入りのテストが稼働中に現れたら
+#     DRIFT になり、直し方は外部化（リポジトリと同一にする）。
+#   - tests/ は再帰的に見る（将来サブディレクトリのテストが出ても見逃さ
+#     ない。Yama さんの問いへの回答）。意図的にローカル専用にするテストは
+#     今は無い。必要になったらチェック側に明示の除外リストを置く（黙って
+#     無視はしない）。
+#
 # 例外：archive.py は内容の照合対象外。公開リポジトリでは個人を特定しうる
 # USER_NAMES 対応表を伏せており、稼働中のコピーと意図的に内容が違うため。
 # 構文チェックだけは両方に行う。
@@ -73,11 +88,51 @@ check_one() {
 }
 
 # リポジトリ側にあるものだけを対象にする（稼働中だけの config.json や
-# .bak、__pycache__、state/ は対象外。tests/ も対象外）。
+# .bak、__pycache__、state/ は対象外）。
 while IFS= read -r -d '' f; do
   rel="${f#"$REPO_LISTENER_DIR"/}"
   check_one "$rel"
 done < <(find "$REPO_LISTENER_DIR" -maxdepth 1 -type f \( -name '*.py' -o -name '*.sh' -o -name '*.service' -o -name '*.timer' \) -print0 2>/dev/null)
+
+# tests/：リポジトリのテストは py_compile の対象。稼働中に同じテストが
+# あれば cmp 比較＋py_compile も行う。稼働中に無くても MISSING にはしない
+# （テストは稼働中へ配置しない運用）。
+check_test_one() {
+  local rel="$1" live="$LIVE_DIR/tests/$rel" repo="$REPO_LISTENER_DIR/tests/$rel"
+  python3 -m py_compile "$repo" 2>/dev/null || {
+    echo "SYNTAX-ERROR: $repo （py_compile が通らない）"
+    PROBLEMS=$((PROBLEMS + 1))
+  }
+  if [ -e "$live" ]; then
+    if ! cmp -s "$live" "$repo"; then
+      echo "DRIFT: $live （リポジトリと内容が違う。リポジトリ側を稼働中へ反映するか、稼働中の変更をリポジトリへ戻すこと）"
+      PROBLEMS=$((PROBLEMS + 1))
+    fi
+    python3 -m py_compile "$live" 2>/dev/null || {
+      echo "SYNTAX-ERROR: $live （py_compile が通らない）"
+      PROBLEMS=$((PROBLEMS + 1))
+    }
+  fi
+}
+
+while IFS= read -r -d '' f; do
+  rel="${f#"$REPO_LISTENER_DIR/tests"/}"
+  check_test_one "$rel"
+done < <(find "$REPO_LISTENER_DIR/tests" -type f -name '*.py' -print0 2>/dev/null)
+
+# 稼働中の tests/ にだけある .py は UNPUBLISHED（リポジトリに無いテストは
+# 公開されていない）。稼働中だけの .bak は *.py ではないので対象外。
+# -type f だけでなく -type l も見る：シンボリックリンクで置かれた未公開
+# テストもすり抜けないようにする（2026-11-21、agyレビュー指摘）。
+if [ -d "$LIVE_DIR/tests" ]; then
+  while IFS= read -r -d '' f; do
+    rel="${f#"$LIVE_DIR/tests"/}"
+    if [ ! -e "$REPO_LISTENER_DIR/tests/$rel" ]; then
+      echo "UNPUBLISHED: $f （稼働中のテストがリポジトリに無い）"
+      PROBLEMS=$((PROBLEMS + 1))
+    fi
+  done < <(find "$LIVE_DIR/tests" \( -type f -o -type l \) -name '*.py' -print0 2>/dev/null)
+fi
 
 if [ "$PROBLEMS" -gt 0 ]; then
   echo "NG: ${PROBLEMS}件の問題あり"

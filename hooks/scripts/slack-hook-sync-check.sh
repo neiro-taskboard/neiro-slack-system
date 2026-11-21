@@ -16,6 +16,15 @@
 #   3. JSON 定義がパースできること、シェルスクリプトが bash -n を通り、
 #      Python ファイルが py_compile を通ること（壊れた編集中コードの検出）
 #
+# 対象は scripts/・definitions/ に加えて tests/（2026-11-21、Yanayana さん
+# の提案を取り込み）。テストもリポジトリが単一正本で、稼働中の tests/ は
+# リポジトリへのシンボリックリンクにする。リンクなら内容は同一なので
+# scrub 比較は要らない（Yanayana さん側の scrub.sed とは方針が違う）。
+# 稼働中にだけあるテストは UNPUBLISHED で拾う。tests/ は再帰的に見る
+# （将来サブディレクトリのテストが出ても見逃さない。Yama さんの問いへの
+# 回答）。意図的にローカル専用にするテストは今は無い。必要になったら
+# チェック側に明示の除外リストを置く（黙って無視はしない）。
+#
 # 実行場所：フックではなくウォッチドッグ側（5分間隔の slack-sync-check.timer
 # から slack-sync-check-run.sh 経由で呼ぶ。Yama さん・agy の指摘：照合の
 # 責務はフックではなくウォッチドッグ側）。
@@ -79,11 +88,25 @@ check_one() {
 }
 
 # リポジトリ側にあるものだけを対象にする（稼働中だけの .bak や
-# __pycache__ は対象外）。
+# __pycache__ は対象外）。tests/ も再帰的に対象。
 while IFS= read -r -d '' f; do
   rel="${f#"$REPO_HOOKS_DIR"/}"
   check_one "$rel"
-done < <(find "$REPO_HOOKS_DIR/scripts" "$REPO_HOOKS_DIR/definitions" -type f \( -name '*.sh' -o -name '*.py' -o -name '*.json' \) -print0 2>/dev/null)
+done < <(find "$REPO_HOOKS_DIR/scripts" "$REPO_HOOKS_DIR/definitions" "$REPO_HOOKS_DIR/tests" -type f \( -name '*.sh' -o -name '*.py' -o -name '*.json' \) -print0 2>/dev/null)
+
+# 稼働中の tests/ にだけある .py は UNPUBLISHED（リポジトリに無いテストは
+# 公開されていない）。稼働中だけの .bak は *.py ではないので対象外。
+# -type f だけでなく -type l も見る：シンボリックリンクで置かれた未公開
+# テストもすり抜けないようにする（2026-11-21、agyレビュー指摘）。
+if [ -d "$HOOKS_DIR/tests" ]; then
+  while IFS= read -r -d '' f; do
+    rel="tests/${f#"$HOOKS_DIR/tests"/}"
+    if [ ! -e "$REPO_HOOKS_DIR/$rel" ]; then
+      echo "UNPUBLISHED: $f （稼働中のテストがリポジトリに無い）"
+      PROBLEMS=$((PROBLEMS + 1))
+    fi
+  done < <(find "$HOOKS_DIR/tests" \( -type f -o -type l \) -name '*.py' -print0 2>/dev/null)
+fi
 
 if [ "$PROBLEMS" -gt 0 ]; then
   echo "NG: ${PROBLEMS}件の問題あり"
