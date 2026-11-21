@@ -40,10 +40,17 @@ if [ -x "$SYNC_CHECK" ]; then
     SYNC_SIG="$(printf '%s' "$SYNC_OUT" | md5sum | cut -d' ' -f1)"
     if [ ! -f "$SYNC_STATE" ] || [ "$(cat "$SYNC_STATE" 2>/dev/null)" != "$SYNC_SIG" ]; then
       SYNC_MSG="フックの単一正本チェックで異常を検出しました。稼働中の ~/hooks とリポジトリのリンクが壊れているか、構文が壊れています。確認してください：$(printf '%s' "$SYNC_OUT" | head -5 | tr '\n' ' ')"
+      # request_id は失敗内容のハッシュだけではだめで、発生時刻も入れる
+      # （2026-11-21、Claude Code（Opus）の指摘1件目を取り込み）。
+      # ハッシュだけだと、一度復旧して同じ障害が再発したときに前の警告と
+      # 同じ request_id になり、送信ガードの metadata 照合が「重複」と
+      # 判定して再警告を送らない。状態ファイルが同一エピソード内の再送
+      # を抑えるので、request_id 側はエピソードごとに一意でよい。
+      SYNC_REQ="hook-sync-$SYNC_SIG-$(date +%s)"
       # 状態ファイルは送信が成功したときだけ更新する（2026-11-19、agyレビュー指摘）。
       # 先に更新すると、ids.json 欠落などで送信が skip された異常が永久に
       # 送られなくなる（次回は「変化なし」と判定されてしまう）。
-      if [ -n "$ALERT_CHANNEL" ] && "$SCRIPT_DIR/slack-send-locked.sh" --channel "$ALERT_CHANNEL" --workspace muse-board --request-id "hook-sync-$SYNC_SIG" --message "$SYNC_MSG" >/dev/null 2>&1; then
+      if [ -n "$ALERT_CHANNEL" ] && "$SCRIPT_DIR/slack-send-locked.sh" --channel "$ALERT_CHANNEL" --workspace muse-board --request-id "$SYNC_REQ" --message "$SYNC_MSG" >/dev/null 2>&1; then
         printf '%s' "$SYNC_SIG" > "$SYNC_STATE"
       fi
     fi
@@ -66,8 +73,12 @@ if [ -x "$LISTENER_SYNC_CHECK" ]; then
     LISTENER_SYNC_SIG="$(printf '%s' "$LISTENER_SYNC_OUT" | md5sum | cut -d' ' -f1)"
     if [ ! -f "$LISTENER_SYNC_STATE" ] || [ "$(cat "$LISTENER_SYNC_STATE" 2>/dev/null)" != "$LISTENER_SYNC_SIG" ]; then
       LISTENER_SYNC_MSG="リスナーの同期チェックで異常を検出しました。稼働中の ~/workspace/slack-listener とリポジトリの内容がずれています。確認してください：$(printf '%s' "$LISTENER_SYNC_OUT" | head -5 | tr '\n' ' ')"
+      # request_id には発生時刻も入れる（フック側と同じ理由。2026-11-21、
+      # Claude Code（Opus）の指摘1件目）。ハッシュだけだと復旧後の再発で
+      # 前の警告と同一の request_id になり、metadata 照合で再警告が抑えられる。
+      LISTENER_SYNC_REQ="listener-sync-$LISTENER_SYNC_SIG-$(date +%s)"
       # 状態ファイルは送信が成功したときだけ更新する（フック側と同じ理由）。
-      if [ -n "$ALERT_CHANNEL" ] && "$SCRIPT_DIR/slack-send-locked.sh" --channel "$ALERT_CHANNEL" --workspace muse-board --request-id "listener-sync-$LISTENER_SYNC_SIG" --message "$LISTENER_SYNC_MSG" >/dev/null 2>&1; then
+      if [ -n "$ALERT_CHANNEL" ] && "$SCRIPT_DIR/slack-send-locked.sh" --channel "$ALERT_CHANNEL" --workspace muse-board --request-id "$LISTENER_SYNC_REQ" --message "$LISTENER_SYNC_MSG" >/dev/null 2>&1; then
         printf '%s' "$LISTENER_SYNC_SIG" > "$LISTENER_SYNC_STATE"
       fi
     fi
