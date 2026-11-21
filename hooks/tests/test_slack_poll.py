@@ -531,6 +531,89 @@ def test_fastpath_reclaims_processing_within_grace():
           out4["decision"] == "silent", out4)
 
 
+def test_burst_cap_defers_extra_events():
+    # バースト対策（2026-11-21）：1回の wake は上限件数まで。残りは状態を
+    # 付けずに残し、次のポーリングで改めて新着として起こす。
+    env = Env()
+    env.env["SLACK_POLL_MAX_PER_WAKE"] = "4"
+    evs = [make_event(ts=f"1794476892.00000{i}") for i in range(6)]
+    env.write_inbox(evs)
+    out = env.run()
+    check("burst cap -> wake", out["decision"] == "wake", out)
+    due = out["payload"]["events"]
+    check("burst cap -> only 4 dispatched", len(due) == 4, due)
+    check("burst cap -> queue_remaining is 2",
+          out["payload"].get("queue_remaining") == 2, out["payload"])
+    st = env.read_state()
+    check("burst cap -> state has only the 4 dispatched",
+          len(st) == 4, st)
+    out2 = env.run()
+    due2 = out2["payload"]["events"]
+    check("burst cap -> next poll dispatches the remaining 2",
+          out2["decision"] == "wake" and len(due2) == 2
+          and out2["payload"].get("queue_remaining") == 0, out2)
+    check("burst cap -> all 6 in state after second poll",
+          len(env.read_state()) == 6, env.read_state())
+
+
+def test_burst_priority_dm_and_mention_first():
+    # 優先順位：DM > ねいろ宛て（本文に Neiro / ねいろ）> その他（古い順）。
+    env = Env()
+    env.env["SLACK_POLL_MAX_PER_WAKE"] = "3"
+    dm = make_event(ts="1794476892.000002",
+                    channel=make_id("D", "TESTDM0001"))
+    dm["text"] = "dm question"
+    mention = make_event(ts="1794476892.000001")
+    mention["text"] = "Neiroさん、質問です"
+    plain_old = make_event(ts="1794476892.000000")
+    plain_old["text"] = "設計の話"
+    plain_new = make_event(ts="1794476892.000003")
+    plain_new["text"] = "設計の話2"
+    env.write_inbox([plain_new, plain_old, mention, dm])
+    out = env.run()
+    due = out["payload"]["events"]
+    order = [e["ts"] for e in due]
+    check("burst priority -> DM, mention, oldest plain",
+          order == [dm["ts"], mention["ts"], plain_old["ts"]], order)
+    check("burst priority -> newest plain left queued",
+          out["payload"].get("queue_remaining") == 1, out["payload"])
+
+
+def test_burst_duplicate_lines_dispatched_once():
+    # 同一ポーリングで inbox に同じイベントが2行あっても、候補は1件だけ
+    # （状態変更の遅延適用で二重に枠を消費しない。agy レビュー指摘）。
+    env = Env()
+    ev = make_event()
+    env.write_inbox([ev, dict(ev)])
+    out = env.run()
+    due = out["payload"]["events"]
+    check("duplicate lines -> dispatched once",
+          out["decision"] == "wake" and len(due) == 1, out)
+    check("duplicate lines -> one state record",
+          len(env.read_state()) == 1, env.read_state())
+
+
+def test_burst_priority_bot_mention():
+    # Slack 形式のメンション <@ボットID> も ねいろ宛てとして優先する。
+    # ids.json は SLACK_POLLER_IDS_FILE で差し替える（合成IDで検証）。
+    env = Env()
+    env.env["SLACK_POLL_MAX_PER_WAKE"] = "1"
+    bot = make_id("U", "TESTBOT001")
+    ids_path = os.path.join(env.d.name, "ids.json")
+    with open(ids_path, "w", encoding="utf-8") as f:
+        json.dump({"bot_neiro_test": bot}, f)
+    env.env["SLACK_POLLER_IDS_FILE"] = ids_path
+    plain = make_event(ts="1794476892.000000")
+    plain["text"] = "設計の話"
+    mention = make_event(ts="1794476892.000009")
+    mention["text"] = f"<@{bot}> 質問です"
+    env.write_inbox([plain, mention])
+    out = env.run()
+    due = out["payload"]["events"]
+    check("bot mention -> dispatched before older plain post",
+          len(due) == 1 and due[0]["ts"] == mention["ts"], due)
+
+
 def main():
     global FAIL
     tests = [test_new_event_wakes_once,
@@ -544,6 +627,10 @@ def main():
              test_waiting_rewake_annotates_resend,
              test_start_grace_does_not_burn_attempts,
              test_fastpath_reclaims_processing_within_grace,
+             test_burst_cap_defers_extra_events,
+             test_burst_priority_dm_and_mention_first,
+             test_burst_duplicate_lines_dispatched_once,
+             test_burst_priority_bot_mention,
              test_parallel_claims_single_flight]
     for t in tests:
         try:

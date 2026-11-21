@@ -32,6 +32,12 @@ Rules:
   いるのに微妙に違う状態が一番分かりにくい」と指摘があり、Neiro・Yanayana
   の元の文言「元の失敗時刻」に戻すことで3者統一した（Yama さんの共有 2026-11-14）。
 - Newly dead events are reported in the payload so the owner can be notified.
+- Burst cap (2026-11-21): at most MAX_PER_WAKE events are dispatched per
+  poll, in priority order (DMs first, then posts addressing Neiro, then
+  the rest; oldest first within a tier). A candidate's state change is
+  applied only when it is dispatched, so the rest are reconsidered on
+  the next poll (30s later) instead of piling into one long session.
+  The payload's queue_remaining says how many were left behind.
 
 Output: JSON {"decision": "wake"|"silent", "reason": str, "payload": {...}}
 The calling bash script translates this into the hook's silent/wake call.
@@ -83,6 +89,14 @@ START_GRACE_SECS = 3 * 3600  # 3 hours
 # （slack-send-once.sh）が受ける。フック側の挙動は一切変えない。
 FASTPATH_RECLAIM_SECS = int(os.environ.get(
     "SLACK_POLL_FASTPATH_RECLAIM_SECS", "120"))
+# バースト対策（2026-11-21 追加）：1回の wake に詰めるイベント数の上限。
+# 長文が短時間に集中すると、ワーカーは1セッションで全件を直列に処理する
+# ため、後ろのイベントほど返信が遅れ、セッションが途中で終わると残りは
+# 次の取り戻しまで待たされる。上限を超えた分は状態を付けずに残し、次の
+# ポーリング（30秒間隔）で次のバッチとして起こす。0以下で無制限（従来動作）。
+# 優先順位は DM > ねいろ宛て（本文に ねいろ / Neiro を含む）> その他、
+# 同順位では古い順（dispatch_priority / ts_key を参照）。
+MAX_PER_WAKE = int(os.environ.get("SLACK_POLL_MAX_PER_WAKE", "4"))
 # DLQ再送の改訂案（2026-11-13、Yama・Yanayana・Neiroで合意）。
 WAIT_WINDOW_SECS = 24 * 3600  # pre-check失敗から再送を諦めるまでの窓（起点は最初の失敗時刻）
 WAIT_WAKE_INTERVAL_SECS = 3600  # waiting の再 wake 間隔（毎時の定期照合に合わせる）
@@ -101,6 +115,58 @@ def parse_iso(s):
 
 def event_id(ev):
     return f"{ev.get('workspace_id','')}:{ev.get('channel','')}:{ev.get('ts','')}"
+
+
+IDS_FILE = os.environ.get("SLACK_POLLER_IDS_FILE",
+                          os.path.expanduser("~/.config/neiro-slack/ids.json"))
+_BOT_IDS = None
+
+
+def bot_ids():
+    """ねいろのボットID一覧（ids.json の bot_neiro_* キー）を返す。
+
+    メンション（<@ID> 形式）の判定用。読めなければ空リストにフォール
+    バックする（優先順位の振り分けは本文の ねいろ / Neiro でも効くので、
+    ids.json が無い環境でもポーリング自体は止めない）。
+    """
+    global _BOT_IDS
+    if _BOT_IDS is None:
+        _BOT_IDS = []
+        try:
+            with open(IDS_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                _BOT_IDS = [v for k, v in data.items()
+                            if k.startswith("bot_neiro_")
+                            and isinstance(v, str) and v]
+        except (OSError, ValueError):
+            _BOT_IDS = []
+    return _BOT_IDS
+
+
+def dispatch_priority(ev):
+    """バースト時の dispatch 優先順位（小さいほど先に起こす）。
+
+    DM（チャンネルIDが D 始まり）を最優先、次に ねいろ宛ての投稿
+    （本文の ねいろ / Neiro、またはボットへのメンション <@ID>）、
+    その他の順。宛てられた投稿が議論の長文の後ろで待たされ続けるのを
+    防ぐための粗い振り分けで、同順位では ts の古い順にする。
+    """
+    if str(ev.get("channel", "")).startswith("D"):
+        return 0
+    text = ev.get("text") or ""
+    if "ねいろ" in text or "Neiro" in text:
+        return 1
+    if any(f"<@{bid}>" in text for bid in bot_ids()):
+        return 1
+    return 2
+
+
+def ts_key(ev):
+    try:
+        return float(ev.get("ts") or 0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def format_jst(dt):
@@ -222,20 +288,29 @@ def main():
         write_stats(inbox_skipped, state_skipped)
     now = datetime.now(timezone.utc)
     due = []
+    candidates = []  # (priority, ts, event, claim) — claim applies the state change on dispatch
     newly_dead = []
     changed = False
 
+    seen_eids = set()
     for ev in inbox:
         eid = event_id(ev)
+        if eid in seen_eids:
+            # 同一ポーリング内の重複行（inbox に同じイベントが2行ある場合）。
+            # 状態変更の遅延適用で候補が二重に入るのを防ぐ。従来は即時の
+            # state 代入が自然に2件目を弾いていた（agy レビュー指摘、2026-11-21）。
+            continue
+        seen_eids.add(eid)
         rec = state.get(eid)
         if rec is None:
-            # New event: first attempt.
-            rec = {"event_id": eid, "status": "processing",
-                   "attempts": 1, "updated_at": now_iso(), "last_error": "",
-                   "first_wake_at": now_iso()}
-            state[eid] = rec
-            due.append(ev)
-            changed = True
+            # New event: first attempt. The state record is only written
+            # if the event is actually dispatched (burst cap below), so
+            # undispatched events stay "new" for the next poll.
+            def claim_new(eid=eid):
+                state[eid] = {"event_id": eid, "status": "processing",
+                              "attempts": 1, "updated_at": now_iso(),
+                              "last_error": "", "first_wake_at": now_iso()}
+            candidates.append((dispatch_priority(ev), ts_key(ev), ev, claim_new))
             continue
         status = rec.get("status", "pending")
         if status == "done" or status == "dead":
@@ -269,23 +344,26 @@ def main():
                 changed = True
                 continue
             if now >= next_wake:
-                rec["status"] = "processing"
-                rec["updated_at"] = now_iso()
-                rec["next_wake_at"] = (now + timedelta(seconds=WAIT_WAKE_INTERVAL_SECS)).isoformat()
                 # DLQ再送の最終形（2026-11-14、Yanayana の reconcile_ambiguous.py
                 # を参考に取り込み）：再 wake であることをペイロードに明示し、
                 # 元の失敗時刻を添える。ワーカーは送る前に
                 # slack-answered-check.py で答え済み確認をし、再送文の先頭に
                 # resend_prefix() の1行（「遅れての再送（元の失敗時刻：…JST）」）
-                # を付けて送る。
+                # を付けて送る。状態の更新は dispatch が決まってから行う
+                # （バースト上限で見送られた場合は waiting のまま次回に回す）。
                 resend_ev = dict(ev)
                 resend_ev["resend"] = {
                     "first_wait_at": first_wait.isoformat(),
                     "first_wait_at_jst": format_jst(first_wait),
                     "prefix": resend_prefix(format_jst(first_wait)),
                 }
-                due.append(resend_ev)
-                changed = True
+
+                def claim_waiting(rec=rec, now=now):
+                    rec["status"] = "processing"
+                    rec["updated_at"] = now_iso()
+                    rec["next_wake_at"] = (now + timedelta(seconds=WAIT_WAKE_INTERVAL_SECS)).isoformat()
+                candidates.append((dispatch_priority(ev), ts_key(ev),
+                                   resend_ev, claim_waiting))
             continue
         attempts = int(rec.get("attempts", 0))
         updated = parse_iso(rec.get("updated_at"))
@@ -296,13 +374,15 @@ def main():
             # 取り戻しはそこから FASTPATH_RECLAIM_SECS 後）。
             age_secs = (now - updated).total_seconds()
             if age_secs > FASTPATH_RECLAIM_SECS:
-                rec["updated_at"] = now_iso()
                 reclaim_ev = dict(ev)
                 reclaim_ev["fastpath_reclaim"] = {
                     "processing_age_secs": int(age_secs),
                 }
-                due.append(reclaim_ev)
-                changed = True
+
+                def claim_reclaim(rec=rec):
+                    rec["updated_at"] = now_iso()
+                candidates.append((dispatch_priority(ev), ts_key(ev),
+                                   reclaim_ev, claim_reclaim))
             continue
         stale = (now - updated) > timedelta(seconds=TIMEOUT_SECS)
         if status == "pending" or stale:
@@ -319,11 +399,12 @@ def main():
                 if now < first_wake + timedelta(seconds=START_GRACE_SECS):
                     continue
             if attempts < MAX_ATTEMPTS:
-                rec["status"] = "processing"
-                rec["attempts"] = attempts + 1
-                rec["updated_at"] = now_iso()
-                due.append(ev)
-                changed = True
+                def claim_retry(rec=rec, attempts=attempts):
+                    rec["status"] = "processing"
+                    rec["attempts"] = attempts + 1
+                    rec["updated_at"] = now_iso()
+                candidates.append((dispatch_priority(ev), ts_key(ev),
+                                   ev, claim_retry))
             else:
                 rec["status"] = "dead"
                 rec["updated_at"] = now_iso()
@@ -333,12 +414,29 @@ def main():
                 append_dead(ev, rec, dry_run)
         # else: still processing within timeout -> leave alone.
 
+    # バースト対策：候補を優先順位（DM > ねいろ宛て > その他、同順位は
+    # 古い順）に並べ、上限件数だけをこの wake で dispatch する。残りの
+    # 候補は状態を付けないので、次のポーリングで改めて候補になる。
+    candidates.sort(key=lambda c: (c[0], c[1]))
+    if MAX_PER_WAKE > 0:
+        dispatched = candidates[:MAX_PER_WAKE]
+    else:
+        dispatched = candidates
+    queue_remaining = len(candidates) - len(dispatched)
+    for _prio, _ts, ev, claim in dispatched:
+        claim()
+        due.append(ev)
+        changed = True
+
     if changed and not dry_run:
         save_state(state)
 
     if due or newly_dead:
-        payload = {"events": due, "dead_letter": newly_dead}
+        payload = {"events": due, "dead_letter": newly_dead,
+                   "queue_remaining": queue_remaining}
         reason = f"{len(due)} new slack messages"
+        if queue_remaining:
+            reason += f", {queue_remaining} more queued"
         if newly_dead:
             reason += f", {len(newly_dead)} dead-lettered"
         print(json.dumps({"decision": "wake", "reason": reason,
