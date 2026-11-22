@@ -24,6 +24,12 @@
 # カバーしている（ランナーの構文が10分以上壊れたままなら exit 2 で
 # FAILED 警告を出す）。警告済みのずれが変化した場合も、同じ猶予ルール
 # を通す。
+# 慢性的なずれへの歯止め（2026-11-22、Yanayana さんの drift_since を
+# 取り込み）：ずれ全体の開始時刻 drift_since を状態ファイルに記録し、
+# 署名が変わっても引き継ぐ。ずれ全体が上限（既定で猶予の2倍＝30分）
+# 続いたら、署名が新しくても警告する。warned はずれのエピソード単位
+# で、署名が変わっても引き継ぐ（「続いている間は1回」を守るため、
+# 警告済みのエピソードでは署名が変わっても再警告しない）。
 # 警告の送信に失敗しても exit 0 のまま終える（タイマーの失敗扱いにしない）。
 # チェック自体はリポジトリ側の正本を直接呼ぶので、~/hooks 側のリンクが
 # 壊れていても動く。
@@ -44,6 +50,11 @@ fi
 # 環境変数で上書きできる（テスト用）。
 GRACE_SECS="${SYNC_CHECK_RUN_GRACE_SECS:-900}"
 
+# ずれ全体の上限（秒）。既定で猶予の2倍＝約30分。ずれがこの時間続いたら
+# 署名が新しくても警告する（drift_since の歯止め）。
+# 環境変数で上書きできる（テスト用）。
+CAP_SECS="${SYNC_CHECK_RUN_CAP_SECS:-$((GRACE_SECS * 2))}"
+
 # チェックスクリプトと状態ファイルのパスは環境変数で上書きできる
 # （テスト用。既定は従来どおり）。
 HOOK_CHECK="${SYNC_CHECK_RUN_HOOK_CHECK:-/home/hatch/workspace/neiro-slack-system/hooks/scripts/slack-hook-sync-check.sh}"
@@ -55,10 +66,27 @@ LISTENER_STATE="${SYNC_CHECK_RUN_LISTENER_STATE:-/home/hatch/hooks/state/listene
 #   sig=<失敗内容の md5>
 #   first_seen=<初回検出の epoch 秒>
 #   warned=<0|1>
+#   drift_since=<ずれ全体の開始 epoch 秒。署名が変わっても引き継ぐ>
 # 旧形式（署名だけ1行）のファイルは、署名が一致すれば warned=1 として
 # 読み替える（移行前から警告済みのずれを、移行直後に猶予で遅らせないため）。
+# drift_since のない旧形式（sig/first_seen/warned の3行）は
+# drift_since=first_seen として読み替える。
 write_state() {
-  printf 'sig=%s\nfirst_seen=%s\nwarned=%s\n' "$1" "$2" "$3" > "$4"
+  printf 'sig=%s\nfirst_seen=%s\nwarned=%s\ndrift_since=%s\n' "$1" "$2" "$3" "$4" > "$5"
+}
+
+# 警告を送る。送信に成功したときだけ warned=1 で状態を書き直す。
+# 引数：<sig> <first_seen> <drift_since> <state_file> <msg> <req>
+warn_once() {
+  local sig="$1" first_seen="$2" drift_since="$3" state_file="$4"
+  local msg="$5" req="$6"
+  if [ -n "$ALERT_CHANNEL" ] && "$SCRIPT_DIR/slack-send-locked.sh" --channel "$ALERT_CHANNEL" --workspace muse-board --request-id "$req" --message "$msg" >/dev/null 2>&1; then
+    write_state "$sig" "$first_seen" 1 "$drift_since" "$state_file"
+  else
+    # 送信に失敗したときは warned を立てない（次回は猶予を待たず再送を
+    # 試みる。送信失敗は猶予の対象外）。
+    write_state "$sig" "$first_seen" 0 "$drift_since" "$state_file"
+  fi
 }
 
 # 1件の同期チェックを実行し、必要なら警告する。
@@ -74,7 +102,8 @@ run_one_check() {
   fi
   sig="$(printf '%s' "$out" | md5sum | cut -d' ' -f1)"
   now="$(date +%s)"
-  local state_sig="" state_first="" state_warned=0
+  local state_sig="" state_first="" state_warned=0 state_drift=""
+  local state_drift_raw=""
   if [ -f "$state_file" ]; then
     local key val
     while IFS='=' read -r key val; do
@@ -82,6 +111,7 @@ run_one_check() {
         sig) state_sig="$val" ;;
         first_seen) state_first="$val" ;;
         warned) state_warned="$val" ;;
+        drift_since) state_drift="$val"; state_drift_raw="$val" ;;
       esac
     done < "$state_file"
     if [ -z "$state_sig" ]; then
@@ -92,6 +122,7 @@ run_one_check() {
         state_sig="$sig"
         state_first="$now"
         state_warned=1
+        state_drift="$now"
       fi
     fi
   fi
@@ -100,21 +131,58 @@ run_one_check() {
   case "$state_first" in
     ''|*[!0-9]*) state_sig="" ;;
   esac
+  # drift_since がなければ first_seen を引き継ぐ（drift_since 導入前の
+  # 状態ファイルの読み替え）。数字でないか未来の時刻なら now にする
+  # （壊れた drift_since が即座に上限超過と判定されるのを防ぐ）。
+  case "$state_drift" in
+    ''|*[!0-9]*) state_drift="$state_first" ;;
+  esac
+  case "$state_drift" in
+    ''|*[!0-9]*) state_drift="$now" ;;
+  esac
+  if [ "$state_drift" -gt "$now" ]; then
+    state_drift="$now"
+  fi
   if [ "$state_warned" != "1" ]; then
     state_warned=0
   fi
-  if [ -z "$state_sig" ] || [ "$state_sig" != "$sig" ]; then
-    # 初回検出か、署名が変わった：時計をリセットして黙る。
-    write_state "$sig" "$now" 0 "$state_file"
+  if [ -n "$state_sig" ] && [ "$state_drift_raw" != "$state_drift" ]; then
+    # drift_since を正規化した値を状態ファイルに書き戻す（壊れた・未来の
+    # 値や、drift_since 導入前の旧形式をその場で直す）。
+    write_state "$state_sig" "$state_first" "$state_warned" "$state_drift" "$state_file"
+  fi
+  if [ -z "$state_sig" ]; then
+    # 新規エピソード：初回検出は黙って記録する（警告しない）。
+    # drift_since もここから始まる。
+    write_state "$sig" "$now" 0 "$now" "$state_file"
+    return 0
+  fi
+  if [ "$state_sig" != "$sig" ]; then
+    # 署名が変わった：first_seen をリセットして黙るのが基本だが、
+    # drift_since と warned はエピソード単位で引き継ぐ。
+    # ずれ全体が上限を越えていれば、署名が新しくてもこの場で警告する
+    # （慢性的なずれの歯止め）。警告済みのエピソードでは再警告しない。
+    if [ "$state_warned" = "1" ]; then
+      write_state "$sig" "$now" 1 "$state_drift" "$state_file"
+      return 0
+    fi
+    if [ $((now - state_drift)) -ge "$CAP_SECS" ]; then
+      local msg req
+      msg="${msg_prefix}$(printf '%s' "$out" | head -5 | tr '\n' ' ')"
+      req="$req_prefix-$sig-$now"
+      warn_once "$sig" "$now" "$state_drift" "$state_file" "$msg" "$req"
+      return 0
+    fi
+    write_state "$sig" "$now" 0 "$state_drift" "$state_file"
     return 0
   fi
   if [ "$state_warned" = "1" ]; then
     return 0
   fi
-  if [ $((now - state_first)) -lt "$GRACE_SECS" ]; then
+  if [ $((now - state_first)) -lt "$GRACE_SECS" ] && [ $((now - state_drift)) -lt "$CAP_SECS" ]; then
     return 0
   fi
-  # 猶予を過ぎた：警告する。
+  # 猶予を過ぎた、またはずれ全体が上限を越えた：警告する。
   local msg req
   msg="${msg_prefix}$(printf '%s' "$out" | head -5 | tr '\n' ' ')"
   # request_id は失敗内容のハッシュだけではだめで、発生時刻も入れる
@@ -128,9 +196,7 @@ run_one_check() {
   # 先に立てると、ids.json 欠落などで送信が skip された異常が永久に
   # 送られなくなる。送信に失敗したときは warned=0 のままなので、次回は
   # 猶予を待たず再送を試みる（送信失敗は猶予の対象外）。
-  if [ -n "$ALERT_CHANNEL" ] && "$SCRIPT_DIR/slack-send-locked.sh" --channel "$ALERT_CHANNEL" --workspace muse-board --request-id "$req" --message "$msg" >/dev/null 2>&1; then
-    write_state "$sig" "$state_first" 1 "$state_file"
-  fi
+  warn_once "$sig" "$state_first" "$state_drift" "$state_file" "$msg" "$req"
   return 0
 }
 

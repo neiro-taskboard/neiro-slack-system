@@ -94,9 +94,11 @@ class SyncCheckRunTest(unittest.TestCase):
                 state[key] = val
         return state
 
-    def write_state(self, path, sig, first_seen, warned):
-        write_file(path, "sig=%s\nfirst_seen=%s\nwarned=%s\n"
-                   % (sig, first_seen, warned))
+    def write_state(self, path, sig, first_seen, warned, drift_since=None):
+        if drift_since is None:
+            drift_since = first_seen
+        write_file(path, "sig=%s\nfirst_seen=%s\nwarned=%s\ndrift_since=%s\n"
+                   % (sig, first_seen, warned, drift_since))
 
     def sig_of(self, content):
         # The runner captures check output with $(...), which strips
@@ -113,7 +115,7 @@ class SyncCheckRunTest(unittest.TestCase):
         self.assertFalse(os.path.exists(self.hook_state))
         self.assertFalse(os.path.exists(self.listener_state))
 
-    # 2. 初回検出は黙って状態だけ記録する
+    # 2. 初回検出は黙って状態だけ記録する（drift_since もここから始まる）
     def test_first_detection_silent_records_state(self):
         before = int(time.time())
         result = self.run_runner()
@@ -125,17 +127,20 @@ class SyncCheckRunTest(unittest.TestCase):
                          self.sig_of("drift line 1\ndrift line 2\n"))
         self.assertTrue(before <= int(state["first_seen"]) <= after)
         self.assertEqual(state["warned"], "0")
+        self.assertTrue(before <= int(state["drift_since"]) <= after)
         self.assertFalse(os.path.exists(self.listener_state))
 
-    # 3. 猶予内（15分未満）は同じずれでも黙ったまま
+    # 3. 猶予内（15分未満）は同じずれでも黙ったまま（drift_since も保持）
     def test_grace_not_elapsed_stays_silent(self):
         self.run_runner()
         first_seen = self.read_state(self.hook_state)["first_seen"]
+        drift_since = self.read_state(self.hook_state)["drift_since"]
         result = self.run_runner()
         self.assertEqual(result.returncode, 0)
         self.assertEqual(self.send_count(), 0)
         state = self.read_state(self.hook_state)
         self.assertEqual(state["first_seen"], first_seen)
+        self.assertEqual(state["drift_since"], drift_since)
         self.assertEqual(state["warned"], "0")
 
     # 4. 猶予を過ぎたら警告を1回送り、warned を立てる
@@ -148,6 +153,7 @@ class SyncCheckRunTest(unittest.TestCase):
         self.assertEqual(self.send_count(), 1)
         state = self.read_state(self.hook_state)
         self.assertEqual(state["first_seen"], str(old))
+        self.assertEqual(state["drift_since"], str(old))
         self.assertEqual(state["warned"], "1")
         with open(self.send_log, encoding="utf-8") as f:
             logged = f.read()
@@ -163,11 +169,14 @@ class SyncCheckRunTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertEqual(self.send_count(), 0)
 
-    # 6. 署名が変われば時計をリセットして黙る
-    def test_signature_change_resets_clock(self):
+    # 6. 署名が変われば first_seen の時計をリセットして黙る。
+    # warned と drift_since はエピソード単位で引き継ぐ（「続いている間は
+    # 1回」を守るため、警告済みのエピソードでは再警告しない）。
+    def test_signature_change_resets_clock_warned_stays(self):
         sig = self.sig_of("drift line 1\ndrift line 2\n")
         old = int(time.time()) - GRACE_SECS - 60
-        self.write_state(self.hook_state, sig, old, 1)
+        drift = int(time.time()) - 2 * GRACE_SECS - 60
+        self.write_state(self.hook_state, sig, old, 1, drift)
         self.set_check_output("hook", "different drift\n")
         before = int(time.time())
         result = self.run_runner()
@@ -177,7 +186,23 @@ class SyncCheckRunTest(unittest.TestCase):
         state = self.read_state(self.hook_state)
         self.assertEqual(state["sig"], self.sig_of("different drift\n"))
         self.assertTrue(before <= int(state["first_seen"]) <= after)
+        self.assertEqual(state["warned"], "1")
+        self.assertEqual(state["drift_since"], str(drift))
+
+    # 6b. 未警告のエピソードで署名が変われば、猶予内で黙って記録する
+    # （drift_since は引き継ぐ）
+    def test_signature_change_unwarned_keeps_drift_since(self):
+        sig = self.sig_of("drift line 1\ndrift line 2\n")
+        now = int(time.time())
+        self.write_state(self.hook_state, sig, now, 0, now)
+        self.set_check_output("hook", "different drift\n")
+        result = self.run_runner()
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(self.send_count(), 0)
+        state = self.read_state(self.hook_state)
+        self.assertEqual(state["sig"], self.sig_of("different drift\n"))
         self.assertEqual(state["warned"], "0")
+        self.assertEqual(state["drift_since"], str(now))
 
     # 7. ずれが解消されれば状態ごとクリア
     def test_resolved_drift_clears_state(self):
@@ -255,6 +280,99 @@ class SyncCheckRunTest(unittest.TestCase):
         result = self.run_runner({"SYNC_CHECK_RUN_GRACE_SECS": "0"})
         self.assertEqual(result.returncode, 0)
         self.assertEqual(self.send_count(), 1)
+
+    # 14. ずれ全体が上限（30分）を越えて署名が変われば、その場で警告する
+    def test_cap_exceeded_new_signature_warns_immediately(self):
+        sig = self.sig_of("drift line 1\ndrift line 2\n")
+        now = int(time.time())
+        drift = now - 2 * GRACE_SECS - 60
+        self.write_state(self.hook_state, sig, now, 0, drift)
+        self.set_check_output("hook", "different drift\n")
+        result = self.run_runner()
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(self.send_count(), 1)
+        state = self.read_state(self.hook_state)
+        self.assertEqual(state["sig"], self.sig_of("different drift\n"))
+        self.assertEqual(state["warned"], "1")
+        self.assertEqual(state["drift_since"], str(drift))
+
+    # 15. 上限を越えた慢性的なずれでも、警告済みのエピソードでは
+    # 署名が変わっても再警告しない（「続いている間は1回」）
+    def test_cap_exceeded_warned_episode_stays_silent(self):
+        sig = self.sig_of("drift line 1\ndrift line 2\n")
+        now = int(time.time())
+        drift = now - 2 * GRACE_SECS - 60
+        self.write_state(self.hook_state, sig, now, 1, drift)
+        self.set_check_output("hook", "different drift\n")
+        result = self.run_runner()
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(self.send_count(), 0)
+        state = self.read_state(self.hook_state)
+        self.assertEqual(state["warned"], "1")
+        self.assertEqual(state["drift_since"], str(drift))
+
+    # 16. 署名が入れ替わり続ける慢性的なずれでも、警告は1回だけ
+    def test_chronic_drift_warns_only_once(self):
+        now = int(time.time())
+        drift = now - 2 * GRACE_SECS - 60
+        sig = self.sig_of("drift line 1\ndrift line 2\n")
+        self.write_state(self.hook_state, sig, now, 0, drift)
+        self.set_check_output("hook", "drift A\n")
+        self.run_runner()
+        self.assertEqual(self.send_count(), 1)
+        # さらに署名が変わっても、同じエピソードでは警告しない
+        self.set_check_output("hook", "drift B\n")
+        self.run_runner()
+        self.assertEqual(self.send_count(), 1)
+        self.set_check_output("hook", "drift C\n")
+        self.run_runner()
+        self.assertEqual(self.send_count(), 1)
+        state = self.read_state(self.hook_state)
+        self.assertEqual(state["drift_since"], str(drift))
+        self.assertEqual(state["warned"], "1")
+
+    # 17. drift_since のない旧形式（3行）は first_seen を引き継ぐ
+    def test_old_three_line_state_migrates_drift_since(self):
+        sig = self.sig_of("drift line 1\ndrift line 2\n")
+        old = int(time.time()) - GRACE_SECS - 60
+        write_file(self.hook_state,
+                   "sig=%s\nfirst_seen=%s\nwarned=0\n" % (sig, old))
+        result = self.run_runner()
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(self.send_count(), 1)
+        state = self.read_state(self.hook_state)
+        self.assertEqual(state["drift_since"], str(old))
+
+    # 18. 壊れた drift_since は first_seen として扱う（即座の上限超過にしない）
+    def test_corrupt_drift_since_falls_back_to_first_seen(self):
+        sig = self.sig_of("drift line 1\ndrift line 2\n")
+        now = int(time.time())
+        write_file(self.hook_state,
+                   "sig=%s\nfirst_seen=%s\nwarned=0\ndrift_since=xxx\n"
+                   % (sig, now))
+        result = self.run_runner()
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(self.send_count(), 0)
+        state = self.read_state(self.hook_state)
+        self.assertEqual(state["drift_since"], str(now))
+
+    # 19. 未来の drift_since は now に丸める（即座の上限超過にしない）
+    def test_future_drift_since_clamped_to_now(self):
+        sig = self.sig_of("drift line 1\ndrift line 2\n")
+        now = int(time.time())
+        future = now + 3600
+        self.write_state(self.hook_state, sig, now, 0, future)
+        result = self.run_runner()
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(self.send_count(), 0)
+        state = self.read_state(self.hook_state)
+        self.assertTrue(now <= int(state["drift_since"]) <= now + 5)
+
+    # 20. 新規エピソードは猶予0でも初回は警告しない
+    def test_new_episode_never_warns_immediately(self):
+        result = self.run_runner({"SYNC_CHECK_RUN_GRACE_SECS": "0"})
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(self.send_count(), 0)
 
 
 if __name__ == "__main__":
