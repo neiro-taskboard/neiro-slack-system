@@ -48,6 +48,12 @@ Covered:
      5 minutes is promoted to the Neiro-addressed tier, and over
      15 minutes to the DM tier, so lower-priority traffic cannot starve
      while DMs and mentions keep flowing; within a tier, oldest first.
+ 15. fastpath reclaim keeps the resend note (中-2, 2026-11-22): a
+     processing event that went through waiting is re-dispatched with
+     the same resend annotation (first_wait_at + JST + prefix); one
+     without waiting history gets none.
+ 16. stale retry keeps the resend note (中-2, 2026-11-22): same shared
+     annotation as 15, for the stale processing / failed retry path.
 """
 import json
 import os
@@ -690,6 +696,97 @@ def test_burst_priority_aging_naive_received_at():
           len(due) == 1 and due[0]["ts"] == plain_old["ts"], due)
 
 
+def test_fastpath_reclaim_keeps_resend_note():
+    # 中-2（2026-11-22）：waiting を経た再送が処理中に死んで fastpath
+    # 取り戻しに回ったときも、resend 注記を付け直す。付けないと再送文の
+    # 先頭から「遅れての再送（元の失敗時刻：…）」が落ちる。
+    # waiting を経ていない取り戻しには resend は付かない。
+    from zoneinfo import ZoneInfo
+    now = datetime.now(timezone.utc)
+    first = now - timedelta(hours=1)
+    expected_jst = first.astimezone(ZoneInfo("Asia/Tokyo")).strftime(
+        "%Y-%m-%d %H:%M JST")
+
+    env = Env()
+    env.env["SLACK_POLL_FASTPATH"] = "1"
+    ev = make_event()
+    env.write_inbox([ev])
+    env.write_state([{"event_id": eid(ev), "status": "processing",
+                      "attempts": 1,
+                      "updated_at": now_iso(now - timedelta(seconds=300)),
+                      "first_wake_at": now_iso(now - timedelta(minutes=30)),
+                      "first_wait_at": now_iso(first),
+                      "last_error": ""}])
+    out = env.run()
+    due = out["payload"]["events"]
+    check("reclaim of a resend -> wake", out["decision"] == "wake", out)
+    resend = due[0].get("resend") if due else None
+    check("reclaim of a resend -> resend annotation kept",
+          isinstance(resend, dict), due)
+    check("reclaim resend.first_wait_at is the original failure time",
+          resend and resend.get("first_wait_at") == now_iso(first), resend)
+    check("reclaim resend.prefix is the agreed wording",
+          resend and resend.get("prefix")
+          == f"遅れての再送（元の失敗時刻：{expected_jst}）", resend)
+    check("reclaim keeps fastpath_reclaim annotation too",
+          isinstance(due[0].get("fastpath_reclaim"), dict), due)
+
+    # waiting を経ていない取り戻しには resend は付かない。
+    env2 = Env()
+    env2.env["SLACK_POLL_FASTPATH"] = "1"
+    env2.write_inbox([ev])
+    env2.write_state([{"event_id": eid(ev), "status": "processing",
+                       "attempts": 1,
+                       "updated_at": now_iso(now - timedelta(seconds=300)),
+                       "first_wake_at": now_iso(now - timedelta(minutes=30)),
+                       "last_error": ""}])
+    out2 = env2.run()
+    due2 = out2["payload"]["events"]
+    check("reclaim without waiting history -> no resend",
+          len(due2) == 1 and "resend" not in due2[0], due2)
+
+
+def test_stale_retry_keeps_resend_note():
+    # 中-2（2026-11-22）：waiting を経た再送が stale リトライに回った
+    # ときも resend 注記を付け直す（fastpath 取り戻しと共通の注記）。
+    # waiting を経ていない stale リトライには resend は付かない。
+    from zoneinfo import ZoneInfo
+    now = datetime.now(timezone.utc)
+    first = now - timedelta(hours=1)
+    expected_jst = first.astimezone(ZoneInfo("Asia/Tokyo")).strftime(
+        "%Y-%m-%d %H:%M JST")
+    old = now - timedelta(seconds=TIMEOUT_SECS + 60)
+    first_wake = now - timedelta(hours=4)
+
+    env = Env()
+    ev = make_event()
+    env.write_inbox([ev])
+    env.write_state([{"event_id": eid(ev), "status": "processing",
+                      "attempts": 1, "updated_at": now_iso(old),
+                      "first_wake_at": now_iso(first_wake),
+                      "first_wait_at": now_iso(first),
+                      "last_error": ""}])
+    out = env.run()
+    due = out["payload"]["events"]
+    resend = due[0].get("resend") if due else None
+    check("stale retry of a resend -> resend annotation kept",
+          isinstance(resend, dict), due)
+    check("stale retry resend.prefix is the agreed wording",
+          resend and resend.get("prefix")
+          == f"遅れての再送（元の失敗時刻：{expected_jst}）", resend)
+
+    env2 = Env()
+    env2.write_inbox([ev])
+    env2.write_state([{"event_id": eid(ev), "status": "processing",
+                       "attempts": 1, "updated_at": now_iso(old),
+                       "first_wake_at": now_iso(first_wake),
+                       "last_error": ""}])
+    out2 = env2.run()
+    due2 = out2["payload"]["events"]
+    check("stale retry without waiting history -> no resend",
+          len(due2) == 1 and "resend" not in due2[0], due2)
+
+
 def main():
     global FAIL
     tests = [test_new_event_wakes_once,
@@ -710,6 +807,8 @@ def main():
              test_burst_priority_aging_promotes_old_plain,
              test_burst_priority_aging_top_after_15min,
              test_burst_priority_aging_naive_received_at,
+             test_fastpath_reclaim_keeps_resend_note,
+             test_stale_retry_keeps_resend_note,
              test_parallel_claims_single_flight]
     for t in tests:
         try:

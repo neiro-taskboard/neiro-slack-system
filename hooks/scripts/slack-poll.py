@@ -225,6 +225,36 @@ def resend_prefix(first_wait_jst):
     return f"遅れての再送（元の失敗時刻：{first_wait_jst}）"
 
 
+def attach_resend(ev, first_wait):
+    """Copy of ev annotated as a late resend (遅れての再送).
+
+    waiting 再送と、取り戻し／stale リトライで共通の注記を作る
+    （中-2：取り戻し・stale リトライでは resend 注記が付かず、
+    再送文の先頭に「遅れての再送（元の失敗時刻：…）」が落ちていた）。
+    first_wait は元の失敗時刻（最初の waiting 時刻）。
+    """
+    resend_ev = dict(ev)
+    resend_ev["resend"] = {
+        "first_wait_at": first_wait.isoformat(),
+        "first_wait_at_jst": format_jst(first_wait),
+        "prefix": resend_prefix(format_jst(first_wait)),
+    }
+    return resend_ev
+
+
+def resend_first_wait(rec):
+    """Return the record's original failure time, or None.
+
+    first_wait_at が無い記録（waiting を経ていない）は None。
+    first_wait_at は waiting を経た記録にだけ刻まれるので、
+    在ること自体が「この処理は遅れての再送である」の目印になる。
+    """
+    first_wait = parse_iso(rec.get("first_wait_at"))
+    if first_wait == datetime.min.replace(tzinfo=timezone.utc):
+        return None
+    return first_wait
+
+
 def load_state():
     state = {}
     skipped = 0
@@ -375,12 +405,7 @@ def main():
                 # resend_prefix() の1行（「遅れての再送（元の失敗時刻：…JST）」）
                 # を付けて送る。状態の更新は dispatch が決まってから行う
                 # （バースト上限で見送られた場合は waiting のまま次回に回す）。
-                resend_ev = dict(ev)
-                resend_ev["resend"] = {
-                    "first_wait_at": first_wait.isoformat(),
-                    "first_wait_at_jst": format_jst(first_wait),
-                    "prefix": resend_prefix(format_jst(first_wait)),
-                }
+                resend_ev = attach_resend(ev, first_wait)
 
                 def claim_waiting(rec=rec, now=now):
                     rec["status"] = "processing"
@@ -402,6 +427,12 @@ def main():
                 reclaim_ev["fastpath_reclaim"] = {
                     "processing_age_secs": int(age_secs),
                 }
+                # 中-2：waiting を経た再送が処理中に死んだ場合、取り戻しでも
+                # resend 注記を付け直す。付けないと再送文の先頭から
+                # 「遅れての再送（元の失敗時刻：…）」が落ちる。
+                first_wait = resend_first_wait(rec)
+                if first_wait is not None:
+                    reclaim_ev = attach_resend(reclaim_ev, first_wait)
 
                 def claim_reclaim(rec=rec):
                     rec["updated_at"] = now_iso()
@@ -423,12 +454,19 @@ def main():
                 if now < first_wake + timedelta(seconds=START_GRACE_SECS):
                     continue
             if attempts < MAX_ATTEMPTS:
+                # 中-2：waiting を経た再送が stale リトライに回った場合も、
+                # fastpath 取り戻しと同じく resend 注記を付け直す。
+                retry_ev = ev
+                first_wait = resend_first_wait(rec)
+                if first_wait is not None:
+                    retry_ev = attach_resend(ev, first_wait)
+
                 def claim_retry(rec=rec, attempts=attempts):
                     rec["status"] = "processing"
                     rec["attempts"] = attempts + 1
                     rec["updated_at"] = now_iso()
                 candidates.append((dispatch_priority(ev, now), ts_key(ev),
-                                   ev, claim_retry))
+                                   retry_ev, claim_retry))
             else:
                 rec["status"] = "dead"
                 rec["updated_at"] = now_iso()
