@@ -54,6 +54,14 @@ Covered:
      without waiting history gets none.
  16. stale retry keeps the resend note (中-2, 2026-11-22): same shared
      annotation as 15, for the stale processing / failed retry path.
+ 17. reading limits (2026-11-22, Yama・Yanayana との合意を取り入れ):
+     an event longer than MAX_EVENT_TEXT_CHARS (3,000) is cut in the
+     wake payload, with text_truncated carrying the original length;
+     a short event is untouched and gets no annotation.
+ 18. wake total budget (2026-11-22): when the dispatched events' texts
+     exceed MAX_WAKE_TEXT_CHARS, the oldest events' texts are trimmed
+     first (newest kept longest), each keeping at least the floor, and
+     no event is dropped.
 """
 import json
 import os
@@ -787,6 +795,61 @@ def test_stale_retry_keeps_resend_note():
           len(due2) == 1 and "resend" not in due2[0], due2)
 
 
+def test_wake_truncates_long_event_text():
+    # 読み取り上限（2026-11-22）：3,000字超の投稿は wake ペイロードで
+    # 切られ、text_truncated に元の文字数が残る。短い投稿はそのまま。
+    env = Env()
+    long_ev = make_event(ts="1794476892.695469")
+    long_ev["text"] = "あ" * 3500
+    short_ev = make_event(ts="1794476893.695469")
+    short_ev["text"] = "短い投稿"
+    env.write_inbox([long_ev, short_ev])
+    out = env.run()
+    due = out["payload"]["events"]
+    check("long event -> wake with both events",
+          out["decision"] == "wake" and len(due) == 2, out)
+    cut = due[0]
+    check("long event text cut to 3000 chars",
+          len(cut.get("text") or "") == 3000, len(cut.get("text") or ""))
+    check("long event text_truncated carries original length",
+          cut.get("text_truncated") == {"original_chars": 3500,
+                                        "kept_chars": 3000},
+          cut.get("text_truncated"))
+    kept = due[1]
+    check("short event text untouched, no annotation",
+          kept.get("text") == "短い投稿"
+          and "text_truncated" not in kept, kept)
+
+
+def test_wake_total_text_budget_trims_oldest():
+    # 合計上限（2026-11-22）：1回あたりの合計を超えたら古いイベントの
+    # 本文から落とし、新しい方を長く残す。イベント自体は落とさない。
+    env = Env()
+    env.env["SLACK_POLL_MAX_EVENT_TEXT_CHARS"] = "10000"
+    env.env["SLACK_POLL_MAX_WAKE_TEXT_CHARS"] = "1200"
+    old_ev = make_event(ts="1794476892.695469")
+    old_ev["text"] = "あ" * 1000
+    new_ev = make_event(ts="1794476893.695469")
+    new_ev["text"] = "い" * 1000
+    env.write_inbox([old_ev, new_ev])
+    out = env.run()
+    due = out["payload"]["events"]
+    check("budget overrun -> both events still dispatched",
+          len(due) == 2, due)
+    check("oldest event trimmed to the floor first",
+          len(due[0].get("text") or "") == 500
+          and due[0].get("text_truncated") == {"original_chars": 1000,
+                                               "kept_chars": 500},
+          due[0].get("text_truncated"))
+    check("newest event trimmed only as far as needed",
+          len(due[1].get("text") or "") == 700
+          and due[1].get("text_truncated") == {"original_chars": 1000,
+                                               "kept_chars": 700},
+          due[1].get("text_truncated"))
+    check("wake total fits the budget",
+          sum(len(e.get("text") or "") for e in due) <= 1200, due)
+
+
 def main():
     global FAIL
     tests = [test_new_event_wakes_once,
@@ -809,6 +872,8 @@ def main():
              test_burst_priority_aging_naive_received_at,
              test_fastpath_reclaim_keeps_resend_note,
              test_stale_retry_keeps_resend_note,
+             test_wake_truncates_long_event_text,
+             test_wake_total_text_budget_trims_oldest,
              test_parallel_claims_single_flight]
     for t in tests:
         try:

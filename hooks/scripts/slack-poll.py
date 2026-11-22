@@ -38,6 +38,12 @@ Rules:
   applied only when it is dispatched, so the rest are reconsidered on
   the next poll (30s later) instead of piling into one long session.
   The payload's queue_remaining says how many were left behind.
+- Reading limits (2026-11-22): each event's text in the wake payload
+  is cut to MAX_EVENT_TEXT_CHARS (3,000) and the wake total to
+  MAX_WAKE_TEXT_CHARS (40,000); the cut is noted in text_truncated
+  with the original length, and the full text can be re-fetched with
+  slackcli when the cut text is not enough to judge. The oldest events'
+  texts are trimmed first; events themselves are never dropped.
 
 Output: JSON {"decision": "wake"|"silent", "reason": str, "payload": {...}}
 The calling bash script translates this into the hook's silent/wake call.
@@ -104,6 +110,21 @@ MAX_PER_WAKE = int(os.environ.get("SLACK_POLL_MAX_PER_WAKE", "4"))
 # 最上位（DM相当）。昇格しても同順位では古い順を維持する。
 # （Yamaさんの質問 2026-11-21 への回答で決めた条件）
 # DLQ再送の改訂案（2026-11-13、Yama・Yanayana・Neiroで合意）。
+# 読み取り上限（2026-11-22 追加、Yama・Yanayana との合意を取り入れ）:
+# 長文バーストの詰まりの主因は長文そのものより、長いスレッドを読む
+# ときの生データの膨張だった（Yama さんの調査、2026-11-22）。
+# wake ペイロードに載せる本文は 1投稿 3,000字、1回あたり合計
+# 40,000字までに切り詰める。切れた分は text_truncated に元の文字数
+# を残し、全文が要るときだけ slackcli conversations get で別取り
+# する（Yama さんの event-text と同じ考え方）。合計を超えた分は
+# 古いイベントの本文から落とすが、1イベントあたり最低
+# TEXT_FLOOR_CHARS は残して判定できるようにする。イベント自体は
+# 落とさない。
+MAX_EVENT_TEXT_CHARS = int(os.environ.get(
+    "SLACK_POLL_MAX_EVENT_TEXT_CHARS", "3000"))
+MAX_WAKE_TEXT_CHARS = int(os.environ.get(
+    "SLACK_POLL_MAX_WAKE_TEXT_CHARS", "40000"))
+TEXT_FLOOR_CHARS = 500
 WAIT_WINDOW_SECS = 24 * 3600  # pre-check失敗から再送を諦めるまでの窓（起点は最初の失敗時刻）
 WAIT_WAKE_INTERVAL_SECS = 3600  # waiting の再 wake 間隔（毎時の定期照合に合わせる）
 
@@ -191,6 +212,60 @@ def ts_key(ev):
         return float(ev.get("ts") or 0)
     except (TypeError, ValueError):
         return 0.0
+
+
+def truncate_event_text(ev):
+    """Return a copy of ev with text cut to MAX_EVENT_TEXT_CHARS.
+
+    切れた分は text_truncated に元の文字数を残す（落とした分は件数
+    ならぬ文字数つきで明示）。全文が要るときはワーカーが slackcli
+    conversations get で別取りする。
+    """
+    text = ev.get("text") or ""
+    if len(text) <= MAX_EVENT_TEXT_CHARS:
+        return dict(ev)
+    out = dict(ev)
+    out["text"] = text[:MAX_EVENT_TEXT_CHARS]
+    out["text_truncated"] = {"original_chars": len(text),
+                             "kept_chars": MAX_EVENT_TEXT_CHARS}
+    return out
+
+
+def _cut_text(ev, keep):
+    """Return a copy of ev with text cut to keep chars.
+
+    text_truncated の original_chars は真の元の長さのままにする
+    （二度切っても元の文字数が分かるように）。
+    """
+    out = dict(ev)
+    text = ev.get("text") or ""
+    orig = (ev.get("text_truncated") or {}).get("original_chars", len(text))
+    out["text"] = text[:keep]
+    out["text_truncated"] = {"original_chars": orig, "kept_chars": keep}
+    return out
+
+
+def apply_wake_text_budget(events):
+    """Trim the oldest events' texts until the wake total fits
+    MAX_WAKE_TEXT_CHARS.
+
+    古いイベントの本文から落とし（新しい方を残す）、1イベントあたり
+    TEXT_FLOOR_CHARS は残す。イベント自体は落とさない。
+    """
+    total = sum(len(e.get("text") or "") for e in events)
+    if total <= MAX_WAKE_TEXT_CHARS:
+        return list(events)
+    out = list(events)
+    for idx in sorted(range(len(out)), key=lambda i: ts_key(out[i])):
+        if total <= MAX_WAKE_TEXT_CHARS:
+            break
+        cur = len(out[idx].get("text") or "")
+        if cur <= TEXT_FLOOR_CHARS:
+            continue
+        keep = max(TEXT_FLOOR_CHARS, cur - (total - MAX_WAKE_TEXT_CHARS))
+        total -= cur - keep
+        out[idx] = _cut_text(out[idx], keep)
+    return out
 
 
 def format_jst(dt):
@@ -487,8 +562,9 @@ def main():
     queue_remaining = len(candidates) - len(dispatched)
     for _prio, _ts, ev, claim in dispatched:
         claim()
-        due.append(ev)
+        due.append(truncate_event_text(ev))
         changed = True
+    due = apply_wake_text_budget(due)
 
     if changed and not dry_run:
         save_state(state)
