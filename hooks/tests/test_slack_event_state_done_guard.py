@@ -24,6 +24,13 @@ neighbours' fixtures so no real ID leaks into the public repo):
   3. done then done with a resolution -> stays done, resolution kept
   4. failed then done -> becomes done, last_error cleared (existing)
   5. failed then failed -> stays failed, last_error updated
+  6. done then failed -> one rejection-log line (at/key/attempted/
+     current/reason); dead then failed -> stays dead and is logged;
+     dead then done -> allowed (heal path)
+  7. --force done -> waiting with a reason -> succeeds, records
+     corrected_from/correction_reason/corrected_at
+  8. --force without a reason -> rejected (exit 2), state unchanged
+  9. rejection log unwritable -> mark still succeeds (fail-open)
 """
 import json
 import os
@@ -58,18 +65,42 @@ class DoneGuardTest(unittest.TestCase):
             self.tmp.name, "slack-events.jsonl")
         self.env["SLACK_EVENT_STATE_LOCK_FILE"] = os.path.join(
             self.tmp.name, "slack-events.lock")
+        self.env["SLACK_EVENT_MARK_REJECTED_FILE"] = os.path.join(
+            self.tmp.name, "mark_rejected.jsonl")
 
     def tearDown(self):
         self.tmp.cleanup()
 
-    def mark(self, status, error=""):
-        args = [SCRIPT, EVENT_ID, status]
+    def mark(self, status, error="", force=False):
+        args = [SCRIPT]
+        if force:
+            args.append("--force")
+        args += [EVENT_ID, status]
         if error:
             args.append(error)
         proc = subprocess.run(args, env=self.env,
                               capture_output=True, text=True)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         return proc.stdout.strip()
+
+    def mark_raw(self, args):
+        return subprocess.run([SCRIPT] + args, env=self.env,
+                              capture_output=True, text=True)
+
+    def seed(self, status, attempts=0):
+        path = self.env["SLACK_EVENT_STATE_FILE"]
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"event_id": EVENT_ID, "status": status,
+                                "attempts": attempts,
+                                "updated_at": "2026-11-23T00:00:00+00:00"},
+                               ensure_ascii=False) + "\n")
+
+    def load_rejected(self):
+        path = self.env["SLACK_EVENT_MARK_REJECTED_FILE"]
+        if not os.path.exists(path):
+            return []
+        with open(path, encoding="utf-8") as f:
+            return [json.loads(line) for line in f if line.strip()]
 
     def load_state(self):
         path = self.env["SLACK_EVENT_STATE_FILE"]
@@ -119,6 +150,54 @@ class DoneGuardTest(unittest.TestCase):
         rec = self.load_state()[EVENT_ID]
         self.assertEqual(rec["status"], "failed")
         self.assertEqual(rec.get("last_error"), "second failure")
+
+    def test_rejected_write_is_logged(self):
+        self.mark("done")
+        self.mark("failed", "late worker failed to send")
+        rows = self.load_rejected()
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["key"], EVENT_ID)
+        self.assertEqual(row["attempted_status"], "failed")
+        self.assertEqual(row["current_status"], "done")
+        self.assertIn("at", row)
+        self.assertIn("reason", row)
+
+    def test_dead_is_terminal_for_failed_but_done_allowed(self):
+        self.seed("dead", attempts=3)
+        self.mark("failed", "late worker failed to send")
+        rec = self.load_state()[EVENT_ID]
+        self.assertEqual(rec["status"], "dead")
+        rows = self.load_rejected()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["current_status"], "dead")
+        self.mark("done", "healed: reply already sent")
+        rec = self.load_state()[EVENT_ID]
+        self.assertEqual(rec["status"], "done")
+
+    def test_force_correction_from_done_needs_reason_and_records_it(self):
+        self.mark("done")
+        proc = self.mark_raw(["--force", EVENT_ID, "waiting"])
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(self.load_state()[EVENT_ID]["status"], "done")
+        out = self.mark("waiting", "mistaken done, reopening", force=True)
+        self.assertIn("CORRECTION", out)
+        rec = self.load_state()[EVENT_ID]
+        self.assertEqual(rec["status"], "waiting")
+        self.assertEqual(rec.get("corrected_from"), "done")
+        self.assertEqual(rec.get("correction_reason"),
+                         "mistaken done, reopening")
+        self.assertIn("corrected_at", rec)
+        self.assertEqual(rec.get("last_error"), "mistaken done, reopening")
+        self.assertEqual(self.load_rejected(), [])
+
+    def test_rejected_log_failure_does_not_break_mark(self):
+        self.mark("done")
+        # Point the log at a directory: the append must fail open.
+        self.env["SLACK_EVENT_MARK_REJECTED_FILE"] = self.tmp.name
+        out = self.mark("failed", "late worker failed to send")
+        self.assertIn("already done", out)
+        self.assertEqual(self.load_state()[EVENT_ID]["status"], "done")
 
 
 if __name__ == "__main__":
