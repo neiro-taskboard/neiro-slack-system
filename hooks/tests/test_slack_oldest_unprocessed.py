@@ -14,13 +14,18 @@ Covered:
   1. state file missing -> exit 0, 0 unprocessed, oldest null
   2. all done/dead -> exit 0, 0 unprocessed
   3. young processing (60s) -> exit 0, counted, not warned
-  4. old processing (200s) -> exit 1, oldest id + age reported
-  5. boundary: 179s -> exit 0; 181s -> exit 1
+  4. processing below its own threshold (200s < 600s) -> exit 0
+  5. boundary for pending: 179s -> exit 0; 181s -> exit 1
   6. oldest wins among several unprocessed events
   7. malformed lines are skipped
   8. missing first_wake_at falls back to updated_at
   9. waiting counts as unprocessed
  10. threshold env override is respected
+ 11. processing above its own threshold (650s) -> exit 1
+ 12. processing boundary: 599s -> exit 0; 601s -> exit 1
+ 13. mixed: processing 400s (under) + pending 200s (over) -> exit 1,
+      oldest is the pending one that exceeded its threshold
+ 14. processing threshold env override is respected
 """
 import json
 import os
@@ -61,6 +66,8 @@ class OldestUnprocessedTest(unittest.TestCase):
         self.env = dict(os.environ)
         self.env["SLACK_OLDEST_UNPROCESSED_STATE_FILE"] = self.state
         self.env.pop("SLACK_OLDEST_UNPROCESSED_THRESHOLD_SECS", None)
+        self.env.pop(
+            "SLACK_OLDEST_UNPROCESSED_PROCESSING_THRESHOLD_SECS", None)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -109,28 +116,31 @@ class OldestUnprocessedTest(unittest.TestCase):
         self.assertEqual(out["oldest_event_id"], EID)
         self.assertGreaterEqual(out["oldest_age_secs"], 60)
 
-    # 4. old processing (200s) -> exit 1, oldest reported
-    def test_old_processing_warns(self):
+    # 4. processing below its own threshold (200s < 600s) -> exit 0.
+    # A worker holding an event while it composes a heavy reply
+    # (2026-11-23: 323s for a commit + 429 tests) must not warn.
+    def test_processing_below_own_threshold_no_warning(self):
         self.write_state([self.rec(age_secs=200)])
         code, out = self.run_check()
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 0)
         self.assertEqual(out["unprocessed_count"], 1)
         self.assertEqual(out["oldest_event_id"], EID)
         self.assertGreaterEqual(out["oldest_age_secs"], 200)
+        self.assertEqual(out["oldest_threshold_secs"], 600)
 
-    # 5. boundary: 179s -> exit 0; 181s -> exit 1
+    # 5. boundary for pending: 179s -> exit 0; 181s -> exit 1
     def test_boundary(self):
-        self.write_state([self.rec(age_secs=179)])
+        self.write_state([self.rec(status="pending", age_secs=179)])
         code, _ = self.run_check()
         self.assertEqual(code, 0)
-        self.write_state([self.rec(age_secs=181)])
+        self.write_state([self.rec(status="pending", age_secs=181)])
         code, _ = self.run_check()
         self.assertEqual(code, 1)
 
     # 6. oldest wins among several unprocessed events
     def test_oldest_wins(self):
-        self.write_state([self.rec(age_secs=60),
-                          self.rec(eid=EID2, age_secs=300),
+        self.write_state([self.rec(status="pending", age_secs=60),
+                          self.rec(eid=EID2, status="pending", age_secs=300),
                           self.rec(eid=WS_MUSE + ":" + CHANNEL + ":1794476002.000001",
                                    status="done", age_secs=900)])
         code, out = self.run_check()
@@ -143,7 +153,7 @@ class OldestUnprocessedTest(unittest.TestCase):
     def test_malformed_lines_skipped(self):
         with open(self.state, "w", encoding="utf-8") as f:
             f.write("{broken\n")
-            f.write(json.dumps(self.rec(age_secs=200),
+            f.write(json.dumps(self.rec(status="pending", age_secs=200),
                                ensure_ascii=False) + "\n")
         code, out = self.run_check()
         self.assertEqual(code, 1)
@@ -151,7 +161,8 @@ class OldestUnprocessedTest(unittest.TestCase):
 
     # 8. missing first_wake_at falls back to updated_at
     def test_first_wake_missing_falls_back(self):
-        self.write_state([self.rec(age_secs=200, first_wake=False)])
+        self.write_state([self.rec(status="pending", age_secs=200,
+                                   first_wake=False)])
         code, out = self.run_check()
         self.assertEqual(code, 1)
         self.assertEqual(out["oldest_event_id"], EID)
@@ -165,13 +176,56 @@ class OldestUnprocessedTest(unittest.TestCase):
 
     # 10. threshold env override is respected
     def test_threshold_override(self):
-        self.write_state([self.rec(age_secs=90)])
+        self.write_state([self.rec(status="pending", age_secs=90)])
         code, _ = self.run_check()
         self.assertEqual(code, 0)
         self.env["SLACK_OLDEST_UNPROCESSED_THRESHOLD_SECS"] = "60"
         code, out = self.run_check()
         self.assertEqual(code, 1)
         self.assertEqual(out["threshold_secs"], 60)
+
+    # 11. processing above its own threshold (650s) -> exit 1.
+    # A stuck worker still alerts, just later.
+    def test_old_processing_warns(self):
+        self.write_state([self.rec(age_secs=650)])
+        code, out = self.run_check()
+        self.assertEqual(code, 1)
+        self.assertEqual(out["unprocessed_count"], 1)
+        self.assertEqual(out["oldest_event_id"], EID)
+        self.assertGreaterEqual(out["oldest_age_secs"], 650)
+        self.assertEqual(out["oldest_threshold_secs"], 600)
+
+    # 12. processing boundary: 599s -> exit 0; 601s -> exit 1
+    def test_processing_boundary(self):
+        self.write_state([self.rec(age_secs=599)])
+        code, _ = self.run_check()
+        self.assertEqual(code, 0)
+        self.write_state([self.rec(age_secs=601)])
+        code, _ = self.run_check()
+        self.assertEqual(code, 1)
+
+    # 13. mixed: processing 400s is under its threshold, but a
+    # pending 200s event exceeds 180s -> exit 1, and the oldest
+    # reported is the pending one that actually exceeded.
+    def test_mixed_oldest_is_exceeding_one(self):
+        self.write_state([self.rec(age_secs=400),
+                          self.rec(eid=EID2, status="pending",
+                                   age_secs=200)])
+        code, out = self.run_check()
+        self.assertEqual(code, 1)
+        self.assertEqual(out["unprocessed_count"], 2)
+        self.assertEqual(out["oldest_event_id"], EID2)
+        self.assertEqual(out["oldest_threshold_secs"], 180)
+
+    # 14. processing threshold env override is respected
+    def test_processing_threshold_override(self):
+        self.write_state([self.rec(age_secs=400)])
+        code, _ = self.run_check()
+        self.assertEqual(code, 0)
+        self.env["SLACK_OLDEST_UNPROCESSED_PROCESSING_THRESHOLD_SECS"] = "300"
+        code, out = self.run_check()
+        self.assertEqual(code, 1)
+        self.assertEqual(out["processing_threshold_secs"], 300)
 
 
 if __name__ == "__main__":

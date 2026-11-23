@@ -209,13 +209,13 @@ if [ -x "$OLDEST_CHECK" ]; then
   if OLDEST_OUT="$("$OLDEST_CHECK" 2>/dev/null)"; then
     rm -f "$OLDEST_FLAG" "$OLDEST_STATE"
   else
-    OLDEST_FIELDS="$(printf '%s' "$OLDEST_OUT" | python3 -c 'import json,sys; d=json.load(sys.stdin); print((d.get("oldest_event_id") or "") + "|" + str(d.get("oldest_age_secs") or "") + "|" + str(d.get("unprocessed_count") or ""))' 2>/dev/null)"
-    IFS='|' read -r OLDEST_ID OLDEST_AGE OLDEST_COUNT <<< "$OLDEST_FIELDS"
+    OLDEST_FIELDS="$(printf '%s' "$OLDEST_OUT" | python3 -c 'import json,sys; d=json.load(sys.stdin); print((d.get("oldest_event_id") or "") + "|" + str(d.get("oldest_age_secs") or "") + "|" + str(d.get("unprocessed_count") or "") + "|" + str(d.get("oldest_threshold_secs") or 180))' 2>/dev/null)"
+    IFS='|' read -r OLDEST_ID OLDEST_AGE OLDEST_COUNT OLDEST_THRESH <<< "$OLDEST_FIELDS"
     if [ -n "$OLDEST_ID" ]; then
       printf '%s' "$OLDEST_ID" > "$OLDEST_FLAG"
       OLDEST_SIG="$(printf '%s' "$OLDEST_ID" | md5sum | cut -d' ' -f1)"
       if [ ! -f "$OLDEST_STATE" ] || [ "$(cat "$OLDEST_STATE" 2>/dev/null)" != "$OLDEST_SIG" ]; then
-        OLDEST_MSG="最古の未処理イベントが180秒以上経っています：${OLDEST_ID}（${OLDEST_AGE}秒、未処理 ${OLDEST_COUNT}件）。フックのワーカーが起動していないか、処理が詰まっている可能性があります。"
+        OLDEST_MSG="最古の未処理イベントが${OLDEST_THRESH:-180}秒以上経っています：${OLDEST_ID}（${OLDEST_AGE}秒、未処理 ${OLDEST_COUNT}件）。フックのワーカーが起動していないか、処理が詰まっている可能性があります。"
         if [ -n "$ALERT_CHANNEL" ] && /home/hatch/hooks/scripts/slack-send-locked.sh --channel "$ALERT_CHANNEL" --workspace muse-board --request-id "oldest-unprocessed-$OLDEST_SIG" --message "$OLDEST_MSG" >/dev/null 2>&1; then
           printf '%s' "$OLDEST_SIG" > "$OLDEST_STATE"
         fi
