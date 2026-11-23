@@ -42,6 +42,20 @@ if [ "${HATCH_HOOK_DRY_RUN:-0}" != "1" ]; then
   fi
 fi
 
+# Periodic heal-replied reconciliation (slack-reconcile-heal.py).
+# Same shape as the ambiguous reconciliation above: the script
+# self-gates to at most once an hour, so calling it on every poll is
+# cheap (a gated no-op most of the time). Best-effort: it never breaks
+# the poll (|| true, 120s cap) and is skipped in dry-run mode.
+# Yanayana さんの滞留根本対策② heal-replied の取り込み（2026-11-23）。
+if [ "${HATCH_HOOK_DRY_RUN:-0}" != "1" ]; then
+  HEAL_PY="/home/hatch/hooks/scripts/slack-reconcile-heal.py"
+  HEAL_OUT="$(timeout 120 python3 "$HEAL_PY" 2>&1 || true)"
+  if [ -n "$HEAL_OUT" ] && ! printf '%s' "$HEAL_OUT" | grep -q '"gated": true'; then
+    printf '%s\n' "$HEAL_OUT" >> "/home/hatch/hooks/state/slack-reconcile-heal.log"
+  fi
+fi
+
 if [ "$DECISION" = "wake" ]; then
   # Dispatch-time guard for the hook definition (2026-11-16, conclusion
   # shared in the #slack-へようこそ thread; Groq gpt-oss-120b consulted).
