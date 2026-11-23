@@ -12,10 +12,16 @@
 #             attempts に数えず、ポーラーが1時間ごとに起こし直し、
 #             24時間以内に読めるようになれば通常通り返信する。24時間を
 #             過ぎたらポーラーが dead にする。第3引数を last_error に残す。
+#   done は最終状態：done 済みのイベントに後から failed/waiting を
+#             書き込んでも復活させない（2026-11-23、Yanayana さんの
+#             滞留根本対策④を取り込み。Yama さんの監査で指摘された
+#             「DONE への FAILED commit で復活する穴」と同じ形。
+#             遅れて届いた失敗が解決済みを掘り返すのを防ぐ）。
+# STATE_FILE / LOCK_FILE は環境変数で上書きできる（テスト用）。
 set -euo pipefail
 
-STATE_FILE="/home/hatch/hooks/state/slack-events.jsonl"
-LOCK_FILE="/home/hatch/hooks/state/slack-events.lock"
+STATE_FILE="${SLACK_EVENT_STATE_FILE:-/home/hatch/hooks/state/slack-events.jsonl}"
+LOCK_FILE="${SLACK_EVENT_STATE_LOCK_FILE:-/home/hatch/hooks/state/slack-events.lock}"
 mkdir -p "$(dirname "$STATE_FILE")"
 
 if [ $# -lt 2 ]; then
@@ -34,10 +40,10 @@ NOW=$(date -u +%Y-%m-%dT%H:%M:%S.%6N+00:00)
 exec 9>"$LOCK_FILE"
 flock 9
 
-python3 - "$EVENT_ID" "$STATUS" "$ERROR" "$NOW" <<'PYEOF'
+python3 - "$STATE_FILE" "$EVENT_ID" "$STATUS" "$ERROR" "$NOW" <<'PYEOF'
 import json, os, sys
-state_file = "/home/hatch/hooks/state/slack-events.jsonl"
-eid, status, error, now = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+state_file = sys.argv[1]
+eid, status, error, now = sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
 state = {}
 if os.path.exists(state_file):
     with open(state_file, encoding="utf-8") as f:
@@ -51,6 +57,10 @@ if os.path.exists(state_file):
             except json.JSONDecodeError:
                 continue
 rec = state.get(eid, {"event_id": eid, "attempts": 0})
+if rec.get("status") == "done" and status in ("failed", "waiting"):
+    # done は最終状態。遅れて届いた失敗で解決済みを復活させない。
+    print(f"{eid} already done; keeping done (not reviving to {status})")
+    sys.exit(0)
 rec["status"] = status
 rec["updated_at"] = now
 if status == "done":
