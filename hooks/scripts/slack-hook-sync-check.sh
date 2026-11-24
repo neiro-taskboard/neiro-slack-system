@@ -10,7 +10,15 @@
 #
 # このスクリプトは以下を検証する：
 #   1. リポジトリにある全フックファイルに対応する稼働中のパスが
-#      シンボリックリンクであること（通常ファイルによる上書きの検出）
+#      シンボリックリンクであること。ただし内容がリポジトリと
+#      バイト同一の通常ファイルも許容する（2026-11-24、フック実行側
+#      の制約を取り込み）。フックの実行基盤はスクリプトの実パスが
+#      ~/hooks/scripts 配下であることを要求し、リポジトリへの
+#      シンボリックリンクだと「hook script must stay under
+#      /home/hatch/hooks/scripts」で失敗する（11/20 から 30秒フックが
+#      全滅。Yamaさん・Yanayanaさん側は稼働側を実ファイルにして
+#      動かしている）。内容が違えば CONTENT-DRIFT で拾うので、
+#      同期ずれの検知は保たれる。
 #   2. リンク先が存在し、期待するリポジトリパスを指していること
 #      （リンク切れ・差し替えの検出）
 #   3. JSON 定義がパースできること、シェルスクリプトが bash -n を通り、
@@ -42,26 +50,32 @@ PROBLEMS=0
 
 check_one() {
   local rel="$1" live="$HOOKS_DIR/$rel" repo="$REPO_HOOKS_DIR/$rel"
-  if [ ! -L "$live" ]; then
-    if [ -e "$live" ]; then
-      echo "NOT-A-SYMLINK: $live （通常ファイルが置かれている。リポジトリへのリンクにすること）"
-    else
-      echo "MISSING: $live （稼働中のファイルが無い）"
+  if [ -L "$live" ]; then
+    if [ ! -e "$live" ]; then
+      echo "BROKEN-LINK: $live -> $(readlink "$live") （リンク先が無い）"
+      PROBLEMS=$((PROBLEMS + 1))
+      return
     fi
-    PROBLEMS=$((PROBLEMS + 1))
-    return
-  fi
-  if [ ! -e "$live" ]; then
-    echo "BROKEN-LINK: $live -> $(readlink "$live") （リンク先が無い）"
-    PROBLEMS=$((PROBLEMS + 1))
-    return
-  fi
-  local target
-  target="$(readlink -f "$live")"
-  local expected
-  expected="$(readlink -f "$repo")"
-  if [ "$target" != "$expected" ]; then
-    echo "WRONG-TARGET: $live -> $target （期待： $expected）"
+    local target
+    target="$(readlink -f "$live")"
+    local expected
+    expected="$(readlink -f "$repo")"
+    if [ "$target" != "$expected" ]; then
+      echo "WRONG-TARGET: $live -> $target （期待： $expected）"
+      PROBLEMS=$((PROBLEMS + 1))
+      return
+    fi
+  elif [ -e "$live" ]; then
+    # 通常ファイル：内容がリポジトリとバイト同一なら許容する。
+    # フック実行基盤が実パスを ~/hooks/scripts 配下に要求するためで、
+    # 違う内容なら CONTENT-DRIFT として拾う（黙っての置き換えは通さない）。
+    if ! cmp -s "$live" "$repo"; then
+      echo "CONTENT-DRIFT: $live （通常ファイルで内容がリポジトリと違う。差分を解消すること）"
+      PROBLEMS=$((PROBLEMS + 1))
+      return
+    fi
+  else
+    echo "MISSING: $live （稼働中のファイルが無い）"
     PROBLEMS=$((PROBLEMS + 1))
     return
   fi

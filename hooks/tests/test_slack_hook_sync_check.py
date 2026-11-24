@@ -63,13 +63,22 @@ class HookSyncCheckTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0)
         self.assertEqual(r.stdout, "")
 
-    # 2. 通常ファイルが置かれていれば NOT-A-SYMLINK で exit 1
-    def test_regular_file_is_not_a_symlink(self):
+    # 2. 内容が同一の通常ファイルは許容する（2026-11-24、フック実行側の
+    # 実パス制約を取り込み。Yamaさん・Yanayanaさん側と同じ構成）
+    def test_regular_file_identical_content_passes(self):
         self.write_repo("scripts/slack-poll.py", "print('ok')\n")
         self.write_live_real("scripts/slack-poll.py", "print('ok')\n")
         r = run_check(self.live, self.repo)
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(r.stdout, "")
+
+    # 2b. 内容が違う通常ファイルは CONTENT-DRIFT で exit 1
+    def test_regular_file_drift_detected(self):
+        self.write_repo("scripts/slack-poll.py", "print('ok')\n")
+        self.write_live_real("scripts/slack-poll.py", "print('drift')\n")
+        r = run_check(self.live, self.repo)
         self.assertEqual(r.returncode, 1)
-        self.assertIn("NOT-A-SYMLINK", r.stdout)
+        self.assertIn("CONTENT-DRIFT", r.stdout)
 
     # 3. 稼働中のファイルが無ければ MISSING で exit 1
     def test_missing_live_file(self):
