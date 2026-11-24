@@ -72,7 +72,8 @@ Covered:
   31. classify_error buckets: self_id_unknown wins over history
       unreadable; dump unreadable; history unreadable; other fallback
   32. target_key is stable for the same target, distinct for different
-      text, and ignores whitespace differences (normalized text)
+      text, and distinct for whitespace differences too (raw text:
+      the key must match build_targets units 1:1)
   33. cannot_verify increments the consecutive count, no close yet
   34. 23rd consecutive cannot_verify does not close yet
   35. 24th consecutive cannot_verify closes as closed_unverifiable
@@ -92,18 +93,25 @@ Covered:
   44. closed_unverifiable target is excluded (no read); a record
       after the close forms a new target
   45. reopened entry re-admits the closed target
-  46. reopened target counts from 0, not from the pre-close streak
-  47. budget: targets beyond the time budget are skipped (not
+  46. reopened target resets only the pre-reopen streak; post-reopen
+      failures are kept (reopened_time comparison)
+  47. spent found_ts migrates to a text-bearing resolution; a
+      text-bearing resolved entry excludes the target (a text-less
+      one does not); migration consumes the spent ts once, checks
+      all candidates by mark, normal resolution and migration
+      never share one post within a run or across runs, and
+      close -> reopen -> close lists the group once
+  48. budget: targets beyond the time budget are skipped (not
       cannot_verify, counts untouched)
-  48. append_closed_unverifiable writes the terminal entry, and a second
+  49. append_closed_unverifiable writes the terminal entry, and a second
       reconcile over the appended file closes nothing more
-  49. CLI: 24th cannot_verify closes, clears counts, exits 2, and the
+  50. CLI: 24th cannot_verify closes, clears counts, exits 2, and the
       transition notification is sent exactly once (with --request-id)
-  50. CLI: user-id channel closes as closed_invalid_channel, exits 0,
+  51. CLI: user-id channel closes as closed_invalid_channel, exits 0,
       and a second run closes nothing more
-  51. CLI --reopen-channel appends a reopened entry for a closed target
+  52. CLI --reopen-channel appends a reopened entry for a closed target
       and appends nothing when there is no closed target
-  52. notify failure returns False without raising
+  53. notify failure returns False without raising
 """
 import importlib.util
 import contextlib
@@ -283,7 +291,7 @@ def test_whitespace_only_text_treated_as_no_text():
           and len(out["closed_no_text"]) == 1
           and out["closed_no_text"][0]["count"] == 1
           and calls == [], str(out))
-    targets, _used = mod.build_targets([amb(text=" ")])
+    targets, _used, _mig = mod.build_targets([amb(text=" ")])
     check("whitespace-only text makes no target",
           targets == [], str(targets))
 
@@ -346,13 +354,133 @@ def test_load_records_broken_line_warns():
               f"stderr={buf.getvalue()!r}")
 
 
-def test_already_resolved_found_ts_not_reused():
+def test_spent_found_ts_migrates_to_text_resolution():
     mod = load_mod()
     msgs = [{"ts": "1794594100.000000", "user": SELF, "text": TEXT}]
     recs = [amb(), resolved_entry(found_ts="1794594100.000000")]
     out = mod.reconcile(recs, reader_for(msgs))
-    check("spent found_ts is not reused for the same target",
-          out["resolved"] == [], str(out))
+    check("spent found_ts migrates to a text-bearing resolution "
+          "(the post was sent, so the target closes as resolved "
+          "instead of being re-read every hour)",
+          len(out["resolved"]) == 1
+          and out["resolved"][0]["found_ts"] == "1794594100.000000"
+          and out["resolved"][0]["text"] == TEXT, str(out))
+
+
+def test_text_bearing_resolved_entry_excludes_target():
+    mod = load_mod()
+    entry = resolved_entry(found_ts="1794594100.000000")
+    entry["text"] = TEXT
+    recs = [amb(), entry]
+    out = mod.reconcile(recs, reader_for([]))
+    check("text-bearing resolved entry excludes the target "
+          "(no history read for an already-resolved target)",
+          out["targets"] == 0, str(out))
+    # A text-less resolved entry does not exclude: the target cannot
+    # be identified from it, so it stays a target.
+    recs2 = [amb(), resolved_entry(found_ts="1794594100.000000")]
+    out2 = mod.reconcile(recs2, reader_for([]))
+    check("text-less resolved entry does not exclude the target",
+          out2["targets"] == 1, str(out2))
+
+
+def test_spent_migration_with_matching_mark():
+    mod = load_mod()
+    msgs = [{"ts": "1794594100.000000", "user": SELF, "text": TEXT}]
+    marks = {"1794594100.000000": ("event_id", EVENT_ID)}
+    recs = [amb_marked(event_id=EVENT_ID),
+            resolved_entry(found_ts="1794594100.000000")]
+    out = mod.reconcile(recs, reader_for(msgs), lookup_for(marks))
+    check("marked target migrates when the spent post has the "
+          "matching mark",
+          len(out["resolved"]) == 1
+          and out["resolved"][0]["found_ts"] == "1794594100.000000"
+          and out["resolved"][0]["mark"] == ("event_id", EVENT_ID),
+          str(out))
+
+
+def test_spent_migration_later_candidate_mark_match():
+    mod = load_mod()
+    ts1 = "1794594100.000000"
+    ts2 = "1794594200.000000"
+    msgs = [{"ts": ts1, "user": SELF, "text": TEXT},
+            {"ts": ts2, "user": SELF, "text": TEXT}]
+    marks = {ts1: ("event_id", OTHER_EVENT_ID),
+             ts2: ("event_id", EVENT_ID)}
+    recs = [amb_marked(event_id=EVENT_ID),
+            resolved_entry(found_ts=ts1),
+            resolved_entry(found_ts=ts2)]
+    out = mod.reconcile(recs, reader_for(msgs), lookup_for(marks))
+    check("migration checks all spent candidates by mark, not just "
+          "the first (later candidate matches)",
+          len(out["resolved"]) == 1
+          and out["resolved"][0]["found_ts"] == ts2, str(out))
+
+
+def test_spent_migration_no_double_resolution():
+    mod = load_mod()
+    ts1 = "1794594100.000000"
+    msgs = [{"ts": ts1, "user": SELF, "text": TEXT}]
+    marks = {ts1: ("event_id", EVENT_ID)}
+    recs = [amb_marked(event_id=EVENT_ID), amb(),
+            resolved_entry(found_ts=ts1)]
+    out = mod.reconcile(recs, reader_for(msgs), lookup_for(marks))
+    check("one spent post migrates at most one target "
+          "(no double resolution)",
+          len(out["resolved"]) == 1
+          and out["resolved"][0]["found_ts"] == ts1
+          and out["targets"] == 2 and out["cannot_verify"] == [],
+          str(out))
+
+
+def test_normal_then_migration_no_double_resolution():
+    mod = load_mod()
+    # 投稿1件に対し、正規化で同じ文面になる空白違いの対象が2つ。
+    # 先に通常解決した投稿を、後続の対象が移行で拾ってはならない。
+    ts1 = "1794594100.000000"
+    msgs = [{"ts": ts1, "user": SELF, "text": TEXT}]
+    recs = [amb(text=TEXT), amb(text=TEXT + " ")]
+    out = mod.reconcile(recs, reader_for(msgs))
+    check("normal resolution then migration: one post resolves at "
+          "most one target",
+          len(out["resolved"]) == 1
+          and out["resolved"][0]["found_ts"] == ts1
+          and out["targets"] == 2 and out["cannot_verify"] == [],
+          str(out))
+
+
+def test_round_trip_no_cross_run_double_resolution():
+    mod = load_mod()
+    # 1回目で通常解決した投稿は、台帳へ文面付きで追記された後、
+    # 2回目の実行で残った空白違いの対象の移行に使われてはならない。
+    ts1 = "1794594100.000000"
+    msgs = [{"ts": ts1, "user": SELF, "text": TEXT}]
+    recs = [amb(text=TEXT), amb(text=TEXT + " ")]
+    out1 = mod.reconcile(recs, reader_for(msgs))
+    check("round trip run 1: one target resolves normally",
+          len(out1["resolved"]) == 1
+          and out1["resolved"][0]["found_ts"] == ts1, str(out1))
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "amb.jsonl")
+        mod.append_resolved(path, out1["resolved"])
+        lines = open(path, encoding="utf-8").read().strip().split("\n")
+        recs2 = recs + [json.loads(l) for l in lines]
+    out2 = mod.reconcile(recs2, reader_for(msgs))
+    check("round trip run 2: remaining target does not migrate "
+          "onto the already-resolved post",
+          out2["resolved"] == [] and out2["targets"] == 1
+          and out2["cannot_verify"] == [], str(out2))
+
+
+def test_closed_unverifiable_groups_no_duplicate_order():
+    mod = load_mod()
+    recs = [amb(), closed_unverifiable_entry(), reopened_entry(),
+            closed_unverifiable_entry()]
+    groups = mod.closed_unverifiable_groups(recs)
+    check("close -> reopen -> close again lists the group once",
+          len(groups) == 1
+          and groups[0]["channel"] == CHANNEL
+          and groups[0]["text"] == TEXT, str(groups))
 
 
 def test_no_reuse_across_targets():
@@ -1071,8 +1199,10 @@ def test_target_key_stable_and_distinct():
     k4 = mod.target_key(CHANNEL, THREAD_TS, "こんにちは、テストです。 ",
                         None)
     check("target_key: same target -> same key; different text -> "
-          "different key; whitespace difference -> same key",
-          k1 == k2 and k1 != k3 and k1 == k4)
+          "different key; whitespace difference -> different key "
+          "(raw text: the key must match build_targets units 1:1, "
+          "or whitespace variants collide)",
+          k1 == k2 and k1 != k3 and k1 != k4)
 
 
 def test_cannot_verify_increments_count():
@@ -1289,6 +1419,21 @@ def test_reopened_resets_count():
     out = mod.reconcile(recs, failing_reader(), counts=counts)
     check("reopened target counts from 0, not from the pre-close streak",
           out["counts"].get(key, {}).get("consecutive") == 1, str(out))
+
+
+def test_reopened_keeps_post_reopen_streak():
+    mod = load_mod()
+    key = mod.target_key(CHANNEL, THREAD_TS, TEXT, None)
+    counts = seed_counts(mod, key, 5)
+    # last_seen after the reopen: the 5-streak is post-reopen, so it
+    # is kept (only the pre-reopen streak resets). Without the
+    # reopened_time comparison the streak would be wiped on every
+    # run and never reach 24.
+    counts[key]["last_seen"] = "2026-11-14T07:00:00+0000"
+    recs = [amb(), closed_unverifiable_entry(), reopened_entry()]
+    out = mod.reconcile(recs, failing_reader(), counts=counts)
+    check("reopened target keeps the post-reopen streak",
+          out["counts"].get(key, {}).get("consecutive") == 6, str(out))
 
 
 def test_budget_skips_remaining_targets():
@@ -1526,7 +1671,14 @@ def main():
     test_no_text_after_close_forms_new_group()
     test_append_closed_no_text_roundtrip()
     test_load_records_broken_line_warns()
-    test_already_resolved_found_ts_not_reused()
+    test_spent_found_ts_migrates_to_text_resolution()
+    test_text_bearing_resolved_entry_excludes_target()
+    test_spent_migration_with_matching_mark()
+    test_spent_migration_later_candidate_mark_match()
+    test_spent_migration_no_double_resolution()
+    test_normal_then_migration_no_double_resolution()
+    test_round_trip_no_cross_run_double_resolution()
+    test_closed_unverifiable_groups_no_duplicate_order()
     test_no_reuse_across_targets()
     test_channel_post_resolves()
     test_unreadable_history_cannot_verify()
@@ -1565,6 +1717,7 @@ def main():
     test_closed_target_excluded_and_new_record_forms_new_target()
     test_reopened_readmits_closed_target()
     test_reopened_resets_count()
+    test_reopened_keeps_post_reopen_streak()
     test_budget_skips_remaining_targets()
     test_append_closed_unverifiable_roundtrip()
     test_cli_closes_at_24_and_notifies_once()

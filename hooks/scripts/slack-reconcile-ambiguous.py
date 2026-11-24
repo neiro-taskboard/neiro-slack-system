@@ -112,7 +112,11 @@ cannot_verify の終端（closed_unverifiable、中-3、2026-11-24）:
     さんと合意した本命案）。
   - 連続回数は状態ファイル
     slack-reconcile-ambiguous-cannot-verify.json に、対象キー
-    （channel, thread_ts, 正規化文面, 印）のダイジェストで保存する。
+    （channel, thread_ts, 生文面, 印）のダイジェストで保存する。
+    キーは build_targets() の対象単位と 1 対 1 に対応させること。
+    正規化文面でキーを作ると、空白違いの別対象が同じキーになり、
+    カウントの二重加算・片肺クローズ・巻き添えリセットが起きる
+    （中-3のブロッカー修正 2026-11-24）。
     履歴が読めた回（解決でも不一致でも）は 0 にリセットする。
     対象が照合対象から消えたらカウントも消す。台帳への対象ごとの
     進捗追記は入れない（既存方針：二重管理を避ける）。
@@ -412,12 +416,16 @@ def classify_error(reason):
 def target_key(channel, thread_ts, text, mark):
     """対象キーのダイジェスト。counts ファイルのキーにする。
 
-    (channel, thread_ts, 正規化文面, 印) を JSON にして sha256。
-    文面そのものをキーにしない（長い文面がキーになるとファイルが
-    読みにくくなるため）。表示用の情報は counts の値側に残す。
+    (channel, thread_ts, 生文面, 印) を JSON にして sha256。
+    build_targets() の対象単位（生文面のタプル）と 1 対 1 に対応
+    させること。正規化文面でキーを作ると、空白違いの別対象が同じ
+    キーになり、カウントの二重加算・片肺クローズ・巻き添えリセット
+    が起きる（中-3のブロッカー修正 2026-11-24）。文面の比較には
+    normalize_text を使うが、キーの生成には使わない。表示用の情報
+    は counts の値側に残す。
     """
     payload = json.dumps(
-        [channel, thread_ts, normalize_text(text),
+        [channel, thread_ts, text,
          list(mark) if mark else None],
         ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -440,6 +448,15 @@ def _earlier(a, b):
     if b is None:
         return a
     return a if a < b else b
+
+
+def _later(a, b):
+    """2つの epoch 秒のうち遅い方。None は「不明」として早い扱い。"""
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return a if a > b else b
 
 
 def parse_record_time(value):
@@ -549,19 +566,33 @@ def build_targets(records):
     エントリより前の記録は閉じた分として控え、エントリより後に出た
     記録は新しいグループになる（closed_no_text と同じ形）。
     reopened エントリがあるグループは、閉じた分を戻して改めて対象に
-    する（その対象は reopened=True になり、reconcile() 側でカウント
-    を 0 から数え直す）。reopened に text や印があれば、それに一致
-    するグループだけを戻す。
-    戻り値: (targets, used_found_ts)
+    する（その対象は reopened=True になり、reopened_time に再開行の
+    時刻が入る。reconcile() 側は last_seen が再開時刻より前の streak
+    だけ 0 から数え直す。台帳は追記専用のため reopened 行は残り続け、
+    無条件に数え直すと再開後の失敗が毎回消えて 24 回に到達しなくなる
+    ため、時刻比較が必要（中-3のブロッカー修正 2026-11-24））。
+    reopened に text や印があれば、それに一致するグループだけを戻す。
+    文面付きの resolved_by_thread_check エントリがあるグループは
+    対象から外す（送信側の文面なし訂正は対象を特定できないので外さ
+    ない。found_ts の使用済み扱いと、文面なし訂正由来の migratable
+    集合に対する reconcile() 側の移行で処理する）。
+    戻り値: (targets, used_found_ts, migratable_found_ts)
       targets: [{channel, thread_ts, text, mark, earliest_time,
-                 key, reopened}]
+                 key, reopened, reopened_time}]
         key は counts ファイル用のダイジェスト。reopened はこの対象が
-        reopened で戻ったものかどうか。
+        reopened で戻ったものかどうか。reopened_time は再開行の時刻
+        （epoch 秒。reopened でない対象は None）。
       used_found_ts: {(channel, thread_ts): {found_ts, ...}} — 既存の
         resolved_by_thread_check の found_ts は使用済みとして扱う。
+      migratable_found_ts: {(channel, thread_ts): {found_ts, ...}} —
+        文面なし訂正由来で、まだ特定の対象に消費されていない
+        found_ts。文面付き訂正で消費されたものは含まない（Run を
+        またいだ二重解決を防ぐ。agyレビュー指摘 2026-11-24）。
     """
     targets = {}
     used = {}
+    migratable = {}
+    consumed = {}
     closed_seg = {}  # key -> earliest_time（閉じた分の記録）
     for rec in records:
         channel = rec.get("channel") or ""
@@ -569,8 +600,35 @@ def build_targets(records):
         outcome = rec.get("outcome")
         if outcome == "resolved_by_thread_check":
             found = rec.get("found_ts")
+            text = rec.get("text")
             if found:
                 used.setdefault((channel, thread_ts), set()).add(found)
+                if text:
+                    # 文面付き訂正：その投稿は特定の対象に消費済み
+                    # なので移行の対象から外す（Run をまたいだ二重
+                    # 解決を防ぐ。agyレビュー指摘 2026-11-24）。
+                    consumed.setdefault((channel, thread_ts),
+                                        set()).add(found)
+                    migratable.setdefault((channel, thread_ts),
+                                          set()).discard(found)
+                elif found not in consumed.get((channel, thread_ts),
+                                               set()):
+                    # 文面なし訂正：まだ特定の対象に消費されていな
+                    # ければ移行可能。
+                    migratable.setdefault((channel, thread_ts),
+                                          set()).add(found)
+            # 文面付きの訂正は、その対象を照合対象から外す（解決済み
+            # の対象を毎時読み直す無駄と、履歴が読めなくなったときに
+            # closed_unverifiable へ誤移行するのを防ぐ。中-3のブロッカー
+            # 修正 2026-11-24）。文面なしの訂正（送信側の
+            # resolve_ambiguous）は対象を特定できないので外さない。
+            # 閉じた分に解決が付いた場合も closed_seg から外す（解決
+            # 済みの対象を reopened で戻さないため）。
+            if text:
+                key = (channel, thread_ts, text, record_mark(rec))
+                if key in targets:
+                    del targets[key]
+                closed_seg.pop(key, None)
             continue
         if outcome == "closed_unverifiable":
             key = (channel, thread_ts, rec.get("text") or "",
@@ -583,6 +641,7 @@ def build_targets(records):
         if outcome == "reopened":
             rtext = rec.get("text")
             rmark = record_mark(rec)
+            rtime = parse_record_time(rec.get("time"))
             for key in list(closed_seg):
                 if key[0] != channel or key[1] != thread_ts:
                     continue
@@ -596,13 +655,16 @@ def build_targets(records):
                     targets[key]["earliest_time"] = _earlier(
                         targets[key]["earliest_time"], seg_time)
                     targets[key]["reopened"] = True
+                    targets[key]["reopened_time"] = _later(
+                        targets[key].get("reopened_time"), rtime)
                 else:
                     targets[key] = {
                         "channel": key[0], "thread_ts": key[1],
                         "text": key[2], "mark": key[3],
                         "earliest_time": seg_time,
                         "key": target_key(key[0], key[1], key[2], key[3]),
-                        "reopened": True}
+                        "reopened": True,
+                        "reopened_time": rtime}
             continue
         if outcome != "ambiguous_post_outcome":
             continue
@@ -622,7 +684,7 @@ def build_targets(records):
                             "earliest_time": rec_time,
                             "key": target_key(channel, thread_ts, text,
                                               mark),
-                            "reopened": False}
+                            "reopened": False, "reopened_time": None}
         elif rec_time is not None:
             cur = targets[key]["earliest_time"]
             if cur is None or rec_time < cur:
@@ -630,7 +692,7 @@ def build_targets(records):
     ordered = sorted(targets.values(),
                      key=lambda t: (t["earliest_time"] is None,
                                     t["earliest_time"] or 0))
-    return ordered, used
+    return ordered, used, migratable
 
 
 def build_no_text_groups(records):
@@ -758,6 +820,13 @@ def reconcile(records, history_reader, mark_lookup=None, counts=None,
       - 予算切れで試さなかった対象は、増やしもリセットもしない。
       - 1回の照合で cannot_verify が2件以上かつ試した対象の半数超
         のときは、その回は誰のカウントも進めない。
+      - reopened で戻った対象は、last_seen が再開時刻より前の streak
+        だけ数え直す。再開後の失敗は残し、次回から加算する。
+      - 文面付きの resolved_by_thread_check がある対象は build_targets()
+        で対象から外れる。文面なしの訂正しかない対象は、一致する投稿
+        がすべて使用済み（found_ts 済み）なら文面付きの訂正として解決
+        に回す（次回から対象から外れる。印がある対象は印の一致も確認
+        する）。
     """
     if counts is None:
         counts = {}
@@ -765,7 +834,7 @@ def reconcile(records, history_reader, mark_lookup=None, counts=None,
         counts = dict(counts)
     if monotonic_fn is None:
         monotonic_fn = time.monotonic
-    targets, used = build_targets(records)
+    targets, used, migratable = build_targets(records)
     no_text_groups = build_no_text_groups(records)
     invalid_groups = build_invalid_channel_groups(records)
     total_no_text = sum(
@@ -777,13 +846,32 @@ def reconcile(records, history_reader, mark_lookup=None, counts=None,
     target_keys = {t["key"] for t in targets}
     # counts は今の対象だけ残す（解決済み・終端済みのキーは消す）。
     counts = {k: v for k, v in counts.items() if k in target_keys}
-    # reopened で戻った対象は数え直し（カウントを 0 から）。
+    # reopened で戻った対象は、再開前の streak だけ数え直す。台帳は
+    # 追記専用のため reopened 行は残り続け、無条件に pop すると再開
+    # 後の失敗が毎回消えて 24 回に到達しなくなる（中-3のブロッカー
+    # 修正 2026-11-24）。last_seen が再開時刻より前の streak だけ
+    # 消し、再開後の失敗は残す。時刻のない reopened 行は旧来どおり
+    # 数え直す（reopen_entry は常に時刻を書くので実務上は現れない）。
     for t in targets:
-        if t.get("reopened"):
+        if not t.get("reopened"):
+            continue
+        ent = counts.get(t["key"])
+        if ent is None:
+            continue
+        reopened_time = t.get("reopened_time")
+        last_seen = parse_record_time(ent.get("last_seen"))
+        if reopened_time is None or last_seen is None \
+                or last_seen < reopened_time:
             counts.pop(t["key"], None)
     resolved = []
     cannot_verify = []
     failed = []  # (target, reason) — 数え上げはループ後にまとめて行う
+    # 今回の照合実行で割り当てた found_ts（(channel, thread_ts)
+    # ごと）。台帳由来の使用済み（spent）と分離する：通常解決で
+    # 割り当てたばかりの投稿を、後続ターゲットの移行が「過去の
+    # 使用済み訂正」と誤認して二重解決するのを防ぐ（agyレビュー
+    # 指摘 2026-11-24）。移行で消費した ts もここで追跡する。
+    claimed = {}
     budget_skipped = []
     deadline = None
     if budget_secs is not None:
@@ -822,15 +910,67 @@ def reconcile(records, history_reader, mark_lookup=None, counts=None,
             failed.append((target, reason))
             continue
         spent = used.setdefault((channel, thread_ts), set())
+        # 台帳由来の使用済み（この実行では変えない）と、今回割り
+        # 当てたものは別々に扱う。
+        claimed_here = claimed.setdefault((channel, thread_ts), set())
         target_norm = normalize_text(text)
         candidates = [m for m in messages
                       if m.get("user") == self_id
                       and normalize_text(m.get("text") or "") == target_norm
                       and m.get("ts") not in spent
+                      and m.get("ts") not in claimed_here
                       and (lower is None
                            or is_reply_after(m.get("ts"), lower))]
         candidates.sort(key=lambda m: (m.get("ts") is None, m.get("ts") or ""))
         if not candidates:
+            # 一致する投稿がすべて使用済み（found_ts 済み）なら、その
+            # 対象は文面なしの訂正で既に解決済み。文面付きの訂正として
+            # 解決に回し、次回から build_targets() で対象から外れる
+            # ようにする（中-3のブロッカー修正 2026-11-24）。印が
+            # ある対象は印の一致も確認する（印違いの投稿への誤帰属を
+            # 防ぐため。印が分からない投稿は従来どおり文面で拾う）。
+            spent_match = [m for m in messages
+                           if m.get("user") == self_id
+                           and normalize_text(m.get("text") or "")
+                           == target_norm
+                           and m.get("ts") in migratable.get(
+                               (channel, thread_ts), set())
+                           and m.get("ts") not in claimed_here
+                           and (lower is None
+                                or is_reply_after(m.get("ts"), lower))]
+            spent_match.sort(key=lambda m: (m.get("ts") is None,
+                                            m.get("ts") or ""))
+            if spent_match:
+                # 印ガード：通常解決と同じく候補全体を印でフィルタ
+                # する。先頭だけ見ると、後続に合致印があっても見落
+                # として未解決のまま残る（agyレビュー指摘 2026-11-24）。
+                chosen = None
+                if mark is not None and mark_lookup is not None:
+                    try:
+                        marks = mark_lookup(channel, thread_ts)
+                    except Exception as exc:  # noqa: BLE001
+                        reason = str(exc)[:200]
+                        cannot_verify.append((channel, thread_ts, reason))
+                        failed.append((target, reason))
+                        continue
+                    for m in spent_match:
+                        m_mark = marks.get(m.get("ts"))
+                        if m_mark is not None \
+                                and tuple(m_mark) != tuple(mark):
+                            continue
+                        chosen = m
+                        break
+                else:
+                    chosen = spent_match[0]
+                if chosen is not None:
+                    found_ts = chosen.get("ts")
+                    claimed_here.add(found_ts)
+                    counts.pop(target["key"], None)
+                    resolved.append({"channel": channel,
+                                     "thread_ts": thread_ts,
+                                     "text": text, "found_ts": found_ts,
+                                     "mark": mark})
+                    continue
             # 履歴が読めた（検証できた）が一致なし。streak をリセット。
             counts.pop(target["key"], None)
             continue
@@ -858,7 +998,7 @@ def reconcile(records, history_reader, mark_lookup=None, counts=None,
                 counts.pop(target["key"], None)
                 continue
         found_ts = candidates[0].get("ts")
-        spent.add(found_ts)
+        claimed_here.add(found_ts)
         # 履歴が読めたので streak をリセット（解決時も）。
         counts.pop(target["key"], None)
         resolved.append({"channel": channel, "thread_ts": thread_ts,
@@ -1189,12 +1329,62 @@ def notify_transitions(notify_cmd, closed_unverifiable, closed_invalid):
     return True
 
 
+def closed_unverifiable_groups(records):
+    """現在 closed_unverifiable のままのグループを返す。
+
+    台帳を先頭から再生し、closed_unverifiable で閉じたグループのうち
+    reopened（文面・印が合うもの）や文面付きの resolved_by_thread_check
+    で解消されていないものを返す。reopen_entry() が「現在閉じている
+    対象にだけ reopened を追記する」ための判定に使う（中-3の追加修正
+    2026-11-24）。文面なしの resolved エントリは対象を特定できない
+    ので、ここでは解消とみなさない（誤って reopen を拒むより、無意味
+    な reopened 行が残る方が実害が小さいため）。build_targets() の
+    閉鎖・再開の扱いと同じ規則で再生する。
+    戻り値: [{channel, thread_ts, text, mark}]（出現順）。
+    """
+    closed = {}
+    order = []
+    seen = set()
+    for rec in records:
+        channel = rec.get("channel") or ""
+        thread_ts = rec.get("thread_ts") or ""
+        outcome = rec.get("outcome")
+        if outcome == "closed_unverifiable":
+            key = (channel, thread_ts, rec.get("text") or "",
+                   record_mark(rec))
+            if key not in closed and key not in seen:
+                order.append(key)
+                seen.add(key)
+            closed[key] = rec
+        elif outcome == "reopened":
+            rtext = rec.get("text")
+            rmark = record_mark(rec)
+            for key in list(closed):
+                if key[0] != channel or key[1] != thread_ts:
+                    continue
+                if rtext is not None \
+                        and normalize_text(rtext) != normalize_text(key[2]):
+                    continue
+                if rmark is not None and rmark != key[3]:
+                    continue
+                closed.pop(key)
+        elif outcome == "resolved_by_thread_check":
+            text = rec.get("text")
+            if text:
+                key = (channel, thread_ts, text, record_mark(rec))
+                closed.pop(key, None)
+    return [{"channel": k[0], "thread_ts": k[1], "text": k[2], "mark": k[3]}
+            for k in order if k in closed]
+
+
 def reopen_entry(ambiguous_file, lock_file, channel, thread_ts, text=None):
     """reopened エントリを台帳へ追記する（手動の戻す経路）。
 
     照合スクリプトのロックを取ってから追記する（照合中の追記と
-    並ばないように）。閉じた対象があるかは台帳を読んで確認し、
-    無ければ追記せずにその旨を返す（無意味なエントリを残さない）。
+    並ばないように）。現在 closed_unverifiable のままの対象があるか
+    は台帳を再生して確認し、無ければ追記せずにその旨を返す（無意味
+    なエントリを残さない。既に reopened 済み・解決済みの対象への
+    重複追記も防ぐ）。
     戻り値: 終了コード（0 = 正常。対象が無いときも 0 だが
     reopened: false）。
     """
@@ -1209,14 +1399,12 @@ def reopen_entry(ambiguous_file, lock_file, channel, thread_ts, text=None):
         return 2
     records = load_records(ambiguous_file)
     matched = False
-    for rec in records:
-        if rec.get("outcome") != "closed_unverifiable":
+    for g in closed_unverifiable_groups(records):
+        if g["channel"] != channel:
             continue
-        if (rec.get("channel") or "") != channel:
+        if (g["thread_ts"] or "") != thread_ts:
             continue
-        if (rec.get("thread_ts") or "") != thread_ts:
-            continue
-        if text is not None and normalize_text(rec.get("text") or "") \
+        if text is not None and normalize_text(g["text"] or "") \
                 != normalize_text(text):
             continue
         matched = True
