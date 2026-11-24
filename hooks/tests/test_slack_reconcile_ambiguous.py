@@ -69,6 +69,41 @@ Covered:
   30. CLI end-to-end with a fake read-meta: a marked record resolves
       when the dump says the same mark (and the resolved entry keeps
       the mark), and does not resolve when the dump says a different mark
+  31. classify_error buckets: self_id_unknown wins over history
+      unreadable; dump unreadable; history unreadable; other fallback
+  32. target_key is stable for the same target, distinct for different
+      text, and ignores whitespace differences (normalized text)
+  33. cannot_verify increments the consecutive count, no close yet
+  34. 23rd consecutive cannot_verify does not close yet
+  35. 24th consecutive cannot_verify closes as closed_unverifiable
+      (attempts/error_kind recorded, counts cleared)
+  36. history readable but no match resets the streak
+  37. resolved target drops its count
+  38. majority-failure run (4 of 6 unreadable) advances no counts;
+      a single failure among many still increments
+  39. single-target failure increments (no majority to suppress)
+  40. user-id channel closes as closed_invalid_channel without any
+      history read
+  41. no-text record with an invalid channel prefers
+      closed_invalid_channel over closed_no_text
+  42. an already-closed invalid channel is not closed again
+  43. a record appearing after a closed_invalid_channel entry forms
+      a new group and is closed again
+  44. closed_unverifiable target is excluded (no read); a record
+      after the close forms a new target
+  45. reopened entry re-admits the closed target
+  46. reopened target counts from 0, not from the pre-close streak
+  47. budget: targets beyond the time budget are skipped (not
+      cannot_verify, counts untouched)
+  48. append_closed_unverifiable writes the terminal entry, and a second
+      reconcile over the appended file closes nothing more
+  49. CLI: 24th cannot_verify closes, clears counts, exits 2, and the
+      transition notification is sent exactly once (with --request-id)
+  50. CLI: user-id channel closes as closed_invalid_channel, exits 0,
+      and a second run closes nothing more
+  51. CLI --reopen-channel appends a reopened entry for a closed target
+      and appends nothing when there is no closed target
+  52. notify failure returns False without raising
 """
 import importlib.util
 import contextlib
@@ -426,11 +461,16 @@ def run_cli(tmpdir, amb_path, last_path, cli, extra=None):
     # （2026-11-14、最初の実装で実際に混入したため）。
     # ロックも一時ファイルにしないと、実運用の照合とテストがロックを
     # 取り合ってしまう。
+    # --counts-file も一時ファイルにする（既定だと実ファイルの連続回数
+    # をテストが汚してしまう。2026-11-24、closed_unverifiable の導入時）。
+    # --no-notify も付ける（移行が起きても実 Slack へ通知しない）。
     cmd = [sys.executable, RECONCILE_PY,
            "--ambiguous-file", amb_path, "--last-run-file", last_path,
            "--runs-file", os.path.join(tmpdir, "runs.jsonl"),
            "--last-summary-file", os.path.join(tmpdir, "last-run.json"),
            "--lock-file", os.path.join(tmpdir, "reconcile.lock"),
+           "--counts-file", os.path.join(tmpdir, "counts.json"),
+           "--no-notify",
            "--slackcli", cli] + (extra or [])
     return subprocess.run(cmd, capture_output=True, text=True, timeout=60)
 
@@ -954,6 +994,8 @@ def test_cli_self_id_unknown_cannot_verify():
                "--runs-file", os.path.join(tmp, "runs.jsonl"),
                "--last-summary-file", os.path.join(tmp, "last-run.json"),
                "--lock-file", os.path.join(tmp, "reconcile.lock"),
+               "--counts-file", os.path.join(tmp, "counts.json"),
+               "--no-notify",
                "--slackcli", cli, "--force"]
         r = subprocess.run(cmd, capture_output=True, text=True,
                            timeout=60, env=env)
@@ -964,6 +1006,511 @@ def test_cli_self_id_unknown_cannot_verify():
               and len(lines) == 1,
               f"rc={r.returncode} out={r.stdout} err={r.stderr}")
 
+
+
+# --- closed_unverifiable / closed_invalid_channel（中-3、2026-11-24） ---
+
+def failing_reader(reason="history unreadable after retries: "
+                          "slackcli read failed (exit 1)"):
+    def reader(channel, thread_ts, oldest):
+        raise RuntimeError(reason)
+    return reader
+
+
+def seed_counts(mod, key, consecutive):
+    return {key: {"consecutive": consecutive,
+                  "last_error": "history unreadable",
+                  "error_kind": "history_unreadable",
+                  "last_seen": "2026-11-14T05:00:00+0000",
+                  "channel": CHANNEL, "thread_ts": THREAD_TS,
+                  "text_preview": TEXT[:60], "mark": None}}
+
+
+def closed_unverifiable_entry(channel=CHANNEL, thread_ts=THREAD_TS,
+                              text=TEXT, attempts=24):
+    return {"time": "2026-11-14T05:10:00+0000", "channel": channel,
+            "thread_ts": thread_ts, "outcome": "closed_unverifiable",
+            "closed_at": "2026-11-14T05:10:00+0000", "attempts": attempts,
+            "last_error": "history unreadable",
+            "error_kind": "history_unreadable",
+            "reason": "cannot_verify 24 consecutive runs", "text": text}
+
+
+def reopened_entry(channel=CHANNEL, thread_ts=THREAD_TS, text=None):
+    rec = {"time": "2026-11-14T06:10:00+0000", "channel": channel,
+           "thread_ts": thread_ts, "outcome": "reopened",
+           "reason": "manual reopen"}
+    if text is not None:
+        rec["text"] = text
+    return rec
+
+
+def test_classify_error_buckets():
+    mod = load_mod()
+    check("classify_error: self id unknown wins over history unreadable",
+          mod.classify_error(
+              "history unreadable in all workspaces: "
+              "self user id unknown for workspace 'muse-board'") ==
+          "self_id_unknown")
+    check("classify_error: dump unreadable",
+          mod.classify_error("dump unreadable in all workspaces") ==
+          "dump_unreadable")
+    check("classify_error: history unreadable",
+          mod.classify_error("history unreadable after retries") ==
+          "history_unreadable")
+    check("classify_error: unknown reason falls back to other",
+          mod.classify_error("api_rate_limited") == "other"
+          and mod.classify_error("") == "other")
+
+
+def test_target_key_stable_and_distinct():
+    mod = load_mod()
+    k1 = mod.target_key(CHANNEL, THREAD_TS, TEXT, None)
+    k2 = mod.target_key(CHANNEL, THREAD_TS, TEXT, None)
+    k3 = mod.target_key(CHANNEL, THREAD_TS, "別の文面です。", None)
+    k4 = mod.target_key(CHANNEL, THREAD_TS, "こんにちは、テストです。 ",
+                        None)
+    check("target_key: same target -> same key; different text -> "
+          "different key; whitespace difference -> same key",
+          k1 == k2 and k1 != k3 and k1 == k4)
+
+
+def test_cannot_verify_increments_count():
+    mod = load_mod()
+    out = mod.reconcile([amb()], failing_reader())
+    key = mod.target_key(CHANNEL, THREAD_TS, TEXT, None)
+    check("cannot_verify increments the consecutive count, no close yet",
+          len(out["cannot_verify"]) == 1
+          and out["closed_unverifiable"] == []
+          and out["counts"].get(key, {}).get("consecutive") == 1
+          and out["counts"][key]["error_kind"] == "history_unreadable",
+          str(out))
+
+
+def test_cannot_verify_23_no_close():
+    mod = load_mod()
+    key = mod.target_key(CHANNEL, THREAD_TS, TEXT, None)
+    out = mod.reconcile([amb()], failing_reader(),
+                        counts=seed_counts(mod, key, 22))
+    check("23rd consecutive cannot_verify does not close yet",
+          out["closed_unverifiable"] == []
+          and out["counts"].get(key, {}).get("consecutive") == 23,
+          str(out))
+
+
+def test_cannot_verify_24th_closes():
+    mod = load_mod()
+    key = mod.target_key(CHANNEL, THREAD_TS, TEXT, None)
+    out = mod.reconcile([amb()], failing_reader(),
+                        counts=seed_counts(mod, key, 23))
+    check("24th consecutive cannot_verify closes the target",
+          len(out["closed_unverifiable"]) == 1
+          and out["closed_unverifiable"][0]["attempts"] == 24
+          and out["closed_unverifiable"][0]["error_kind"] ==
+          "history_unreadable"
+          and out["closed_unverifiable"][0]["channel"] == CHANNEL
+          and out["closed_unverifiable"][0]["text"] == TEXT
+          and out["counts"] == {}
+          and len(out["cannot_verify"]) == 1, str(out))
+
+
+def test_clean_read_resets_count():
+    mod = load_mod()
+    key = mod.target_key(CHANNEL, THREAD_TS, TEXT, None)
+    out = mod.reconcile([amb()], reader_for([]),
+                        counts=seed_counts(mod, key, 5))
+    check("history readable but no match resets the streak",
+          out["resolved"] == [] and out["cannot_verify"] == []
+          and out["counts"] == {}, str(out))
+
+
+def test_resolved_resets_count():
+    mod = load_mod()
+    key = mod.target_key(CHANNEL, THREAD_TS, TEXT, None)
+    msgs = [{"ts": "1794594100.000000", "user": SELF, "text": TEXT}]
+    out = mod.reconcile([amb()], reader_for(msgs),
+                        counts=seed_counts(mod, key, 5))
+    check("resolved target drops its count",
+          len(out["resolved"]) == 1 and out["counts"] == {}, str(out))
+
+
+def test_majority_failure_suppresses_counts():
+    mod = load_mod()
+    # 6対象のうち4件が読めず2件が読めた回は、誰のカウントも進めない。
+    fail_channels = {make_id("C", "TESTCH%02d" % i) for i in range(4)}
+
+    def reader(channel, thread_ts, oldest):
+        if channel in fail_channels:
+            raise RuntimeError("history unreadable")
+        return [], SELF
+
+    recs = [amb(channel=make_id("C", "TESTCH%02d" % i),
+                thread_ts="179459400%d.000000" % i,
+                text="多数失敗 %d" % i) for i in range(6)]
+    out = mod.reconcile(recs, reader)
+    check("majority-failure run advances no counts",
+          out["counts_suppressed"] is True and out["counts"] == {}
+          and len(out["cannot_verify"]) == 4, str(out))
+    # 6対象のうち1件だけ失敗した回は、カウントが進む。
+    fail_one = {make_id("C", "TESTCH%02d" % 0)}
+
+    def reader_one(channel, thread_ts, oldest):
+        if channel in fail_one:
+            raise RuntimeError("history unreadable")
+        return [], SELF
+
+    out2 = mod.reconcile(recs, reader_one)
+    check("single failure among many still increments",
+          out2["counts_suppressed"] is False
+          and len(out2["counts"]) == 1
+          and list(out2["counts"].values())[0]["consecutive"] == 1,
+          str(out2))
+
+
+def test_single_target_failure_increments():
+    mod = load_mod()
+    out = mod.reconcile([amb()], failing_reader())
+    key = mod.target_key(CHANNEL, THREAD_TS, TEXT, None)
+    check("single-target failure increments (no majority to suppress)",
+          out["counts_suppressed"] is False
+          and out["counts"].get(key, {}).get("consecutive") == 1,
+          str(out))
+
+
+def test_invalid_channel_closed_without_read():
+    mod = load_mod()
+    calls = []
+
+    def reader(channel, thread_ts, oldest):
+        calls.append((channel, thread_ts))
+        return [], SELF
+
+    user_channel = make_id("U", "TESTUSER01")
+    out = mod.reconcile([amb(channel=user_channel)], reader)
+    check("user-id channel closes as closed_invalid_channel, no read",
+          out["resolved"] == [] and out["targets"] == 0
+          and len(out["closed_invalid_channel"]) == 1
+          and out["closed_invalid_channel"][0]["count"] == 1
+          and calls == [], str(out))
+
+
+def test_invalid_channel_no_text_prefers_invalid():
+    mod = load_mod()
+
+    def reader(channel, thread_ts, oldest):
+        return [], SELF
+
+    user_channel = make_id("U", "TESTUSER01")
+    out = mod.reconcile([amb(channel=user_channel, text=None)], reader)
+    check("no-text record with invalid channel -> closed_invalid_channel",
+          len(out["closed_invalid_channel"]) == 1
+          and out["closed_no_text"] == [], str(out))
+
+
+def test_invalid_channel_already_closed_not_reclosed():
+    mod = load_mod()
+
+    def reader(channel, thread_ts, oldest):
+        return [], SELF
+
+    user_channel = make_id("U", "TESTUSER01")
+    closed = {"time": "2026-11-13T18:25:00+0000", "channel": user_channel,
+              "thread_ts": THREAD_TS, "outcome": "closed_invalid_channel",
+              "closed_at": "2026-11-13T18:25:00+0000",
+              "reason": "channel is not a readable conversation id",
+              "count": 1}
+    out = mod.reconcile([amb(channel=user_channel), closed], reader)
+    check("already-closed invalid channel is not closed again",
+          out["closed_invalid_channel"] == [], str(out))
+
+
+def test_invalid_channel_after_close_forms_new_group():
+    mod = load_mod()
+
+    def reader(channel, thread_ts, oldest):
+        return [], SELF
+
+    user_channel = make_id("U", "TESTUSER01")
+    closed = {"time": "2026-11-13T18:25:00+0000", "channel": user_channel,
+              "thread_ts": THREAD_TS, "outcome": "closed_invalid_channel",
+              "closed_at": "2026-11-13T18:25:00+0000",
+              "reason": "channel is not a readable conversation id",
+              "count": 1}
+    recs = [amb(channel=user_channel), closed,
+            amb(channel=user_channel, time_s="2026-11-14T18:20:00+0000")]
+    out = mod.reconcile(recs, reader)
+    check("record after closed_invalid_channel forms a new group",
+          len(out["closed_invalid_channel"]) == 1
+          and out["closed_invalid_channel"][0]["count"] == 1, str(out))
+
+
+def test_closed_target_excluded_and_new_record_forms_new_target():
+    mod = load_mod()
+    calls = []
+
+    def reader(channel, thread_ts, oldest):
+        calls.append((channel, thread_ts))
+        return [], SELF
+
+    recs = [amb(), closed_unverifiable_entry()]
+    out = mod.reconcile(recs, reader)
+    check("closed target excluded, no history read",
+          out["targets"] == 0 and calls == []
+          and out["closed_unverifiable"] == [], str(out))
+    recs2 = recs + [amb(time_s="2026-11-14T18:20:00+0000")]
+    out2 = mod.reconcile(recs2, reader)
+    check("record after close forms a new target",
+          out2["targets"] == 1 and len(calls) == 1, str(out2))
+
+
+def test_reopened_readmits_closed_target():
+    mod = load_mod()
+    calls = []
+
+    def reader(channel, thread_ts, oldest):
+        calls.append((channel, thread_ts))
+        return [], SELF
+
+    recs = [amb(), closed_unverifiable_entry()]
+    out = mod.reconcile(recs, reader)
+    check("closed target excluded before reopen",
+          out["targets"] == 0 and calls == [], str(out))
+    recs2 = recs + [reopened_entry()]
+    out2 = mod.reconcile(recs2, reader)
+    check("reopened target is a target again and read",
+          out2["targets"] == 1 and len(calls) == 1, str(out2))
+
+
+def test_reopened_resets_count():
+    mod = load_mod()
+    key = mod.target_key(CHANNEL, THREAD_TS, TEXT, None)
+    counts = seed_counts(mod, key, 5)
+    recs = [amb(), closed_unverifiable_entry(), reopened_entry()]
+    out = mod.reconcile(recs, failing_reader(), counts=counts)
+    check("reopened target counts from 0, not from the pre-close streak",
+          out["counts"].get(key, {}).get("consecutive") == 1, str(out))
+
+
+def test_budget_skips_remaining_targets():
+    mod = load_mod()
+    now = [0.0]
+
+    def clock():
+        return now[0]
+
+    def reader(channel, thread_ts, oldest):
+        now[0] += 6.0
+        return [], SELF
+
+    recs = [amb(text="budget %d" % i,
+                thread_ts="179459400%d.000000" % i) for i in range(3)]
+    out = mod.reconcile(recs, reader, budget_secs=10, monotonic_fn=clock)
+    check("budget: targets beyond the budget are skipped, not cannot_verify",
+          len(out["budget_skipped"]) == 1 and out["cannot_verify"] == []
+          and out["targets"] == 3 and out["counts"] == {}, str(out))
+
+
+def test_append_closed_unverifiable_roundtrip():
+    mod = load_mod()
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "amb.jsonl")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(json.dumps(amb(), ensure_ascii=False) + "\n")
+        closed = [{"channel": CHANNEL, "thread_ts": THREAD_TS,
+                   "text": TEXT, "mark": None, "attempts": 24,
+                   "last_error": "history unreadable",
+                   "error_kind": "history_unreadable",
+                   "closed_at": "2026-11-14T05:10:00+0000"}]
+        mod.append_closed_unverifiable(path, closed)
+        lines = open(path, encoding="utf-8").read().strip().split("\n")
+        entry = json.loads(lines[1])
+        check("append_closed_unverifiable writes the terminal entry",
+              len(lines) == 2
+              and entry.get("outcome") == "closed_unverifiable"
+              and entry.get("attempts") == 24
+              and entry.get("error_kind") == "history_unreadable"
+              and entry.get("text") == TEXT, str(lines))
+        out = mod.reconcile(mod.load_records(path), reader_for([]))
+        check("second reconcile over the appended file closes nothing more",
+              out["targets"] == 0 and out["closed_unverifiable"] == [],
+              str(out))
+
+
+def fake_self_id_unknown_cli(tmp, messages_by_key=None):
+    """whoami が失敗し、conversations read は辞書から返す fake slackcli。
+
+    ids.json に bot ID が無いと self_user_id が None になり、
+    cannot_verify（self_id_unknown）になる。読み取り自体は成功する
+    のでリトライの待ち時間は発生しない。
+    """
+    path = os.path.join(tmp, "slackcli")
+    data_path = os.path.join(tmp, "data.json")
+    with open(data_path, "w", encoding="utf-8") as f:
+        json.dump({f"{k[0]}|{k[1]}": v
+                   for k, v in (messages_by_key or {}).items()},
+                  f, ensure_ascii=False)
+    body = (
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "data = json.load(open(sys.argv[0].replace('slackcli', 'data.json'), encoding='utf-8'))\n"
+        "args = sys.argv[1:]\n"
+        "if args[:2] == ['auth', 'whoami']:\n"
+        "    sys.exit(1)\n"
+        "channel = args[2]\n"
+        "thread_ts = ''\n"
+        "oldest = '0'\n"
+        "i = 3\n"
+        "while i < len(args):\n"
+        "    if args[i] == '--thread-ts': thread_ts = args[i+1]; i += 2\n"
+        "    elif args[i] == '--oldest': oldest = args[i+1]; i += 2\n"
+        "    elif args[i] == '--workspace': i += 2\n"
+        "    else: i += 1\n"
+        "msgs = [m for m in data.get(channel + '|' + thread_ts, []) if float(m['ts']) > float(oldest)]\n"
+        "print(json.dumps({'channel_id': channel, 'message_count': len(msgs), 'has_more': False, 'messages': msgs}, ensure_ascii=False))\n"
+    )
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(body)
+    os.chmod(path, 0o755)
+    return path
+
+
+def fake_notify_cmd(tmp):
+    """呼ばれた引数を calls.jsonl に残す fake 通知コマンド。"""
+    path = os.path.join(tmp, "notify.sh")
+    calls_path = os.path.join(tmp, "calls.jsonl")
+    body = (
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "open(sys.argv[0].replace('notify.sh', 'calls.jsonl'), 'a', "
+        "encoding='utf-8').write(json.dumps(sys.argv[1:], "
+        "ensure_ascii=False) + '\\n')\n")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(body)
+    os.chmod(path, 0o755)
+    return path, calls_path
+
+
+def test_cli_closes_at_24_and_notifies_once():
+    with tempfile.TemporaryDirectory() as tmp:
+        mod = load_mod()
+        amb_path = os.path.join(tmp, "amb.jsonl")
+        last_path = os.path.join(tmp, "last.json")
+        counts_path = os.path.join(tmp, "counts.json")
+        with open(amb_path, "w", encoding="utf-8") as f:
+            f.write(json.dumps(amb(), ensure_ascii=False) + "\n")
+        key = mod.target_key(CHANNEL, THREAD_TS, TEXT, None)
+        with open(counts_path, "w", encoding="utf-8") as f:
+            json.dump(seed_counts(mod, key, 23), f)
+        cli = fake_self_id_unknown_cli(tmp, {})
+        notify, calls_path = fake_notify_cmd(tmp)
+        ids_path = _write_ids(
+            tmp, {"channel_welcome_muse_torishimariyakai": CHANNEL})
+        env = dict(os.environ)
+        env["NEIRO_SLACK_IDS_PATH"] = ids_path
+        cmd = [sys.executable, RECONCILE_PY,
+               "--ambiguous-file", amb_path, "--last-run-file", last_path,
+               "--runs-file", os.path.join(tmp, "runs.jsonl"),
+               "--last-summary-file", os.path.join(tmp, "last-run.json"),
+               "--lock-file", os.path.join(tmp, "reconcile.lock"),
+               "--counts-file", counts_path,
+               "--notify-cmd", notify,
+               "--slackcli", cli, "--force"]
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=60, env=env)
+        out = json.loads(r.stdout[r.stdout.find("{"):])
+        lines = open(amb_path, encoding="utf-8").read().strip().split("\n")
+        entry = json.loads(lines[1]) if len(lines) > 1 else {}
+        counts_after = json.load(open(counts_path, encoding="utf-8"))
+        calls = [json.loads(line) for line in
+                 open(calls_path, encoding="utf-8")] \
+            if os.path.exists(calls_path) else []
+        check("CLI: 24th cannot_verify closes, counts cleared, notified once",
+              r.returncode == 2 and out["closed_unverifiable"] == 1
+              and out["notified"] is True
+              and entry.get("outcome") == "closed_unverifiable"
+              and entry.get("attempts") == 24
+              and entry.get("error_kind") == "self_id_unknown"
+              and counts_after == {}
+              and len(calls) == 1
+              and "closed_unverifiable" in " ".join(calls[0])
+              and "--request-id" in calls[0],
+              f"rc={r.returncode} out={r.stdout} err={r.stderr}")
+
+
+def test_cli_invalid_channel_closes():
+    with tempfile.TemporaryDirectory() as tmp:
+        amb_path = os.path.join(tmp, "amb.jsonl")
+        last_path = os.path.join(tmp, "last.json")
+        user_channel = make_id("U", "TESTUSER01")
+        with open(amb_path, "w", encoding="utf-8") as f:
+            f.write(json.dumps(amb(channel=user_channel),
+                               ensure_ascii=False) + "\n")
+        cli = fake_slackcli(tmp, {})  # この記録では呼ばれない
+        r = run_cli(tmp, amb_path, last_path, cli, ["--force"])
+        out = json.loads(r.stdout[r.stdout.find("{"):])
+        lines = open(amb_path, encoding="utf-8").read().strip().split("\n")
+        entry = json.loads(lines[1]) if len(lines) > 1 else {}
+        check("CLI: user-id channel closes as closed_invalid_channel, exits 0",
+              r.returncode == 0 and out["closed_invalid_channel"] == 1
+              and out["targets"] == 0
+              and entry.get("outcome") == "closed_invalid_channel",
+              f"rc={r.returncode} out={r.stdout} err={r.stderr}")
+        r2 = run_cli(tmp, amb_path, last_path, cli, ["--force"])
+        out2 = json.loads(r2.stdout[r2.stdout.find("{"):])
+        lines2 = open(amb_path, encoding="utf-8").read().strip().split("\n")
+        check("CLI: second run closes nothing more",
+              r2.returncode == 0 and out2["closed_invalid_channel"] == 0
+              and len(lines2) == 2, f"out={r2.stdout}")
+
+
+def test_cli_reopen_readmits():
+    with tempfile.TemporaryDirectory() as tmp:
+        amb_path = os.path.join(tmp, "amb.jsonl")
+        with open(amb_path, "w", encoding="utf-8") as f:
+            f.write(json.dumps(amb(), ensure_ascii=False) + "\n")
+            f.write(json.dumps(closed_unverifiable_entry(),
+                               ensure_ascii=False) + "\n")
+        lock = os.path.join(tmp, "reconcile.lock")
+        base = [sys.executable, RECONCILE_PY,
+                "--ambiguous-file", amb_path, "--lock-file", lock]
+        r = subprocess.run(base + ["--reopen-channel", CHANNEL,
+                                   "--reopen-thread-ts", THREAD_TS],
+                           capture_output=True, text=True, timeout=60)
+        out = json.loads(r.stdout[r.stdout.find("{"):])
+        lines = open(amb_path, encoding="utf-8").read().strip().split("\n")
+        check("CLI reopen appends reopened entry for a closed target",
+              r.returncode == 0 and out.get("reopened") is True
+              and len(lines) == 3
+              and json.loads(lines[2]).get("outcome") == "reopened",
+              f"rc={r.returncode} out={r.stdout} err={r.stderr}")
+        r2 = subprocess.run(base + ["--reopen-channel",
+                                    make_id("C", "TESTOTHER1"),
+                                    "--reopen-thread-ts", THREAD_TS],
+                            capture_output=True, text=True, timeout=60)
+        out2 = json.loads(r2.stdout[r2.stdout.find("{"):])
+        lines2 = open(amb_path, encoding="utf-8").read().strip().split("\n")
+        check("CLI reopen with no closed target appends nothing",
+              r2.returncode == 0 and out2.get("reopened") is False
+              and len(lines2) == 3, f"out={r2.stdout}")
+
+
+def test_notify_failure_tolerated():
+    mod = load_mod()
+    with tempfile.TemporaryDirectory() as tmp:
+        ids_path = _write_ids(
+            tmp, {"channel_welcome_muse_torishimariyakai": CHANNEL})
+        old = _set_ids_env(ids_path)
+        try:
+            closed = [{"channel": CHANNEL, "thread_ts": THREAD_TS,
+                       "text": TEXT, "mark": None, "attempts": 24,
+                       "last_error": "history unreadable",
+                       "error_kind": "history_unreadable",
+                       "closed_at": "2026-11-14T05:10:00+0000"}]
+            ok = mod.notify_transitions("/bin/false", closed, [])
+            check("notify failure returns False without raising",
+                  ok is False, "")
+        finally:
+            _restore_ids_env(old)
 
 
 def main():
@@ -1002,6 +1549,28 @@ def main():
     test_self_id_whoami_garbage_rejected()
     test_self_id_whoami_w_shape()
     test_cli_self_id_unknown_cannot_verify()
+    test_classify_error_buckets()
+    test_target_key_stable_and_distinct()
+    test_cannot_verify_increments_count()
+    test_cannot_verify_23_no_close()
+    test_cannot_verify_24th_closes()
+    test_clean_read_resets_count()
+    test_resolved_resets_count()
+    test_majority_failure_suppresses_counts()
+    test_single_target_failure_increments()
+    test_invalid_channel_closed_without_read()
+    test_invalid_channel_no_text_prefers_invalid()
+    test_invalid_channel_already_closed_not_reclosed()
+    test_invalid_channel_after_close_forms_new_group()
+    test_closed_target_excluded_and_new_record_forms_new_target()
+    test_reopened_readmits_closed_target()
+    test_reopened_resets_count()
+    test_budget_skips_remaining_targets()
+    test_append_closed_unverifiable_roundtrip()
+    test_cli_closes_at_24_and_notifies_once()
+    test_cli_invalid_channel_closes()
+    test_cli_reopen_readmits()
+    test_notify_failure_tolerated()
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 
