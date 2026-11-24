@@ -26,6 +26,8 @@ Covered:
  13. mixed: processing 400s (under) + pending 200s (over) -> exit 1,
       oldest is the pending one that exceeded its threshold
  14. processing threshold env override is respected
+ 15. processing_count is reported (2026-11-24, Yanayana's suggestion):
+     mixed processing + pending, and all-pending -> 0
 """
 import json
 import os
@@ -226,6 +228,28 @@ class OldestUnprocessedTest(unittest.TestCase):
         code, out = self.run_check()
         self.assertEqual(code, 1)
         self.assertEqual(out["processing_threshold_secs"], 300)
+
+    # 15. processing_count is reported (2026-11-24, Yanayana's
+    # suggestion for the alert text): mixed processing + pending
+    # counts only the processing ones, all-pending reports 0, and
+    # done/dead records are not counted in either number.
+    def test_processing_count_reported(self):
+        self.write_state([self.rec(age_secs=650),
+                          self.rec(eid=EID2, status="pending",
+                                   age_secs=200),
+                          self.rec(eid=WS_MUSE + ":" + CHANNEL + ":1794476002.000001",
+                                   status="done", age_secs=900)])
+        code, out = self.run_check()
+        self.assertEqual(code, 1)
+        self.assertEqual(out["unprocessed_count"], 2)
+        self.assertEqual(out["processing_count"], 1)
+        self.write_state([self.rec(status="pending", age_secs=200),
+                          self.rec(eid=EID2, status="waiting",
+                                   age_secs=200)])
+        code, out = self.run_check()
+        self.assertEqual(code, 1)
+        self.assertEqual(out["unprocessed_count"], 2)
+        self.assertEqual(out["processing_count"], 0)
 
 
 if __name__ == "__main__":

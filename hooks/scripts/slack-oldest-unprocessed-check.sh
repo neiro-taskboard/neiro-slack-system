@@ -28,9 +28,13 @@
 # 10 分で警告は出る。誰も掴んでいない pending / failed / waiting は
 # 180 秒のまま。警告の対象は「自分のしきい値を超えたもの」のうち最古
 # のもので、超えたものが無ければ最古の未処理を情報として出す。
-# 出力は JSON 1行：{"unprocessed_count": N, "oldest_event_id": ...,
-# "oldest_age_secs": ..., "threshold_secs": 180,
+# 出力は JSON 1行：{"unprocessed_count": N, "processing_count": M,
+# "oldest_event_id": ..., "oldest_age_secs": ...,
+# "threshold_secs": 180,
 # "processing_threshold_secs": 600, "oldest_threshold_secs": ...}。
+# processing_count は未処理のうち status が processing の件数
+# （2026-11-24、Yanayana さんの提案を取り込み：警告文に載せると、
+# 受け手は「止まっているのか、捌いている最中なのか」が分かる）。
 # 重複抑止の署名には oldest_event_id だけを使う（年齢の秒数を入れると
 # 毎回変わって連投になるため）。年齢と件数は Slack 警告文に入れる。
 #
@@ -68,6 +72,7 @@ warn_oldest_id = None
 warn_oldest_age = None
 warn_oldest_threshold = None
 count = 0
+processing_count = 0
 if os.path.exists(state_file):
     with open(state_file, encoding="utf-8") as f:
         for line in f:
@@ -87,6 +92,8 @@ if os.path.exists(state_file):
                 continue
             age = (now - started).total_seconds()
             count += 1
+            if rec.get("status") == "processing":
+                processing_count += 1
             this_threshold = processing_threshold if rec.get("status") == "processing" else threshold
             if oldest_age is None or age > oldest_age:
                 oldest_age = age
@@ -103,6 +110,7 @@ if warn_oldest_id is not None:
 
 print(json.dumps({
     "unprocessed_count": count,
+    "processing_count": processing_count,
     "oldest_event_id": oldest_id,
     "oldest_age_secs": int(oldest_age) if oldest_age is not None else None,
     "threshold_secs": threshold,
