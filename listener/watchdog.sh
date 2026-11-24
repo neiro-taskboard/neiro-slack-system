@@ -202,6 +202,9 @@ fi
 # 入れると 5 分ごとに変わって連投になるため）。復旧したら状態ファイルを
 # 消すので、次の詰まりではまた警告が出る。警告の送信に失敗しても
 # ウォッチドッグは止めない。
+# 2026-11-24：詰まりが続く間、最古の入れ替わりごとに警告が出て煩かった
+# （半日で6件、すべて処理中の警告）ため、エピソード単位のクールダウン
+# （前回の警告から 3600 秒以内は送らない）を追加。詳細は下の実装部。
 OLDEST_CHECK="/home/hatch/workspace/neiro-slack-system/hooks/scripts/slack-oldest-unprocessed-check.sh"
 OLDEST_STATE="/home/hatch/hooks/state/oldest-unprocessed-warning.state"
 OLDEST_FLAG="/home/hatch/hooks/state/oldest-unprocessed-warning.flag"
@@ -214,7 +217,28 @@ if [ -x "$OLDEST_CHECK" ]; then
     if [ -n "$OLDEST_ID" ]; then
       printf '%s' "$OLDEST_ID" > "$OLDEST_FLAG"
       OLDEST_SIG="$(printf '%s' "$OLDEST_ID" | md5sum | cut -d' ' -f1)"
-      if [ ! -f "$OLDEST_STATE" ] || [ "$(cat "$OLDEST_STATE" 2>/dev/null)" != "$OLDEST_SIG" ]; then
+      # エピソード単位のクールダウン（2026-11-24）：状態ファイルには
+      # 「署名 送信時刻（epoch秒）」を持つ。同じ詰まりが続く間は最古が
+      # 入れ替わるたびに警告が出て煩かった（半日で6件）ため、前回の
+      # 警告から 3600 秒以内は、最古が入れ替わっていても送らない。
+      # 最初の1件は常に出るので、詰まりの検知自体は遅れない。詰まりが
+      # 解消すれば状態ファイルごと消えるので、次の詰まりではまた最初
+      # の1件から出る。古い形式（署名だけ）の状態ファイルは時刻 0 と
+      # して読む（＝クールダウンなしで送れる）。
+      OLDEST_PREV_SIG=""
+      OLDEST_PREV_EPOCH=0
+      if [ -f "$OLDEST_STATE" ]; then
+        read -r OLDEST_PREV_SIG OLDEST_PREV_EPOCH < "$OLDEST_STATE" || true
+        case "$OLDEST_PREV_EPOCH" in ''|*[!0-9]*) OLDEST_PREV_EPOCH=0 ;; esac
+      fi
+      OLDEST_NOW_EPOCH="$(date +%s)"
+      OLDEST_SEND=0
+      if [ "$OLDEST_PREV_SIG" != "$OLDEST_SIG" ]; then
+        if [ -z "$OLDEST_PREV_SIG" ] || [ $((OLDEST_NOW_EPOCH - OLDEST_PREV_EPOCH)) -ge 3600 ]; then
+          OLDEST_SEND=1
+        fi
+      fi
+      if [ "$OLDEST_SEND" = "1" ]; then
         # 処理中の件数も載せる（2026-11-24、Yanayana さんの提案を取り込み）。
         # 処理中が0件ならワーカーが掴んでいない＝止まっている疑いが強く、
         # 1件以上なら順に捌いている最中の可能性がある、と受け手が分かる。
@@ -224,7 +248,7 @@ if [ -x "$OLDEST_CHECK" ]; then
           OLDEST_MSG="最古の未処理イベントが${OLDEST_THRESH:-180}秒以上経っています：${OLDEST_ID}（${OLDEST_AGE}秒、未処理 ${OLDEST_COUNT}件、うち処理中 0件）。フックのワーカーが起動していないか、処理が詰まっている可能性があります。"
         fi
         if [ -n "$ALERT_CHANNEL" ] && /home/hatch/hooks/scripts/slack-send-locked.sh --channel "$ALERT_CHANNEL" --workspace muse-board --request-id "oldest-unprocessed-$OLDEST_SIG" --message "$OLDEST_MSG" >/dev/null 2>&1; then
-          printf '%s' "$OLDEST_SIG" > "$OLDEST_STATE"
+          printf '%s %s\n' "$OLDEST_SIG" "$OLDEST_NOW_EPOCH" > "$OLDEST_STATE"
         fi
       fi
     else

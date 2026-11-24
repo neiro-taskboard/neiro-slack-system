@@ -14,7 +14,7 @@ Covered:
   1. state file missing -> exit 0, 0 unprocessed, oldest null
   2. all done/dead -> exit 0, 0 unprocessed
   3. young processing (60s) -> exit 0, counted, not warned
-  4. processing below its own threshold (200s < 600s) -> exit 0
+  4. processing below its own threshold (900s < 1800s) -> exit 0
   5. boundary for pending: 179s -> exit 0; 181s -> exit 1
   6. oldest wins among several unprocessed events
   7. malformed lines are skipped
@@ -118,17 +118,18 @@ class OldestUnprocessedTest(unittest.TestCase):
         self.assertEqual(out["oldest_event_id"], EID)
         self.assertGreaterEqual(out["oldest_age_secs"], 60)
 
-    # 4. processing below its own threshold (200s < 600s) -> exit 0.
-    # A worker holding an event while it composes a heavy reply
-    # (2026-11-23: 323s for a commit + 429 tests) must not warn.
+    # 4. processing below its own threshold (900s < 1800s) -> exit 0.
+    # A worker holding an event while it works through a busy queue
+    # (2026-11-24: 10 events held, oldest 770s, all processing, six
+    # alerts in an afternoon) must not warn.
     def test_processing_below_own_threshold_no_warning(self):
-        self.write_state([self.rec(age_secs=200)])
+        self.write_state([self.rec(age_secs=900)])
         code, out = self.run_check()
         self.assertEqual(code, 0)
         self.assertEqual(out["unprocessed_count"], 1)
         self.assertEqual(out["oldest_event_id"], EID)
-        self.assertGreaterEqual(out["oldest_age_secs"], 200)
-        self.assertEqual(out["oldest_threshold_secs"], 600)
+        self.assertGreaterEqual(out["oldest_age_secs"], 900)
+        self.assertEqual(out["oldest_threshold_secs"], 1800)
 
     # 5. boundary for pending: 179s -> exit 0; 181s -> exit 1
     def test_boundary(self):
@@ -186,23 +187,23 @@ class OldestUnprocessedTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(out["threshold_secs"], 60)
 
-    # 11. processing above its own threshold (650s) -> exit 1.
+    # 11. processing above its own threshold (1900s) -> exit 1.
     # A stuck worker still alerts, just later.
     def test_old_processing_warns(self):
-        self.write_state([self.rec(age_secs=650)])
+        self.write_state([self.rec(age_secs=1900)])
         code, out = self.run_check()
         self.assertEqual(code, 1)
         self.assertEqual(out["unprocessed_count"], 1)
         self.assertEqual(out["oldest_event_id"], EID)
-        self.assertGreaterEqual(out["oldest_age_secs"], 650)
-        self.assertEqual(out["oldest_threshold_secs"], 600)
+        self.assertGreaterEqual(out["oldest_age_secs"], 1900)
+        self.assertEqual(out["oldest_threshold_secs"], 1800)
 
-    # 12. processing boundary: 599s -> exit 0; 601s -> exit 1
+    # 12. processing boundary: 1799s -> exit 0; 1801s -> exit 1
     def test_processing_boundary(self):
-        self.write_state([self.rec(age_secs=599)])
+        self.write_state([self.rec(age_secs=1799)])
         code, _ = self.run_check()
         self.assertEqual(code, 0)
-        self.write_state([self.rec(age_secs=601)])
+        self.write_state([self.rec(age_secs=1801)])
         code, _ = self.run_check()
         self.assertEqual(code, 1)
 

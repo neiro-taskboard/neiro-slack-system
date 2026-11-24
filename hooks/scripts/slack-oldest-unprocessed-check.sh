@@ -28,10 +28,14 @@
 # 10 分で警告は出る。誰も掴んでいない pending / failed / waiting は
 # 180 秒のまま。警告の対象は「自分のしきい値を超えたもの」のうち最古
 # のもので、超えたものが無ければ最古の未処理を情報として出す。
+# 2026-11-24：600 秒でも、ワーカーが順に捌いている最中の警告が半日で
+# 6件出て受け手（オーナー）から煩いと指摘があったため、processing の
+# しきい値を 1800 秒へ上げる。掴んだまま30分は、止まった疑いが強い
+# 水準。あわせて watchdog 側にエピソード単位のクールダウンを入れた。
 # 出力は JSON 1行：{"unprocessed_count": N, "processing_count": M,
 # "oldest_event_id": ..., "oldest_age_secs": ...,
 # "threshold_secs": 180,
-# "processing_threshold_secs": 600, "oldest_threshold_secs": ...}。
+# "processing_threshold_secs": 1800, "oldest_threshold_secs": ...}。
 # processing_count は未処理のうち status が processing の件数
 # （2026-11-24、Yanayana さんの提案を取り込み：警告文に載せると、
 # 受け手は「止まっているのか、捌いている最中なのか」が分かる）。
@@ -41,12 +45,12 @@
 # 環境変数（テスト用）：SLACK_OLDEST_UNPROCESSED_STATE_FILE
 # （既定 /home/hatch/hooks/state/slack-events.jsonl）、
 # SLACK_OLDEST_UNPROCESSED_THRESHOLD_SECS（既定 180）、
-# SLACK_OLDEST_UNPROCESSED_PROCESSING_THRESHOLD_SECS（既定 600）。
+# SLACK_OLDEST_UNPROCESSED_PROCESSING_THRESHOLD_SECS（既定 1800）。
 set -u
 
 STATE_FILE="${SLACK_OLDEST_UNPROCESSED_STATE_FILE:-/home/hatch/hooks/state/slack-events.jsonl}"
 THRESHOLD_SECS="${SLACK_OLDEST_UNPROCESSED_THRESHOLD_SECS:-180}"
-PROCESSING_THRESHOLD_SECS="${SLACK_OLDEST_UNPROCESSED_PROCESSING_THRESHOLD_SECS:-600}"
+PROCESSING_THRESHOLD_SECS="${SLACK_OLDEST_UNPROCESSED_PROCESSING_THRESHOLD_SECS:-1800}"
 
 python3 - "$STATE_FILE" "$THRESHOLD_SECS" "$PROCESSING_THRESHOLD_SECS" <<'PYEOF'
 import json
