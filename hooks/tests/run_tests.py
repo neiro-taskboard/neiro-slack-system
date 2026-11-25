@@ -1,223 +1,86 @@
 #!/usr/bin/env python3
-"""Tests for ~/hooks/scripts/slack-poll.py.
+"""Run the whole hooks test suite: every test_*.py in this directory.
 
-Mirrors the approach Yama shared in the muse取締役会 thread
-(#slack-へようこそ, 2026-11-12): no real Slack calls, temporary
-files only. Run with: python3 run_tests.py
+中-6 (Yama's Claude Code audit, 2026-11-21): run_tests.py used to contain
+only 11 inline duplicates of the slack-poll tests, while the repo now has
+23 test files in two styles. The README's "run run_tests.py before
+commit/push" gate therefore passed while most of the suite never ran.
+
+This runner fixes that without changing any test file:
+  1. unittest suites: `python3 -m unittest discover` over test_*.py
+     (12 modules, 166 tests as of 2026-11-26).
+  2. standalone check-style scripts: the files that print
+     "[PASS] ..." / "N passed, 0 failed" from their own main() instead of
+     defining unittest TestCases (11 files, 345 checks as of 2026-11-26:
+     poll, answered-check, reconcile-ambiguous, send-once fail-closed,
+     send-locked, resend, permalink, thread-bounded, mark-guard,
+     ledger-parroting, send-once timeout). They are detected, not hardcoded: a test file
+     whose module loads zero unittest tests is run as a script.
+  3. Exit code is 1 if anything fails, 0 only when everything passes.
+     (511 checks in total as of 2026-11-26.)
+
+Style follows the neighbours (plain Python, no pytest):
+  python3 run_tests.py
 """
-import importlib.util
-import io
-import json
 import os
+import subprocess
 import sys
-import tempfile
 import unittest
-from contextlib import redirect_stdout
-from datetime import datetime, timedelta, timezone
 
-def make_id(prefix, rest):
-    """Build an ID-shaped string from parts (like a real Slack ID).
-
-    Fixtures are synthetic (2026-11-21): the real IDs used before were
-    other people's and ours; parts-built fakes keep the tests passing
-    without leaking real IDs into the public repo.
-    """
-    return prefix + "0" + rest
+HERE = os.path.dirname(os.path.abspath(__file__))
+TIMEOUT = 300
 
 
-WS_MUSE = make_id("T", "TESTWSMUSE1")
-CHANNEL = make_id("C", "TESTCHAN01")
+def run(cmd, label):
+    print(f"== {label}", flush=True)
+    proc = subprocess.run(cmd, cwd=HERE, timeout=TIMEOUT,
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          text=True)
+    tail = "\n".join(proc.stdout.rstrip().splitlines()[-3:])
+    if tail:
+        print(tail)
+    print(f"exit={proc.returncode}")
+    return proc.returncode
 
 
-POLL_PATH = os.path.expanduser("~/hooks/scripts/slack-poll.py")
+def main():
+    failures = []
 
+    # 1. unittest suites (discover finds the TestCase-based files).
+    rc = run([sys.executable, "-m", "unittest", "discover",
+              "-s", HERE, "-p", "test_*.py"], "unittest discover")
+    if rc != 0:
+        failures.append("unittest discover")
 
-def load_poll():
-    spec = importlib.util.spec_from_file_location("slack_poll", POLL_PATH)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+    # 2. Standalone check-style scripts: files with zero unittest tests.
+    loader = unittest.TestLoader()
+    sys.path.insert(0, HERE)
+    try:
+        for name in sorted(os.listdir(HERE)):
+            if not (name.startswith("test_") and name.endswith(".py")):
+                continue
+            module = name[:-3]
+            try:
+                suite = loader.loadTestsFromName(module)
+                count = suite.countTestCases()
+            except Exception as exc:  # import error: discover already failed
+                print(f"== {name}: could not load ({exc})")
+                failures.append(name)
+                continue
+            if count:
+                continue
+            rc = run([sys.executable, os.path.join(HERE, name)], name)
+            if rc != 0:
+                failures.append(name)
+    finally:
+        sys.path.remove(HERE)
 
-
-def iso(dt):
-    return dt.isoformat()
-
-
-class PollTest(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.mod = load_poll()
-        self.mod.INBOX = os.path.join(self.tmp.name, "inbox.jsonl")
-        self.mod.STATE_FILE = os.path.join(self.tmp.name, "state.jsonl")
-        self.mod.DEAD_FILE = os.path.join(self.tmp.name, "dead.jsonl")
-        self.mod.STATS_FILE = os.path.join(self.tmp.name, "stats.json")
-        self.now = datetime.now(timezone.utc)
-        os.environ.pop("SLACK_POLL_DRY_RUN", None)
-
-    def tearDown(self):
-        self.tmp.cleanup()
-        os.environ.pop("SLACK_POLL_DRY_RUN", None)
-
-    def write_inbox(self, events):
-        with open(self.mod.INBOX, "w", encoding="utf-8") as f:
-            for ev in events:
-                f.write(json.dumps(ev, ensure_ascii=False) + "\n")
-
-    def write_state(self, recs):
-        with open(self.mod.STATE_FILE, "w", encoding="utf-8") as f:
-            for r in recs:
-                f.write(json.dumps(r, ensure_ascii=False) + "\n")
-
-    def run_main(self):
-        buf = io.StringIO()
-        with redirect_stdout(buf):
-            self.mod.main()
-        return json.loads(buf.getvalue())
-
-    def load_state(self):
-        state = {}
-        with open(self.mod.STATE_FILE, encoding="utf-8") as f:
-            for line in f:
-                rec = json.loads(line)
-                state[rec["event_id"]] = rec
-        return state
-
-    def ev(self, ts="1794476000.000001"):
-        return {"workspace_id": WS_MUSE, "channel": CHANNEL,
-                "ts": ts, "text": "test"}
-
-    # 1. 新規イベント -> processing, attempts=1, wake
-    def test_new_event_wakes(self):
-        self.write_inbox([self.ev()])
-        out = self.run_main()
-        self.assertEqual(out["decision"], "wake")
-        self.assertEqual(len(out["payload"]["events"]), 1)
-        st = self.load_state()
-        rec = st[WS_MUSE + ":" + CHANNEL + ":1794476000.000001"]
-        self.assertEqual(rec["status"], "processing")
-        self.assertEqual(rec["attempts"], 1)
-
-    # 2. done はスキップ
-    def test_done_skipped(self):
-        self.write_inbox([self.ev()])
-        self.write_state([{"event_id": WS_MUSE + ":" + CHANNEL + ":1794476000.000001",
-                           "status": "done", "attempts": 1,
-                           "updated_at": iso(self.now)}])
-        out = self.run_main()
-        self.assertEqual(out["decision"], "silent")
-
-    # 3. dead はスキップ
-    def test_dead_skipped(self):
-        self.write_inbox([self.ev()])
-        self.write_state([{"event_id": WS_MUSE + ":" + CHANNEL + ":1794476000.000001",
-                           "status": "dead", "attempts": 3,
-                           "updated_at": iso(self.now)}])
-        out = self.run_main()
-        self.assertEqual(out["decision"], "silent")
-
-    # 4. stale processing (attempts<3) -> attempts+1 で再 wake
-    #    first_wake_at は起動猶予（3時間）を過ぎているのでリトライ経路。
-    def test_stale_processing_retried(self):
-        self.write_inbox([self.ev()])
-        self.write_state([{"event_id": WS_MUSE + ":" + CHANNEL + ":1794476000.000001",
-                           "status": "processing", "attempts": 1,
-                           "updated_at": iso(self.now - timedelta(minutes=20)),
-                           "first_wake_at": iso(self.now - timedelta(hours=4))}])
-        out = self.run_main()
-        self.assertEqual(out["decision"], "wake")
-        st = self.load_state()
-        rec = st[WS_MUSE + ":" + CHANNEL + ":1794476000.000001"]
-        self.assertEqual(rec["status"], "processing")
-        self.assertEqual(rec["attempts"], 2)
-
-    # 5. stale processing (attempts>=3) -> dead + デッドレター
-    #    first_wake_at は起動猶予（3時間）を過ぎているので dead 経路。
-    def test_stale_processing_dead_after_max(self):
-        self.write_inbox([self.ev()])
-        self.write_state([{"event_id": WS_MUSE + ":" + CHANNEL + ":1794476000.000001",
-                           "status": "processing", "attempts": 3,
-                           "updated_at": iso(self.now - timedelta(minutes=20)),
-                           "first_wake_at": iso(self.now - timedelta(hours=4))}])
-        out = self.run_main()
-        self.assertEqual(out["decision"], "wake")
-        self.assertEqual(len(out["payload"]["dead_letter"]), 1)
-        st = self.load_state()
-        self.assertEqual(st[WS_MUSE + ":" + CHANNEL + ":1794476000.000001"]["status"], "dead")
-        with open(self.mod.DEAD_FILE, encoding="utf-8") as f:
-            dead = [json.loads(l) for l in f if l.strip()]
-        self.assertEqual(len(dead), 1)
-
-    # 6. failed (stale) -> attempts<3 なら再 wake
-    def test_failed_retried(self):
-        self.write_inbox([self.ev()])
-        self.write_state([{"event_id": WS_MUSE + ":" + CHANNEL + ":1794476000.000001",
-                           "status": "failed", "attempts": 2,
-                           "updated_at": iso(self.now - timedelta(minutes=20)),
-                           "last_error": "boom"}])
-        out = self.run_main()
-        self.assertEqual(out["decision"], "wake")
-        st = self.load_state()
-        self.assertEqual(st[WS_MUSE + ":" + CHANNEL + ":1794476000.000001"]["attempts"], 3)
-
-    # 7. processing でタイムアウト内 -> そのまま
-    def test_fresh_processing_left_alone(self):
-        self.write_inbox([self.ev()])
-        self.write_state([{"event_id": WS_MUSE + ":" + CHANNEL + ":1794476000.000001",
-                           "status": "processing", "attempts": 1,
-                           "updated_at": iso(self.now - timedelta(minutes=1))}])
-        out = self.run_main()
-        self.assertEqual(out["decision"], "silent")
-
-    # 8. 不正な JSON 行はスキップして処理継続
-    def test_malformed_lines_skipped(self):
-        with open(self.mod.INBOX, "w", encoding="utf-8") as f:
-            f.write("not json\n")
-            f.write(json.dumps(self.ev(), ensure_ascii=False) + "\n")
-        with open(self.mod.STATE_FILE, "w", encoding="utf-8") as f:
-            f.write("{broken\n")
-        out = self.run_main()
-        self.assertEqual(out["decision"], "wake")
-        self.assertEqual(len(out["payload"]["events"]), 1)
-
-    # 9. dry_run では state を書き込まない
-    def test_dry_run_does_not_write_state(self):
-        os.environ["SLACK_POLL_DRY_RUN"] = "1"
-        self.write_inbox([self.ev()])
-        out = self.run_main()
-        self.assertEqual(out["decision"], "wake")
-        self.assertFalse(os.path.exists(self.mod.STATE_FILE))
-
-    # 10. event_id の形式 workspace:channel:ts
-    def test_event_id_format(self):
-        ev = {"workspace_id": "W1", "channel": "C1", "ts": "123.456"}
-        self.assertEqual(self.mod.event_id(ev), "W1:C1:123.456")
-
-    # 11. 起動猶予（2026-11-14）：最初の wake から3時間の間は、stale でも
-    #     試行回数を消費せず dead にもしない（ワーカーがまだ起動していない
-    #     可能性があるため）。猶予内なら attempts=3 でも dead にならない。
-    def test_start_grace_leaves_stale_processing_alone(self):
-        self.write_inbox([self.ev()])
-        self.write_state([{"event_id": WS_MUSE + ":" + CHANNEL + ":1794476000.000001",
-                           "status": "processing", "attempts": 1,
-                           "updated_at": iso(self.now - timedelta(minutes=20)),
-                           "first_wake_at": iso(self.now - timedelta(minutes=30))}])
-        out = self.run_main()
-        self.assertEqual(out["decision"], "silent")
-        st = self.load_state()
-        rec = st[WS_MUSE + ":" + CHANNEL + ":1794476000.000001"]
-        self.assertEqual(rec["attempts"], 1)
-        self.assertEqual(rec["status"], "processing")
-        # attempts=3 でも猶予内なら dead にしない。
-        self.write_state([{"event_id": WS_MUSE + ":" + CHANNEL + ":1794476000.000001",
-                           "status": "processing", "attempts": 3,
-                           "updated_at": iso(self.now - timedelta(minutes=20)),
-                           "first_wake_at": iso(self.now - timedelta(minutes=30))}])
-        out2 = self.run_main()
-        self.assertEqual(out2["decision"], "silent")
-        st2 = self.load_state()
-        self.assertEqual(st2[WS_MUSE + ":" + CHANNEL + ":1794476000.000001"]["status"],
-                         "processing")
+    if failures:
+        print(f"\nFAILED: {', '.join(failures)}")
+        return 1
+    print("\nALL SUITES PASSED")
+    return 0
 
 
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    sys.exit(main())
