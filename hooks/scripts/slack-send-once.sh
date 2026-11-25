@@ -43,7 +43,8 @@
 #      の実地ケースで、送らずに止めたら実際には届いていて二重投稿が
 #      起きなかったことが確認されたため。送れなかった分は DLQ再送の改訂案
 #      （2026-11-13）で後から拾う：呼び出し側が waiting として記録し、
-#      1時間ごとに起こし直して24時間以内に再送する。終了コードは3で、
+#      段階間隔（2分／5分／15分／30分／60分）で起こし直して24時間以内に
+#      再送する。終了コードは3で、
 #      送信そのものの失敗（終了コード1）と区別する）。
 #   4. 履歴取得は next_oldest でページングして全ページを確認する
 #      （Yama さんの修正4番目・Yanayana さんの共有 2026-11-12 と同じ穴の修正。
@@ -242,7 +243,8 @@
 #   DLQ再送の改訂案（2026-11-13、Yama・Yanayana・Neiroで合意）：pre-check失敗は
 #   投稿の失敗ではなく API 待ちなので、送信失敗（1）と区別する。呼び出し側は
 #   終了コード3のとき failed ではなく waiting として記録し、ポーラーが
-#   1時間ごとに起こし直して24時間以内に再送する。送信そのものの失敗（1）は
+#   段階間隔（2分／5分／15分／30分／60分）で起こし直して24時間以内に再送する。
+#   送信そのものの失敗（1）は
 #   従来通り failed → リトライ／デッドレターで終端。
 set -uo pipefail
 
@@ -262,6 +264,19 @@ REQUEST_ID=""
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 READ_META="$SCRIPT_DIR/slack-read-metadata.py"
 POST_META="$SCRIPT_DIR/slack-post-metadata.py"
+
+# slackcli 直呼びの締切（2026-11-25、Yama方式の取り入れ：通信に締切を
+# 付ける）。メタデータ経由の通信（slack-read-metadata.py /
+# slack-post-metadata.py）は curl --max-time 30 と試行回数の上限で既に
+# 締切があるので、ここでは締切の無い slackcli 直呼びだけを timeout で
+# 包む。読み取りは履歴リトライ（最大5回）の内側なので短め、送信は
+# 1回きりなので長め。締切で切れた送信は終了コード124で失敗扱いに
+# なり、既存の到達確認（応答ロスト時の検証）にそのまま乗る。
+CLI_READ_TIMEOUT_SECS="${SLACK_SEND_ONCE_READ_TIMEOUT_SECS:-60}"
+CLI_SEND_TIMEOUT_SECS="${SLACK_SEND_ONCE_SEND_TIMEOUT_SECS:-120}"
+slackcli_read() {
+  timeout "$CLI_READ_TIMEOUT_SECS" "$SLACKCLI" "$@"
+}
 
 # 実IDは ids.json から読む（2026-11-19、実ID外部化の第2本）。
 # slack-ids.sh は関数定義だけで、source 時の副作用はない。
@@ -383,7 +398,7 @@ if [ -n "$WORKSPACE" ]; then WS_ARGS=(--workspace "$WORKSPACE"); fi
 # muse-board、既知のワークスペースID2件だけ。
 self_user_id() {
   local id
-  id=$("$SLACKCLI" auth whoami "${WS_ARGS[@]}" 2>/dev/null \
+  id=$(slackcli_read auth whoami "${WS_ARGS[@]}" 2>/dev/null \
     | grep -oP '\([UW][A-Z0-9]+' | head -1 | tr -d '(' || true)
   # whoami の失敗時に "(UNAUTHORIZED)" のような文字列が stdout に
   # 出ても、ID 形状でないものは使わない（2026-11-19、answered-check
@@ -675,7 +690,7 @@ check_bounded() {
   local attempt=0 raw found rc
   while [ "$attempt" -lt "$HISTORY_ATTEMPTS" ]; do
     attempt=$((attempt + 1))
-    raw=$("$SLACKCLI" conversations read "$CHANNEL" --limit "$BOUNDED_N" --json "${WS_ARGS[@]}" 2>/dev/null || true)
+    raw=$(slackcli_read conversations read "$CHANNEL" --limit "$BOUNDED_N" --json "${WS_ARGS[@]}" 2>/dev/null || true)
     found=$(printf '%s' "$raw" | python3 -c "
 try:
     import sys, json, re
@@ -852,7 +867,7 @@ check_duplicate_thread() {
   local attempt=0 raw found rc
   while [ "$attempt" -lt "$HISTORY_ATTEMPTS" ]; do
     attempt=$((attempt + 1))
-    raw=$("$SLACKCLI" conversations read "$CHANNEL" --limit "$THREAD_CHECK_N" --json --thread-ts "$THREAD_TS" "${WS_ARGS[@]}" 2>/dev/null || true)
+    raw=$(slackcli_read conversations read "$CHANNEL" --limit "$THREAD_CHECK_N" --json --thread-ts "$THREAD_TS" "${WS_ARGS[@]}" 2>/dev/null || true)
     found=$(printf '%s' "$raw" | python3 -c "
 try:
     import sys, json, re
@@ -920,7 +935,7 @@ check_duplicate() {
     local oldest="$cutoff"
     while :; do
       local read_args=("$CHANNEL" --limit 50 --json --oldest "$oldest")
-      raw=$("$SLACKCLI" conversations read "${read_args[@]}" "${WS_ARGS[@]}" 2>/dev/null || true)
+      raw=$(slackcli_read conversations read "${read_args[@]}" "${WS_ARGS[@]}" 2>/dev/null || true)
       page_out=$(printf '%s' "$raw" | CUTOFF="$cutoff" python3 -c "
 try:
     import sys, json, re, time, os
@@ -1006,7 +1021,7 @@ check_other_duplicate() {
   [ -n "$THREAD_TS" ] || return 1
   while [ "$attempt" -lt "$HISTORY_ATTEMPTS" ]; do
     attempt=$((attempt + 1))
-    raw=$("$SLACKCLI" conversations read "$CHANNEL" --limit "$THREAD_CHECK_N" --json --thread-ts "$THREAD_TS" "${WS_ARGS[@]}" 2>/dev/null || true)
+    raw=$(slackcli_read conversations read "$CHANNEL" --limit "$THREAD_CHECK_N" --json --thread-ts "$THREAD_TS" "${WS_ARGS[@]}" 2>/dev/null || true)
     found=$(printf '%s' "$raw" | python3 -c "
 try:
     import sys, json
@@ -1058,7 +1073,7 @@ check_other_bounded() {
   [ -n "$THREAD_TS" ] && return 1
   while [ "$attempt" -lt "$HISTORY_ATTEMPTS" ]; do
     attempt=$((attempt + 1))
-    raw=$("$SLACKCLI" conversations read "$CHANNEL" --limit "$BOUNDED_N" --json "${WS_ARGS[@]}" 2>/dev/null || true)
+    raw=$(slackcli_read conversations read "$CHANNEL" --limit "$BOUNDED_N" --json "${WS_ARGS[@]}" 2>/dev/null || true)
     found=$(printf '%s' "$raw" | python3 -c "
 try:
     import sys, json
@@ -1149,8 +1164,9 @@ if [ "$CHECK_RC" -eq 2 ]; then
   # Yama さんの実地ケース（2026-11-12）：応答ロストで到達不明のまま
   # 送らずに止めたら、実際には届いていて二重投稿は起きなかった。
   # 届かなかった分は DLQ再送の改訂案（2026-11-13）で後から拾う：
-  # 終了コード3で返し、呼び出し側が waiting として記録して1時間ごとに
-  # 起こし直す。送信そのものの失敗（終了コード1）とは区別する。
+  # 終了コード3で返し、呼び出し側が waiting として記録して段階間隔
+  # （2分／5分／15分／30分／60分）で起こし直す。送信そのものの失敗
+  # （終了コード1）とは区別する。
   # 以前の fail-open はここで廃止（Yama さん・Yanayana さんと方針を揃えた）。
   if ledger_ts=$(check_ledger); then
     echo "already sent (found in local send log, ts $ledger_ts), skipping send" >&2
@@ -1212,7 +1228,7 @@ if [ -n "$EVENT_ID" ] || [ -n "$REQUEST_ID" ]; then
 else
   SEND_ARGS=(messages send --recipient-id "$CHANNEL" --message-file "$TMP_MSG" --json)
   if [ -n "$THREAD_TS" ]; then SEND_ARGS+=(--thread-ts "$THREAD_TS"); fi
-  SEND_OUT=$("$SLACKCLI" "${SEND_ARGS[@]}" "${WS_ARGS[@]}" 2>&1)
+  SEND_OUT=$(timeout "$CLI_SEND_TIMEOUT_SECS" "$SLACKCLI" "${SEND_ARGS[@]}" "${WS_ARGS[@]}" 2>&1)
   SEND_RC=$?
 fi
 if [ "$SEND_RC" -eq 0 ]; then

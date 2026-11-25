@@ -62,6 +62,15 @@ Covered:
      exceed MAX_WAKE_TEXT_CHARS, the oldest events' texts are trimmed
      first (newest kept longest), each keeping at least the floor, and
      no event is dropped.
+ 19. waiting staged intervals (2026-11-25, Yama方式): the re-wake
+     interval widens in stages 2m/5m/15m/30m/60m (then stays 60m),
+     counted in wait_wakes; the first sight of a waiting record
+     schedules stage 1 without waking.
+ 20. reclaim cutoff and backoff (2026-11-25, Yama方式): fastpath
+     reclaim stops at first_wake + 3h and at RECLAIM_MAX_COUNT, and
+     the required processing age widens with reclaim_count
+     (120s -> 5m -> 15m -> 30m); the count is recorded and never
+     reset by an automatic path.
 """
 import json
 import os
@@ -795,6 +804,126 @@ def test_stale_retry_keeps_resend_note():
           len(due2) == 1 and "resend" not in due2[0], due2)
 
 
+def _secs_until(iso_ts):
+    return (datetime.fromisoformat(iso_ts)
+            - datetime.now(timezone.utc)).total_seconds()
+
+
+def test_waiting_staged_intervals():
+    # waiting 段階化（2026-11-25、Yama方式）：再 wake 間隔は 2分→5分→
+    # 15分→30分→60分と広がり、起こし直しの回数は wait_wakes に数える。
+    # 窓（24時間）と first_wait_at（元の失敗時刻）は従来通り不変。
+    env = Env()
+    ev = make_event()
+    now = datetime.now(timezone.utc)
+    first = now - timedelta(hours=1)
+
+    # 初めて waiting を見たとき：窓の起点と第1段（2分）の次回 wake を
+    # 刻むだけで、その場では起こさない。
+    env.write_inbox([ev])
+    env.write_state([{"event_id": eid(ev), "status": "waiting", "attempts": 1,
+                      "updated_at": now_iso(first),
+                      "last_error": "pre-check unverifiable"}])
+    out = env.run()
+    check("waiting first sight -> silent (stage 1 scheduled)",
+          out["decision"] == "silent", out)
+    rec = env.read_state()[eid(ev)]
+    check("waiting first sight -> first_wait_at is the original failure",
+          rec.get("first_wait_at") == now_iso(first), rec)
+    check("waiting first sight -> wait_wakes 0", rec.get("wait_wakes") == 0, rec)
+    d1 = _secs_until(rec["next_wake_at"])
+    check("waiting first sight -> next wake in ~120s", 100 <= d1 <= 140, d1)
+
+    # 第1段を過ぎた：起こし直され、wait_wakes=1、次回は第2段（5分）。
+    rec["next_wake_at"] = now_iso(now - timedelta(seconds=5))
+    env.write_state([rec])
+    out2 = env.run()
+    check("waiting stage 1 due -> re-woken",
+          out2["decision"] == "wake" and len(out2["payload"]["events"]) == 1,
+          out2)
+    rec2 = env.read_state()[eid(ev)]
+    check("waiting stage 1 -> wait_wakes 1", rec2.get("wait_wakes") == 1, rec2)
+    check("waiting stage 1 -> attempts still untouched",
+          rec2.get("attempts") == 1, rec2)
+    d2 = _secs_until(rec2["next_wake_at"])
+    check("waiting stage 1 -> next wake in ~300s", 270 <= d2 <= 330, d2)
+
+    # 段が進むと間隔が広がる：wait_wakes=3 の起こし直しで次は最終段60分。
+    rec2["status"] = "waiting"
+    rec2["wait_wakes"] = 3
+    rec2["next_wake_at"] = now_iso(now - timedelta(seconds=5))
+    env.write_state([rec2])
+    out3 = env.run()
+    check("waiting stage 4 due -> re-woken", out3["decision"] == "wake", out3)
+    rec3 = env.read_state()[eid(ev)]
+    check("waiting stage 4 -> wait_wakes 4", rec3.get("wait_wakes") == 4, rec3)
+    d3 = _secs_until(rec3["next_wake_at"])
+    check("waiting stage 4 -> next wake in ~3600s (final stage)",
+          3400 <= d3 <= 3700, d3)
+
+
+def test_reclaim_cutoff_and_backoff():
+    # 取り戻しの打ち切り（2026-11-25、Yama方式）：first_wake から3時間を
+    # 過ぎたものと、回数上限（10回）に達したものは取り戻さない。間隔は
+    # reclaim_count で段階的に広がる（バックオフ）。打ち切り側では
+    # カウンタは進まない（消費しない）。
+    now = datetime.now(timezone.utc)
+    ev = make_event()
+    base = {"status": "processing", "attempts": 1, "last_error": ""}
+
+    # 窓切れ：first_wake が3時間1分前。processing 経過が十分でも
+    # 取り戻さない。
+    env = Env()
+    env.env["SLACK_POLL_FASTPATH"] = "1"
+    env.write_inbox([ev])
+    env.write_state([dict(base, event_id=eid(ev),
+                          updated_at=now_iso(now - timedelta(seconds=2000)),
+                          first_wake_at=now_iso(now - timedelta(hours=3,
+                                                                minutes=1)))])
+    out = env.run()
+    check("reclaim past the 3h window -> silent",
+          out["decision"] == "silent", out)
+    rec = env.read_state()[eid(ev)]
+    check("reclaim past the window -> count not consumed",
+          not rec.get("reclaim_count"), rec)
+
+    # 回数上限：reclaim_count=10（上限）では取り戻さない。
+    env2 = Env()
+    env2.env["SLACK_POLL_FASTPATH"] = "1"
+    env2.write_inbox([ev])
+    env2.write_state([dict(base, event_id=eid(ev), reclaim_count=10,
+                           updated_at=now_iso(now - timedelta(seconds=2000)),
+                           first_wake_at=now_iso(now - timedelta(hours=1)))])
+    out2 = env2.run()
+    check("reclaim at the count cap -> silent",
+          out2["decision"] == "silent", out2)
+
+    # バックオフ：reclaim_count=1 のしきい値は300秒。経過200秒では
+    # 取り戻さず、400秒では取り戻してカウンタが 2 になる。
+    env3 = Env()
+    env3.env["SLACK_POLL_FASTPATH"] = "1"
+    env3.write_inbox([ev])
+    seed3 = dict(base, event_id=eid(ev), reclaim_count=1,
+                 first_wake_at=now_iso(now - timedelta(hours=1)))
+    env3.write_state([dict(seed3,
+                           updated_at=now_iso(now - timedelta(seconds=200)))])
+    out3 = env3.run()
+    check("reclaim backoff stage 1 at 200s -> silent",
+          out3["decision"] == "silent", out3)
+    env3.write_state([dict(seed3,
+                           updated_at=now_iso(now - timedelta(seconds=400)))])
+    out4 = env3.run()
+    check("reclaim backoff stage 1 at 400s -> wake",
+          out4["decision"] == "wake", out4)
+    rec4 = env3.read_state()[eid(ev)]
+    check("reclaim increments reclaim_count to 2",
+          rec4.get("reclaim_count") == 2, rec4)
+    due4 = out4["payload"]["events"]
+    check("reclaim annotation carries the new count",
+          (due4[0].get("fastpath_reclaim") or {}).get("reclaim_count") == 2,
+          due4)
+
+
 def test_wake_truncates_long_event_text():
     # 読み取り上限（2026-11-22）：3,000字超の投稿は wake ペイロードで
     # 切られ、text_truncated に元の文字数が残る。短い投稿はそのまま。
@@ -872,6 +1001,8 @@ def main():
              test_burst_priority_aging_naive_received_at,
              test_fastpath_reclaim_keeps_resend_note,
              test_stale_retry_keeps_resend_note,
+             test_waiting_staged_intervals,
+             test_reclaim_cutoff_and_backoff,
              test_wake_truncates_long_event_text,
              test_wake_total_text_budget_trims_oldest,
              test_parallel_claims_single_flight]

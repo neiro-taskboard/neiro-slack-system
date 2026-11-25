@@ -21,8 +21,11 @@ Rules:
 - done / dead                          -> skip.
 - waiting (pre-check failure only)     -> DLQ再送の改訂案（2026-11-13、Yama・
   Yanayana・Neiroで合意）。送信前の履歴取得が読めなかった分は投稿の失敗
-  ではなく API 待ちなので、attempts（retry_count）に数えない。1時間ごとに
+  ではなく API 待ちなので、attempts（retry_count）に数えない。段階間隔
+  （2分／5分／15分／30分／60分、以降は60分。Yama方式、2026-11-25）で
   起こし直し、24時間以内に履歴が読めるようになれば通常通り返信する。
+  起こし直しの回数は wait_wakes に数え、数え直しは人間の再投入
+  （slack-event-state.sh の --force 訂正）のときだけ（終端原則）。
   24時間を過ぎても読めなければ諦めとして dead にし、デッドレターに記録する。
   起こし直しのペイロードには resend（元の失敗時刻つき・接頭辞つき）を付け、ワーカーが
   再送前に答え済み確認をしてから「遅れての再送」の接頭辞つきで送る
@@ -93,6 +96,13 @@ START_GRACE_SECS = 3 * 3600  # 3 hours
 # attempts と first_wake_at は触らない：リトライ／dead の会計は従来通り
 # フック側が持ち、遅れて起動した元のワーカーとの競合は送信前チェック
 # （slack-send-once.sh）が受ける。フック側の挙動は一切変えない。
+# 取り戻しの打ち切り（2026-11-25、Yama方式の取り入れ）：取り戻しは
+# first_wake から RECLAIM_WINDOW_SECS（3時間＝起動猶予と同じ）まで、
+# 回数は RECLAIM_MAX_COUNT まで、間隔は段階バックオフ（120秒→5分→
+# 15分→30分）で広げる。回数は reclaim_count に数え、数え直しは
+# 人間の再投入（--force 訂正）のときだけ（終端原則：巡回するたびに
+# 消費し、有限で必ず止まる）。打ち切り後はフック側の通常の
+# リトライ／dead の会計に委ねる（猶予明けに attempts で判定される）。
 FASTPATH_RECLAIM_SECS = int(os.environ.get(
     "SLACK_POLL_FASTPATH_RECLAIM_SECS", "120"))
 # バースト対策（2026-11-21 追加）：1回の wake に詰めるイベント数の上限。
@@ -126,7 +136,14 @@ MAX_WAKE_TEXT_CHARS = int(os.environ.get(
     "SLACK_POLL_MAX_WAKE_TEXT_CHARS", "40000"))
 TEXT_FLOOR_CHARS = 500
 WAIT_WINDOW_SECS = 24 * 3600  # pre-check失敗から再送を諦めるまでの窓（起点は最初の失敗時刻）
-WAIT_WAKE_INTERVAL_SECS = 3600  # waiting の再 wake 間隔（毎時の定期照合に合わせる）
+# waiting の再 wake 段階間隔（2026-11-25、Yama方式の取り入れ）：従来は
+# 3600秒の一律だった。wait_wakes（起こし直しの回数）を添字にし、最後の
+# 段を超えたら最終段（60分）のまま。全体の上限は窓（24時間）。
+WAIT_WAKE_STAGES_SECS = [120, 300, 900, 1800, 3600]
+# fastpath 取り戻しの打ち切り（2026-11-25、Yama方式の取り入れ）。
+RECLAIM_WINDOW_SECS = START_GRACE_SECS  # 取り戻しは first_wake から3時間まで
+RECLAIM_MAX_COUNT = 10  # 取り戻しの回数上限
+RECLAIM_BACKOFF_STAGES_SECS = [300, 900, 1800]  # 初回（FASTPATH_RECLAIM_SECS）の後の段階
 
 
 AGING_PROMOTE_SECS = 300  # 5 minutes: 「その他」-> ねいろ宛て相当
@@ -142,6 +159,35 @@ def parse_iso(s):
         return datetime.fromisoformat(s)
     except (TypeError, ValueError):
         return datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _count(rec, key):
+    """記録のカウンタ（wait_wakes / reclaim_count）を int で読む。
+
+    無い・壊れているときは 0。カウンタはポーラーと --force 訂正だけが
+    触り、自動経路では数え直さない（終端原則）。
+    """
+    try:
+        return int(rec.get(key) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def wait_wake_interval(wakes):
+    """waiting の再 wake 間隔（秒）。wakes はこれまでの起こし直し回数。"""
+    idx = min(max(int(wakes), 0), len(WAIT_WAKE_STAGES_SECS) - 1)
+    return WAIT_WAKE_STAGES_SECS[idx]
+
+
+def reclaim_threshold(count):
+    """取り戻しに必要な processing 経過（秒）。count はこれまでの取り戻し回数。
+
+    初回は FASTPATH_RECLAIM_SECS（環境変数で上書き可）、以降は段階で
+    広げる。環境変数で初回を大きくしても単調になるよう累積 max を取る。
+    """
+    stages = [FASTPATH_RECLAIM_SECS] + RECLAIM_BACKOFF_STAGES_SECS
+    idx = min(max(int(count), 0), len(stages) - 1)
+    return max(stages[:idx + 1])
 
 
 def event_id(ev):
@@ -446,7 +492,8 @@ def main():
             continue
         if status == "waiting":
             # pre-check（履歴取得）の失敗は投稿の失敗ではなく API 待ちなので
-            # attempts に数えない。1時間ごとに起こし直し、24時間以内に履歴が
+            # attempts に数えない。段階間隔（2分／5分／15分／30分／60分）で
+            # 起こし直し、24時間以内に履歴が
             # 読めるようになれば通常通り返信する。24時間を過ぎても読めなければ
             # 諦めとして dead にし、デッドレターに記録する。
             # 窓の起点は最初の waiting 時刻のまま、持ち越しで延びない。
@@ -468,8 +515,12 @@ def main():
             next_wake = parse_iso(rec.get("next_wake_at"))
             if next_wake == datetime.min.replace(tzinfo=timezone.utc):
                 # 初めて waiting を見たとき：窓の起点と次回 wake 時刻を刻む。
+                # 次回 wake は段階の第1段（2分）。起こし直しの回数は
+                # wait_wakes に数える（数え直しは人間の再投入のときだけ）。
                 rec["first_wait_at"] = first_wait.isoformat()
-                rec["next_wake_at"] = (now + timedelta(seconds=WAIT_WAKE_INTERVAL_SECS)).isoformat()
+                rec["wait_wakes"] = _count(rec, "wait_wakes")
+                rec["next_wake_at"] = (now + timedelta(
+                    seconds=wait_wake_interval(rec["wait_wakes"]))).isoformat()
                 changed = True
                 continue
             if now >= next_wake:
@@ -485,7 +536,10 @@ def main():
                 def claim_waiting(rec=rec, now=now):
                     rec["status"] = "processing"
                     rec["updated_at"] = now_iso()
-                    rec["next_wake_at"] = (now + timedelta(seconds=WAIT_WAKE_INTERVAL_SECS)).isoformat()
+                    wakes = _count(rec, "wait_wakes") + 1
+                    rec["wait_wakes"] = wakes
+                    rec["next_wake_at"] = (now + timedelta(
+                        seconds=wait_wake_interval(wakes))).isoformat()
                 candidates.append((dispatch_priority(ev, now), ts_key(ev),
                                    resend_ev, claim_waiting))
             continue
@@ -494,13 +548,27 @@ def main():
         if fastpath and status == "processing":
             # 高速スイープの取り戻し：起動猶予の内側でも、processing の
             # 経過がしきい値を超えていたらスイープ側が即処理する。
-            # 状態は processing のまま updated_at だけ進める（次回の
-            # 取り戻しはそこから FASTPATH_RECLAIM_SECS 後）。
+            # 状態は processing のまま updated_at だけ進める。
+            # 打ち切り（2026-11-25、Yama方式）：first_wake から
+            # RECLAIM_WINDOW_SECS（3時間）を過ぎたものと、RECLAIM_MAX_COUNT
+            # 回取り戻したものはもう取り戻さない（フック側の通常の
+            # リトライ／dead の会計に委ねる）。しきい値は reclaim_count で
+            # 段階的に広がる（バックオフ）。数え直しは人間の再投入
+            # （--force 訂正）のときだけ（終端原則）。
             age_secs = (now - updated).total_seconds()
-            if age_secs > FASTPATH_RECLAIM_SECS:
+            reclaim_count = _count(rec, "reclaim_count")
+            first_wake = parse_iso(rec.get("first_wake_at"))
+            if first_wake == datetime.min.replace(tzinfo=timezone.utc):
+                # first_wake_at が無い古い記録は updated_at を代用する
+                # （起動猶予の判定と同じ扱い）。
+                first_wake = updated
+            if (now < first_wake + timedelta(seconds=RECLAIM_WINDOW_SECS)
+                    and reclaim_count < RECLAIM_MAX_COUNT
+                    and age_secs > reclaim_threshold(reclaim_count)):
                 reclaim_ev = dict(ev)
                 reclaim_ev["fastpath_reclaim"] = {
                     "processing_age_secs": int(age_secs),
+                    "reclaim_count": reclaim_count + 1,
                 }
                 # 中-2：waiting を経た再送が処理中に死んだ場合、取り戻しでも
                 # resend 注記を付け直す。付けないと再送文の先頭から
@@ -509,8 +577,9 @@ def main():
                 if first_wait is not None:
                     reclaim_ev = attach_resend(reclaim_ev, first_wait)
 
-                def claim_reclaim(rec=rec):
+                def claim_reclaim(rec=rec, reclaim_count=reclaim_count):
                     rec["updated_at"] = now_iso()
+                    rec["reclaim_count"] = reclaim_count + 1
                 candidates.append((dispatch_priority(ev, now), ts_key(ev),
                                    reclaim_ev, claim_reclaim))
             continue

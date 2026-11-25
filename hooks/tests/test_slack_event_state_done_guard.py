@@ -31,6 +31,9 @@ neighbours' fixtures so no real ID leaks into the public repo):
      corrected_from/correction_reason/corrected_at
   8. --force without a reason -> rejected (exit 2), state unchanged
   9. rejection log unwritable -> mark still succeeds (fail-open)
+ 10. --force correction resets the poller's wait_wakes / reclaim_count
+     (2026-11-25: counting restarts only on human re-injection, the
+     terminal principle; automatic paths never reset them)
 """
 import json
 import os
@@ -190,6 +193,23 @@ class DoneGuardTest(unittest.TestCase):
         self.assertIn("corrected_at", rec)
         self.assertEqual(rec.get("last_error"), "mistaken done, reopening")
         self.assertEqual(self.load_rejected(), [])
+
+    def test_force_correction_resets_poller_counters(self):
+        # 人間の再投入（--force 訂正）ではポーラーのカウンタを数え直す。
+        # waiting 段階化（wait_wakes）と取り戻し打ち切り（reclaim_count）
+        # のカウンタは、自動経路では決してリセットされない（終端原則）。
+        path = self.env["SLACK_EVENT_STATE_FILE"]
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"event_id": EVENT_ID, "status": "done",
+                                "attempts": 1, "wait_wakes": 4,
+                                "reclaim_count": 7,
+                                "updated_at": "2026-11-25T00:00:00+00:00"},
+                               ensure_ascii=False) + "\n")
+        self.mark("waiting", "reopening by hand", force=True)
+        rec = self.load_state()[EVENT_ID]
+        self.assertEqual(rec["status"], "waiting")
+        self.assertNotIn("wait_wakes", rec)
+        self.assertNotIn("reclaim_count", rec)
 
     def test_rejected_log_failure_does_not_break_mark(self):
         self.mark("done")

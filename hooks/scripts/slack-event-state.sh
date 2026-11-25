@@ -9,7 +9,8 @@
 #             ポーラーが attempts < 3 の間だけリトライし、使い切ったら dead。
 #   waiting : DLQ再送の改訂案（2026-11-13）。送信前の履歴確認ができず
 #             送れなかった（cannot-verify / pre-check失敗）とき専用。
-#             attempts に数えず、ポーラーが1時間ごとに起こし直し、
+#             attempts に数えず、ポーラーが段階間隔（2分／5分／15分／
+#             30分／60分、2026-11-25 に Yama方式へ変更）で起こし直し、
 #             24時間以内に読めるようになれば通常通り返信する。24時間を
 #             過ぎたらポーラーが dead にする。第3引数を last_error に残す。
 #   done/dead は最終状態：done/dead 済みのイベントに後から failed/waiting を
@@ -26,6 +27,9 @@
 #             が必須。訂正は state に corrected_from / correction_reason /
 #             corrected_at として残し、標準出力にも CORRECTION のアラート1行を出す。
 #             理由なしの --force は受け付けない。
+#             --force の訂正は人間の再投入として、ポーラーの再 wake 回数
+#             （wait_wakes）と取り戻し回数（reclaim_count）をリセットする
+#             （2026-11-25。終端原則：数え直しは人間の再投入のときだけ）。
 # STATE_FILE / LOCK_FILE は環境変数で上書きできる（テスト用）。
 # SLACK_EVENT_MARK_REJECTED_FILE で警告ログの場所を上書きできる（テスト用）。
 #   既定は STATE_FILE と同じディレクトリの mark_rejected.jsonl。
@@ -102,6 +106,11 @@ if force and current in ("done", "dead") and status in ("failed", "waiting"):
     rec["corrected_from"] = current
     rec["correction_reason"] = error
     rec["corrected_at"] = now
+    # 人間の再投入（この訂正）では、ポーラーの再 wake／取り戻しの
+    # カウンタを数え直す（終端原則：数え直しは人間の再投入のときだけ。
+    # 2026-11-25、waiting 段階化と取り戻し打ち切りの導入に合わせて）。
+    rec.pop("wait_wakes", None)
+    rec.pop("reclaim_count", None)
     print(f"CORRECTION: {eid} {current} -> {status} (reason: {error})")
 rec["status"] = status
 rec["updated_at"] = now
