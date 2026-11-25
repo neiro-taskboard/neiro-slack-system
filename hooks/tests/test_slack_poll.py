@@ -71,6 +71,11 @@ Covered:
      the required processing age widens with reclaim_count
      (120s -> 5m -> 15m -> 30m); the count is recorded and never
      reset by an automatic path.
+ 21. author_kind recording (2026-11-25, Yama方式の二段構えの前提):
+     a new event's state record carries author_kind — "bot" when the
+     inbox event has a bot_id, "human" otherwise (missing or empty
+     bot_id included) — for the oldest-unprocessed check's two-tier
+     thresholds.
 """
 import json
 import os
@@ -979,9 +984,32 @@ def test_wake_total_text_budget_trims_oldest():
           sum(len(e.get("text") or "") for e in due) <= 1200, due)
 
 
+def test_author_kind_recorded():
+    env = Env()
+    bot_ev = make_event(ts="1794476893.000001")
+    bot_ev["bot_id"] = make_id("B", "TESTBOTAPP1")
+    human_ev = make_event(ts="1794476894.000001")
+    empty_ev = make_event(ts="1794476895.000001")
+    empty_ev["bot_id"] = ""
+    env.write_inbox([bot_ev, human_ev, empty_ev])
+    out = env.run()
+    check("author_kind -> wake", out["decision"] == "wake", out)
+    state = env.read_state()
+    check("author_kind -> bot_id event recorded as bot",
+          state[eid(bot_ev)].get("author_kind") == "bot",
+          state.get(eid(bot_ev)))
+    check("author_kind -> no bot_id recorded as human",
+          state[eid(human_ev)].get("author_kind") == "human",
+          state.get(eid(human_ev)))
+    check("author_kind -> empty bot_id recorded as human",
+          state[eid(empty_ev)].get("author_kind") == "human",
+          state.get(eid(empty_ev)))
+
+
 def main():
     global FAIL
     tests = [test_new_event_wakes_once,
+             test_author_kind_recorded,
              test_stale_processing_rewakes_once,
              test_stale_at_max_attempts_dead,
              test_failed_retries_then_dead,

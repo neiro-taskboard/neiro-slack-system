@@ -28,6 +28,17 @@ Covered:
  14. processing threshold env override is respected
  15. processing_count is reported (2026-11-24, Yanayana's suggestion):
      mixed processing + pending, and all-pending -> 0
+ 16. two-tier thresholds (2026-11-25, Yama方式): bot posts use the
+     longer bot thresholds (pending 1800s, processing 7200s); a bot
+     event past the human threshold but under the bot one is quiet
+ 17. bot boundaries: pending 1799s -> exit 0, 1801s -> exit 1;
+     processing 7199s -> exit 0, 7201s -> exit 1
+ 18. human tier wins: when both tiers exceed, the warning reports
+     the human event even if the bot event is older
+ 19. a record without author_kind (pre-2026-11-25 ledger) is treated
+     as human, so legacy records keep the strict thresholds
+ 20. bot thresholds can be overridden by env vars
+ 21. bot_count counts only unprocessed bot-authored records
 """
 import json
 import os
@@ -70,6 +81,9 @@ class OldestUnprocessedTest(unittest.TestCase):
         self.env.pop("SLACK_OLDEST_UNPROCESSED_THRESHOLD_SECS", None)
         self.env.pop(
             "SLACK_OLDEST_UNPROCESSED_PROCESSING_THRESHOLD_SECS", None)
+        self.env.pop("SLACK_OLDEST_UNPROCESSED_BOT_THRESHOLD_SECS", None)
+        self.env.pop(
+            "SLACK_OLDEST_UNPROCESSED_BOT_PROCESSING_THRESHOLD_SECS", None)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -86,11 +100,13 @@ class OldestUnprocessedTest(unittest.TestCase):
         return proc.returncode, json.loads(proc.stdout)
 
     def rec(self, eid=EID, status="processing", age_secs=0,
-            first_wake=True):
+            first_wake=True, kind=None):
         r = {"event_id": eid, "status": status, "attempts": 1,
              "updated_at": iso(self.now - timedelta(seconds=age_secs))}
         if first_wake:
             r["first_wake_at"] = iso(self.now - timedelta(seconds=age_secs))
+        if kind is not None:
+            r["author_kind"] = kind
         return r
 
     # 1. state file missing -> exit 0, 0 unprocessed
@@ -251,6 +267,105 @@ class OldestUnprocessedTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(out["unprocessed_count"], 2)
         self.assertEqual(out["processing_count"], 0)
+
+    # 16. two-tier (2026-11-25): a bot pending at 900s is past the
+    # human threshold (180s) but under the bot one (1800s) -> exit 0,
+    # reported as bot with the bot threshold.
+    def test_bot_pending_under_bot_threshold_no_warning(self):
+        self.write_state([self.rec(status="pending", age_secs=900,
+                                   kind="bot")])
+        code, out = self.run_check()
+        self.assertEqual(code, 0)
+        self.assertEqual(out["unprocessed_count"], 1)
+        self.assertEqual(out["oldest_event_id"], EID)
+        self.assertEqual(out["oldest_author_kind"], "bot")
+        self.assertEqual(out["oldest_threshold_secs"], 1800)
+        self.assertEqual(out["bot_threshold_secs"], 1800)
+        self.assertEqual(out["bot_processing_threshold_secs"], 7200)
+
+    # 17. bot boundaries: pending 1799s -> exit 0, 1801s -> exit 1;
+    # processing 7199s -> exit 0, 7201s -> exit 1.
+    def test_bot_boundaries(self):
+        self.write_state([self.rec(status="pending", age_secs=1799,
+                                   kind="bot")])
+        code, _ = self.run_check()
+        self.assertEqual(code, 0)
+        self.write_state([self.rec(status="pending", age_secs=1801,
+                                   kind="bot")])
+        code, out = self.run_check()
+        self.assertEqual(code, 1)
+        self.assertEqual(out["oldest_author_kind"], "bot")
+        self.assertEqual(out["oldest_threshold_secs"], 1800)
+        self.write_state([self.rec(status="processing", age_secs=7199,
+                                   kind="bot")])
+        code, _ = self.run_check()
+        self.assertEqual(code, 0)
+        self.write_state([self.rec(status="processing", age_secs=7201,
+                                   kind="bot")])
+        code, out = self.run_check()
+        self.assertEqual(code, 1)
+        self.assertEqual(out["oldest_author_kind"], "bot")
+        self.assertEqual(out["oldest_threshold_secs"], 7200)
+
+    # 18. human tier wins: a bot event far past its own threshold
+    # (5000s) plus a human event just past 180s -> the warning is
+    # about the human event.
+    def test_human_tier_wins_over_older_bot(self):
+        self.write_state([self.rec(status="pending", age_secs=5000,
+                                   kind="bot"),
+                          self.rec(eid=EID2, status="pending",
+                                   age_secs=200, kind="human")])
+        code, out = self.run_check()
+        self.assertEqual(code, 1)
+        self.assertEqual(out["oldest_event_id"], EID2)
+        self.assertEqual(out["oldest_author_kind"], "human")
+        self.assertEqual(out["oldest_threshold_secs"], 180)
+        self.assertEqual(out["bot_count"], 1)
+
+    # 19. no author_kind (legacy record) -> treated as human.
+    def test_missing_author_kind_is_human(self):
+        self.write_state([self.rec(status="pending", age_secs=200)])
+        code, out = self.run_check()
+        self.assertEqual(code, 1)
+        self.assertEqual(out["oldest_author_kind"], "human")
+        self.assertEqual(out["oldest_threshold_secs"], 180)
+        self.assertEqual(out["bot_count"], 0)
+
+    # 20. bot threshold env overrides are respected.
+    def test_bot_threshold_overrides(self):
+        self.write_state([self.rec(status="pending", age_secs=900,
+                                   kind="bot")])
+        self.env["SLACK_OLDEST_UNPROCESSED_BOT_THRESHOLD_SECS"] = "600"
+        code, out = self.run_check()
+        self.assertEqual(code, 1)
+        self.assertEqual(out["bot_threshold_secs"], 600)
+        self.assertEqual(out["oldest_threshold_secs"], 600)
+        self.write_state([self.rec(status="processing", age_secs=3000,
+                                   kind="bot")])
+        code, _ = self.run_check()
+        self.assertEqual(code, 0)
+        self.env[
+            "SLACK_OLDEST_UNPROCESSED_BOT_PROCESSING_THRESHOLD_SECS"] = "2000"
+        code, out = self.run_check()
+        self.assertEqual(code, 1)
+        self.assertEqual(out["bot_processing_threshold_secs"], 2000)
+        self.assertEqual(out["oldest_threshold_secs"], 2000)
+
+    # 21. bot_count counts only unprocessed bot-authored records.
+    def test_bot_count_reported(self):
+        self.write_state([self.rec(status="pending", age_secs=100,
+                                   kind="bot"),
+                          self.rec(eid=EID2, status="processing",
+                                   age_secs=100, kind="bot"),
+                          self.rec(eid=WS_MUSE + ":" + CHANNEL + ":1794476002.000001",
+                                   status="done", age_secs=900, kind="bot"),
+                          self.rec(eid=WS_MUSE + ":" + CHANNEL + ":1794476003.000001",
+                                   status="pending", age_secs=100,
+                                   kind="human")])
+        code, out = self.run_check()
+        self.assertEqual(code, 0)
+        self.assertEqual(out["unprocessed_count"], 3)
+        self.assertEqual(out["bot_count"], 2)
 
 
 if __name__ == "__main__":

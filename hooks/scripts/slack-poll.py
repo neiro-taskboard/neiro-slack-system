@@ -6,7 +6,14 @@ then decides which events are due for processing.
 
 State file (JSONL, one object per line):
   {"event_id": "<workspace_id>:<channel>:<ts>", "status": "pending|processing|done|failed|dead|waiting",
-   "attempts": <int>, "updated_at": "<ISO8601 UTC>", "last_error": "<str>"}
+   "attempts": <int>, "updated_at": "<ISO8601 UTC>", "last_error": "<str>",
+   "author_kind": "bot|human"}
+  author_kind is recorded when the event is first claimed (2026-11-25):
+  "bot" when the inbox event carries a bot_id, else "human". The
+  oldest-unprocessed check uses it for its two-tier alert thresholds
+  (human posts alert first, bot-to-bot posts only after a longer wait).
+  Records written before this carry no author_kind and are treated as
+  "human" by the check.
 
 Rules:
 - New event (not in state)            -> mark processing, attempts=1, wake it.
@@ -192,6 +199,19 @@ def reclaim_threshold(count):
 
 def event_id(ev):
     return f"{ev.get('workspace_id','')}:{ev.get('channel','')}:{ev.get('ts','')}"
+
+
+def author_kind(ev):
+    """投稿者の種別（"bot" / "human"）。
+
+    判定はイベント自身が持つ印（bot_id）だけを使う。Slack の message
+    イベントはボット投稿にだけ bot_id が付き、人間の投稿には付かない
+    （リスナー・backfill・auto-join はこの bot_id を inbox にそのまま
+    残している）。ID のハードコードはしない（ボットIDはワークスペース
+    ごとに違うため）。bot_id が無い・空のものは "human" として扱う
+    （滞留アラートの二段構えで、印のないものを緩い側に寄せないため）。
+    """
+    return "bot" if (ev.get("bot_id") or "") else "human"
 
 
 IDS_FILE = os.environ.get("SLACK_POLLER_IDS_FILE",
@@ -481,10 +501,13 @@ def main():
             # New event: first attempt. The state record is only written
             # if the event is actually dispatched (burst cap below), so
             # undispatched events stay "new" for the next poll.
-            def claim_new(eid=eid):
+            # author_kind は claim が dispatch 決定後（ループ終了後）に
+            # 実行されるため、ev の値をデフォルト引数で束縛する（eid と同じ）。
+            def claim_new(eid=eid, kind=author_kind(ev)):
                 state[eid] = {"event_id": eid, "status": "processing",
                               "attempts": 1, "updated_at": now_iso(),
-                              "last_error": "", "first_wake_at": now_iso()}
+                              "last_error": "", "first_wake_at": now_iso(),
+                              "author_kind": kind}
             candidates.append((dispatch_priority(ev, now), ts_key(ev), ev, claim_new))
             continue
         status = rec.get("status", "pending")

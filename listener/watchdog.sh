@@ -221,17 +221,29 @@ fi
 # 2026-11-24：詰まりが続く間、最古の入れ替わりごとに警告が出て煩かった
 # （半日で6件、すべて処理中の警告）ため、エピソード単位のクールダウン
 # （前回の警告から 3600 秒以内は送らない）を追加。詳細は下の実装部。
+# 2026-11-25：二段構え（チェック側で主＝人間／副＝ボットに分離）に
+# 合わせ、クールダウンの状態ファイルを段別に分ける。副（ボット）の
+# 警告がクールダウンを消費して主（人間）の警告を抑えることがない
+# ようにするためで、クールダウンの仕組み自体（3600秒・送信成功時の
+# み記録・解消で消去）は両段とも従来通り。警告文にも段を明記する。
 OLDEST_CHECK="/home/hatch/workspace/neiro-slack-system/hooks/scripts/slack-oldest-unprocessed-check.sh"
 OLDEST_STATE="/home/hatch/hooks/state/oldest-unprocessed-warning.state"
+OLDEST_BOT_STATE="/home/hatch/hooks/state/oldest-unprocessed-warning-bot.state"
 OLDEST_FLAG="/home/hatch/hooks/state/oldest-unprocessed-warning.flag"
 if [ -x "$OLDEST_CHECK" ]; then
   if OLDEST_OUT="$("$OLDEST_CHECK" 2>/dev/null)"; then
-    rm -f "$OLDEST_FLAG" "$OLDEST_STATE"
+    rm -f "$OLDEST_FLAG" "$OLDEST_STATE" "$OLDEST_BOT_STATE"
   else
-    OLDEST_FIELDS="$(printf '%s' "$OLDEST_OUT" | python3 -c 'import json,sys; d=json.load(sys.stdin); print((d.get("oldest_event_id") or "") + "|" + str(d.get("oldest_age_secs") or "") + "|" + str(d.get("unprocessed_count") or "") + "|" + str(d.get("oldest_threshold_secs") or 180) + "|" + str(d.get("processing_count") or 0))' 2>/dev/null)"
-    IFS='|' read -r OLDEST_ID OLDEST_AGE OLDEST_COUNT OLDEST_THRESH OLDEST_PROCESSING <<< "$OLDEST_FIELDS"
+    OLDEST_FIELDS="$(printf '%s' "$OLDEST_OUT" | python3 -c 'import json,sys; d=json.load(sys.stdin); print((d.get("oldest_event_id") or "") + "|" + str(d.get("oldest_age_secs") or "") + "|" + str(d.get("unprocessed_count") or "") + "|" + str(d.get("oldest_threshold_secs") or 180) + "|" + str(d.get("processing_count") or 0) + "|" + str(d.get("oldest_author_kind") or "human"))' 2>/dev/null)"
+    IFS='|' read -r OLDEST_ID OLDEST_AGE OLDEST_COUNT OLDEST_THRESH OLDEST_PROCESSING OLDEST_KIND <<< "$OLDEST_FIELDS"
     if [ -n "$OLDEST_ID" ]; then
       printf '%s' "$OLDEST_ID" > "$OLDEST_FLAG"
+      # 段別のクールダウン状態ファイル（主は従来のファイル名のまま）。
+      if [ "$OLDEST_KIND" = "bot" ]; then
+        OLDEST_TIER_STATE="$OLDEST_BOT_STATE"
+      else
+        OLDEST_TIER_STATE="$OLDEST_STATE"
+      fi
       OLDEST_SIG="$(printf '%s' "$OLDEST_ID" | md5sum | cut -d' ' -f1)"
       # エピソード単位のクールダウン（2026-11-24）：状態ファイルには
       # 「署名 送信時刻（epoch秒）」を持つ。同じ詰まりが続く間は最古が
@@ -243,8 +255,8 @@ if [ -x "$OLDEST_CHECK" ]; then
       # して読む（＝クールダウンなしで送れる）。
       OLDEST_PREV_SIG=""
       OLDEST_PREV_EPOCH=0
-      if [ -f "$OLDEST_STATE" ]; then
-        read -r OLDEST_PREV_SIG OLDEST_PREV_EPOCH < "$OLDEST_STATE" || true
+      if [ -f "$OLDEST_TIER_STATE" ]; then
+        read -r OLDEST_PREV_SIG OLDEST_PREV_EPOCH < "$OLDEST_TIER_STATE" || true
         case "$OLDEST_PREV_EPOCH" in ''|*[!0-9]*) OLDEST_PREV_EPOCH=0 ;; esac
       fi
       OLDEST_NOW_EPOCH="$(date +%s)"
@@ -258,13 +270,20 @@ if [ -x "$OLDEST_CHECK" ]; then
         # 処理中の件数も載せる（2026-11-24、Yanayana さんの提案を取り込み）。
         # 処理中が0件ならワーカーが掴んでいない＝止まっている疑いが強く、
         # 1件以上なら順に捌いている最中の可能性がある、と受け手が分かる。
-        if [ "${OLDEST_PROCESSING:-0}" -gt 0 ] 2>/dev/null; then
-          OLDEST_MSG="最古の未処理イベントが${OLDEST_THRESH:-180}秒以上経っています：${OLDEST_ID}（${OLDEST_AGE}秒、未処理 ${OLDEST_COUNT}件、うち処理中 ${OLDEST_PROCESSING}件）。ワーカーが順に処理している最中の可能性があります。"
+        # 段の明記（2026-11-25、二段構え）：副（ボット）の警告には
+        # その旨を前置きし、主（人間）の警告と見分けられるようにする。
+        if [ "$OLDEST_KIND" = "bot" ]; then
+          OLDEST_TIER_NOTE="ボット同士の未処理投稿です（副の長めのしきい値での警告）。"
         else
-          OLDEST_MSG="最古の未処理イベントが${OLDEST_THRESH:-180}秒以上経っています：${OLDEST_ID}（${OLDEST_AGE}秒、未処理 ${OLDEST_COUNT}件、うち処理中 0件）。フックのワーカーが起動していないか、処理が詰まっている可能性があります。"
+          OLDEST_TIER_NOTE=""
+        fi
+        if [ "${OLDEST_PROCESSING:-0}" -gt 0 ] 2>/dev/null; then
+          OLDEST_MSG="${OLDEST_TIER_NOTE}最古の未処理イベントが${OLDEST_THRESH:-180}秒以上経っています：${OLDEST_ID}（${OLDEST_AGE}秒、未処理 ${OLDEST_COUNT}件、うち処理中 ${OLDEST_PROCESSING}件）。ワーカーが順に処理している最中の可能性があります。"
+        else
+          OLDEST_MSG="${OLDEST_TIER_NOTE}最古の未処理イベントが${OLDEST_THRESH:-180}秒以上経っています：${OLDEST_ID}（${OLDEST_AGE}秒、未処理 ${OLDEST_COUNT}件、うち処理中 0件）。フックのワーカーが起動していないか、処理が詰まっている可能性があります。"
         fi
         if [ -n "$ALERT_CHANNEL" ] && /home/hatch/hooks/scripts/slack-send-locked.sh --channel "$ALERT_CHANNEL" --workspace muse-board --request-id "oldest-unprocessed-$OLDEST_SIG" --message "$OLDEST_MSG" >/dev/null 2>&1; then
-          printf '%s %s\n' "$OLDEST_SIG" "$OLDEST_NOW_EPOCH" > "$OLDEST_STATE"
+          printf '%s %s\n' "$OLDEST_SIG" "$OLDEST_NOW_EPOCH" > "$OLDEST_TIER_STATE"
         fi
       fi
     else

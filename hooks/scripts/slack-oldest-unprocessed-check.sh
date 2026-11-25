@@ -32,33 +32,55 @@
 # 6件出て受け手（オーナー）から煩いと指摘があったため、processing の
 # しきい値を 1800 秒へ上げる。掴んだまま30分は、止まった疑いが強い
 # 水準。あわせて watchdog 側にエピソード単位のクールダウンを入れた。
+#
+# 2026-11-25：滞留アラートの二段構え（Yama 方式の取り入れ第2件）。
+# 投稿者で段を分ける。主＝人間からの未処理投稿は現行のしきい値
+# （180秒／processing 1800秒）のまま。副＝ボット同士の未処理投稿は
+# 長めのしきい値でのみ警告する（pending等 1800秒＝主の10倍、
+# processing 7200秒＝主の4倍。ボット同士の議論は人間の未回答より
+# 緊急度が低く、後回しにされがちな分だけ長く待つ）。投稿者の種別は
+# 台帳の author_kind（ポーラーが初回 claim 時にイベント自身の bot_id
+# の有無で記録）で判定し、author_kind の無い古い記録は主（人間）と
+# して扱う（印のないものを緩い側に寄せない）。両段ともしきい値を
+# 超えたものがあるときは、主の最古を警告対象にする（副の古さで主の
+# 警告を埋もれさせない）。watchdog 側のクールダウン状態ファイルも
+# 段別に分けてあるので、副の警告が主の警告を抑えることはない。
 # 出力は JSON 1行：{"unprocessed_count": N, "processing_count": M,
-# "oldest_event_id": ..., "oldest_age_secs": ...,
-# "threshold_secs": 180,
-# "processing_threshold_secs": 1800, "oldest_threshold_secs": ...}。
+# "bot_count": B, "oldest_event_id": ..., "oldest_age_secs": ...,
+# "oldest_author_kind": "human"|"bot",
+# "threshold_secs": 180, "processing_threshold_secs": 1800,
+# "bot_threshold_secs": 1800, "bot_processing_threshold_secs": 7200,
+# "oldest_threshold_secs": ...}。
 # processing_count は未処理のうち status が processing の件数
 # （2026-11-24、Yanayana さんの提案を取り込み：警告文に載せると、
 # 受け手は「止まっているのか、捌いている最中なのか」が分かる）。
+# bot_count は未処理のうちボット投稿の件数（二段構え、2026-11-25）。
 # 重複抑止の署名には oldest_event_id だけを使う（年齢の秒数を入れると
 # 毎回変わって連投になるため）。年齢と件数は Slack 警告文に入れる。
 #
 # 環境変数（テスト用）：SLACK_OLDEST_UNPROCESSED_STATE_FILE
 # （既定 /home/hatch/hooks/state/slack-events.jsonl）、
 # SLACK_OLDEST_UNPROCESSED_THRESHOLD_SECS（既定 180）、
-# SLACK_OLDEST_UNPROCESSED_PROCESSING_THRESHOLD_SECS（既定 1800）。
+# SLACK_OLDEST_UNPROCESSED_PROCESSING_THRESHOLD_SECS（既定 1800）、
+# SLACK_OLDEST_UNPROCESSED_BOT_THRESHOLD_SECS（既定 1800）、
+# SLACK_OLDEST_UNPROCESSED_BOT_PROCESSING_THRESHOLD_SECS（既定 7200）。
 set -u
 
 STATE_FILE="${SLACK_OLDEST_UNPROCESSED_STATE_FILE:-/home/hatch/hooks/state/slack-events.jsonl}"
 THRESHOLD_SECS="${SLACK_OLDEST_UNPROCESSED_THRESHOLD_SECS:-180}"
 PROCESSING_THRESHOLD_SECS="${SLACK_OLDEST_UNPROCESSED_PROCESSING_THRESHOLD_SECS:-1800}"
+BOT_THRESHOLD_SECS="${SLACK_OLDEST_UNPROCESSED_BOT_THRESHOLD_SECS:-1800}"
+BOT_PROCESSING_THRESHOLD_SECS="${SLACK_OLDEST_UNPROCESSED_BOT_PROCESSING_THRESHOLD_SECS:-7200}"
 
-python3 - "$STATE_FILE" "$THRESHOLD_SECS" "$PROCESSING_THRESHOLD_SECS" <<'PYEOF'
+python3 - "$STATE_FILE" "$THRESHOLD_SECS" "$PROCESSING_THRESHOLD_SECS" "$BOT_THRESHOLD_SECS" "$BOT_PROCESSING_THRESHOLD_SECS" <<'PYEOF'
 import json
 import os
 import sys
 from datetime import datetime, timezone
 
-state_file, threshold, processing_threshold = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+state_file = sys.argv[1]
+threshold, processing_threshold = int(sys.argv[2]), int(sys.argv[3])
+bot_threshold, bot_processing_threshold = int(sys.argv[4]), int(sys.argv[5])
 now = datetime.now(timezone.utc)
 
 
@@ -69,14 +91,22 @@ def parse_iso(s):
         return None
 
 
+def threshold_for(status, kind):
+    # 二段構え（2026-11-25）：主＝人間は現行値、副＝ボットは長め。
+    if status == "processing":
+        return bot_processing_threshold if kind == "bot" else processing_threshold
+    return bot_threshold if kind == "bot" else threshold
+
+
 oldest_id = None
 oldest_age = None
 oldest_threshold = None
-warn_oldest_id = None
-warn_oldest_age = None
-warn_oldest_threshold = None
+oldest_kind = None
+# 警告候補は段ごとに最古を保持し、主（人間）があれば主を優先する。
+warn = {"human": None, "bot": None}  # kind -> (age, event_id, threshold)
 count = 0
 processing_count = 0
+bot_count = 0
 if os.path.exists(state_file):
     with open(state_file, encoding="utf-8") as f:
         for line in f:
@@ -98,28 +128,40 @@ if os.path.exists(state_file):
             count += 1
             if rec.get("status") == "processing":
                 processing_count += 1
-            this_threshold = processing_threshold if rec.get("status") == "processing" else threshold
+            # author_kind の無い古い記録は主（人間）として扱う。
+            kind = "bot" if rec.get("author_kind") == "bot" else "human"
+            if kind == "bot":
+                bot_count += 1
+            this_threshold = threshold_for(rec.get("status"), kind)
             if oldest_age is None or age > oldest_age:
                 oldest_age = age
                 oldest_id = rec.get("event_id")
                 oldest_threshold = this_threshold
+                oldest_kind = kind
             if age >= this_threshold:
-                if warn_oldest_age is None or age > warn_oldest_age:
-                    warn_oldest_age = age
-                    warn_oldest_id = rec.get("event_id")
-                    warn_oldest_threshold = this_threshold
+                cur = warn[kind]
+                if cur is None or age > cur[0]:
+                    warn[kind] = (age, rec.get("event_id"), this_threshold)
 
-if warn_oldest_id is not None:
-    oldest_id, oldest_age, oldest_threshold = warn_oldest_id, warn_oldest_age, warn_oldest_threshold
+warn_kind = "human" if warn["human"] is not None else (
+    "bot" if warn["bot"] is not None else None)
+if warn_kind is not None:
+    warn_age, warn_id, warn_threshold = warn[warn_kind]
+    oldest_id, oldest_age, oldest_threshold = warn_id, warn_age, warn_threshold
+    oldest_kind = warn_kind
 
 print(json.dumps({
     "unprocessed_count": count,
     "processing_count": processing_count,
+    "bot_count": bot_count,
     "oldest_event_id": oldest_id,
     "oldest_age_secs": int(oldest_age) if oldest_age is not None else None,
+    "oldest_author_kind": oldest_kind,
     "threshold_secs": threshold,
     "processing_threshold_secs": processing_threshold,
+    "bot_threshold_secs": bot_threshold,
+    "bot_processing_threshold_secs": bot_processing_threshold,
     "oldest_threshold_secs": oldest_threshold,
 }, ensure_ascii=False))
-sys.exit(1 if warn_oldest_id is not None else 0)
+sys.exit(1 if warn_kind is not None else 0)
 PYEOF
