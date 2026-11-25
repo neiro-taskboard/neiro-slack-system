@@ -86,6 +86,22 @@ fi
 if [ "$LISTENER_OK" = "0" ]; then
   echo "service start/restart skipped (listener.py syntax check failed)"
 elif ! systemctl is-active --quiet "$SERVICE"; then
+  # 検知時の身元記録（2026-11-25、Yanayana さんの実装を取り込み）。
+  # リスナー停止を検知した時点で hostname・起動時刻・boot_id ハッシュを
+  # events/detection_identity.log へ1行残す。再起動より前に記録するので、
+  # 起動に失敗した場合も残る。うちの hostname も汎用名（htch-runtime）
+  # なので、識別は起動時刻・boot_id 側が担う。記録に失敗しても
+  # ウォッチドッグは止めない。
+  DETECT_TS="$(date -Is 2>/dev/null || date)"
+  DETECT_HOST="$(hostname 2>/dev/null || echo unknown)"
+  DETECT_BOOT="$(uptime -s 2>/dev/null | tr ' ' 'T')"
+  DETECT_BOOTID="unknown"
+  if [ -r /proc/sys/kernel/random/boot_id ]; then
+    DETECT_BOOTID="$(tr -d '\n' < /proc/sys/kernel/random/boot_id | sha256sum | cut -c1-8)"
+  fi
+  printf '%s hostname=%s boot=%s boot_id=%s event=listener-not-running\n' \
+    "$DETECT_TS" "$DETECT_HOST" "${DETECT_BOOT:-unknown}" "$DETECT_BOOTID" \
+    >> /home/hatch/workspace/slack-listener/events/detection_identity.log 2>/dev/null || true
   systemctl enable --now "$SERVICE" >/dev/null 2>&1 || systemctl start "$SERVICE"
   echo "service started"
 elif [ "$UNIT_CHANGED" = "1" ]; then
