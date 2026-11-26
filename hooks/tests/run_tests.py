@@ -33,9 +33,20 @@ TIMEOUT = 300
 
 def run(cmd, label):
     print(f"== {label}", flush=True)
-    proc = subprocess.run(cmd, cwd=HERE, timeout=TIMEOUT,
-                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                          text=True)
+    try:
+        proc = subprocess.run(cmd, cwd=HERE, timeout=TIMEOUT,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              text=True)
+    except subprocess.TimeoutExpired as exc:
+        # A hanging suite must fail this runner, not abort it: without
+        # this the traceback would stop the remaining suites and print
+        # no FAILED summary (Groq gpt-oss-120b review, 2026-11-26).
+        print(f"TIMEOUT after {TIMEOUT}s")
+        tail = "\n".join((exc.stdout or "").rstrip().splitlines()[-3:])
+        if tail:
+            print(tail)
+        print("exit=124")
+        return 124
     tail = "\n".join(proc.stdout.rstrip().splitlines()[-3:])
     if tail:
         print(tail)
@@ -53,7 +64,11 @@ def main():
         failures.append("unittest discover")
 
     # 2. Standalone check-style scripts: files with zero unittest tests.
+    # The import below only counts tests: check-style scripts must keep
+    # their work behind `if __name__ == "__main__"` (all 11 do, as of
+    # 2026-11-26), or the import itself would run their checks.
     loader = unittest.TestLoader()
+    saved_path = list(sys.path)
     sys.path.insert(0, HERE)
     try:
         for name in sorted(os.listdir(HERE)):
@@ -73,7 +88,7 @@ def main():
             if rc != 0:
                 failures.append(name)
     finally:
-        sys.path.remove(HERE)
+        sys.path[:] = saved_path
 
     if failures:
         print(f"\nFAILED: {', '.join(failures)}")
