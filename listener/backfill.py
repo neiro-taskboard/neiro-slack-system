@@ -202,10 +202,14 @@ def _fetch_history_page(workspace_key, channel, limit=HISTORY_PAGE_LIMIT,
                          oldest=None, quiet=False):
     """One page of a channel's history via slackcli.
 
-    Returns (messages, has_more, next_oldest). slackcli returns
+    Returns (messages, has_more, next_oldest, ok). slackcli returns
     messages oldest-first; --oldest is exclusive, so chaining with
     next_oldest (the newest ts of the page just read) walks forward
-    without duplicates. Returns ([], False, None) on any failure.
+    without duplicates. ok is False on any failure (subprocess error,
+    no JSON, bad JSON); an empty messages list with ok True means the
+    read succeeded but there is nothing new — the two must not be
+    conflated, because a quiet DM with no new messages would otherwise
+    look unreadable (2026-11-27).
     """
     cmd = [SLACKCLI, "conversations", "read", channel,
            "--workspace", workspace_key, "--limit", str(limit), "--json"]
@@ -216,22 +220,22 @@ def _fetch_history_page(workspace_key, channel, limit=HISTORY_PAGE_LIMIT,
     except (subprocess.SubprocessError, OSError) as e:
         if not quiet:
             log(f"history fetch failed for {channel}: {e}")
-        return [], False, None
+        return [], False, None, False
     out = proc.stdout
     start = out.find("{")
     if start < 0:
         if not quiet:
             log(f"history fetch failed for {channel}: no JSON in output "
                 f"(rc={proc.returncode}, stderr={proc.stderr.strip()[:200]})")
-        return [], False, None
+        return [], False, None, False
     try:
         data = json.loads(out[start:])
     except json.JSONDecodeError as e:
         if not quiet:
             log(f"history fetch failed for {channel}: bad JSON: {e}")
-        return [], False, None
+        return [], False, None, False
     return data.get("messages", []), bool(data.get("has_more")), \
-        data.get("next_oldest")
+        data.get("next_oldest"), True
 
 
 # History paging (agreed 2026-11-21 with Yama / Yanayana: up to 2-3
@@ -242,32 +246,51 @@ def _fetch_history_page(workspace_key, channel, limit=HISTORY_PAGE_LIMIT,
 # passed, pages walk forward, and anything past the cap is left for
 # the next run (the inbox baseline only advances by what was added),
 # with a warning so the gap is visible instead of silent.
-def fetch_history(workspace_key, channel, limit=HISTORY_PAGE_LIMIT,
-                  quiet=False, oldest=None):
-    """Return the channel's recent top-level messages via slackcli.
+def fetch_history_status(workspace_key, channel, limit=HISTORY_PAGE_LIMIT,
+                         quiet=False, oldest=None):
+    """Return (messages, failed) for the channel's recent history.
 
     Pages forward from `oldest` (exclusive) up to HISTORY_MAX_PAGES
     pages of `limit` messages each. Callers pass the channel's newest
     inbox ts as `oldest` so only messages newer than the baseline are
-    fetched at all.
+    fetched at all. failed is True when any page's fetch itself
+    failed; an empty messages list with failed False means the read
+    succeeded and there is simply nothing new.
     """
     messages = []
+    failed = False
     cursor = oldest
     for page in range(HISTORY_MAX_PAGES):
-        page_msgs, has_more, next_oldest = _fetch_history_page(
+        page_msgs, has_more, next_oldest, ok = _fetch_history_page(
             workspace_key, channel, limit=limit, oldest=cursor,
             quiet=quiet)
+        if not ok:
+            failed = True
+            return messages, failed
         messages.extend(page_msgs)
         if not has_more:
-            return messages
+            return messages, failed
         if not next_oldest:
             log(f"history paging stopped for {channel}: has_more but "
                 f"no next_oldest on page {page + 1}")
-            return messages
+            return messages, failed
         cursor = next_oldest
     log(f"history paging hit the {HISTORY_MAX_PAGES}-page cap for "
         f"{channel} ({len(messages)} messages); newer messages past "
         f"the cap are left for the next backfill run")
+    return messages, failed
+
+
+def fetch_history(workspace_key, channel, limit=HISTORY_PAGE_LIMIT,
+                  quiet=False, oldest=None):
+    """Return the channel's recent top-level messages via slackcli.
+
+    Same paging as fetch_history_status, but only the messages: kept
+    for the callers (and tests) that do not need to tell a failed
+    fetch from an empty one.
+    """
+    messages, _failed = fetch_history_status(
+        workspace_key, channel, limit=limit, quiet=quiet, oldest=oldest)
     return messages
 
 
@@ -443,20 +466,28 @@ def main():
             # missed all user DMs with channel_not_found).
             by_ts = {}
             if channel.startswith("D") and ws.get("slackcli_user_key"):
-                got_any = False
+                # Readable means the fetch itself succeeded, even when
+                # it returns no new messages: a quiet DM (no posts
+                # since the baseline) used to be logged as unreadable
+                # on every run, because the old check treated "no
+                # messages" the same as "fetch failed" (2026-11-27).
+                # One key failing is expected — a user DM is visible
+                # only to the user key, a bot DM only to the bot key —
+                # so only both keys failing counts as unreadable.
+                readable_any = False
                 for key, ident in ((ws.get("slackcli_key", ""), "bot"),
                                    (ws["slackcli_user_key"], "user")):
-                    msgs = fetch_history(key, channel, quiet=True,
-                                        oldest=newest)
-                    if msgs:
-                        got_any = True
+                    msgs, failed = fetch_history_status(
+                        key, channel, quiet=True, oldest=newest)
+                    if not failed:
+                        readable_any = True
                     for m in msgs:
                         ts = m.get("ts", "")
                         if ts and ts not in by_ts:
                             m = dict(m)
                             m["_identity"] = ident
                             by_ts[ts] = m
-                if not got_any:
+                if not readable_any:
                     log(f"history fetch failed for {channel}: "
                         f"neither bot nor user key can read it")
                 messages = list(by_ts.values())
