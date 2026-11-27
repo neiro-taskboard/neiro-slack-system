@@ -12,6 +12,31 @@
 # Safe to run repeatedly; exits 0 in all expected cases.
 set -u
 
+# 固まり対策（2026-11-27、Yama さんの指摘を取り込み）。
+# watchdog.sh は5分間隔の定期ジョブ駆動で、oneshot のサービスでは
+# ないので TimeoutStartSec は使えない。代わりにこの2つで守る：
+# ・timeout 240：全体が4分で終わらなければ強制終了し、次の5分周期に
+#   委ねる（5分周期のうち4分で打ち切る）。
+# ・flock -n：前回が固まって残っていたら今回は即終了（exit 0）し、
+#   重なりを防ぐ。固まった前回は timeout が殺すので、次周期では
+#   また動ける。
+# 順序の罠：flock を取ってから timeout で再実行すると、ロックが親の
+# timeout プロセスに残って内側の flock -n を弾いてしまう。なので
+# 先に timeout で再実行し（ガード変数で1回だけ）、内側で flock を
+# 取る順序にする。WATCHDOG_TIMEOUT_SECS はテスト用の上書き可。
+WATCHDOG_TIMEOUT_SECS="${WATCHDOG_TIMEOUT_SECS:-240}"
+if [ -z "${WATCHDOG_TIMEOUT_GUARD:-}" ]; then
+  export WATCHDOG_TIMEOUT_GUARD=1
+  exec timeout "$WATCHDOG_TIMEOUT_SECS" "$0" "$@"
+fi
+WATCHDOG_LOCK_FILE="${WATCHDOG_LOCK_FILE:-/home/hatch/hooks/state/watchdog.lock}"
+mkdir -p "$(dirname "$WATCHDOG_LOCK_FILE")"
+exec 9>"$WATCHDOG_LOCK_FILE"
+if ! flock -n 9; then
+  echo "watchdog.sh: previous run still holding the lock; skipping this cycle" >&2
+  exit 0
+fi
+
 # 警告先チャンネルは ids.json から読む（2026-11-21、実ID外部化の残り4件）。
 # fail-closed：読めなければ警告送信だけ skip し、空のチャンネルでは送らない。
 # 読めないときに状態ファイルだけ先に更新すると、復旧後も警告が出なくなる
