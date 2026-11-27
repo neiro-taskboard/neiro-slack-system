@@ -194,7 +194,7 @@ def restore_inbox(path, events):
     os.replace(tmp, path)
 
 
-HISTORY_PAGE_LIMIT = 20
+HISTORY_PAGE_LIMIT = 30
 HISTORY_MAX_PAGES = 3
 
 
@@ -235,8 +235,8 @@ def _fetch_history_page(workspace_key, channel, limit=HISTORY_PAGE_LIMIT,
 
 
 # History paging (agreed 2026-11-21 with Yama / Yanayana: up to 2-3
-# pages, warn when the cap is hit). One page is 20 messages, so a
-# burst of more than 20 missed messages in one channel used to lose
+# pages, warn when the cap is hit). One page is 30 messages, so a
+# burst of more than 30 missed messages in one channel used to lose
 # the oldest ones silently: the single fetch returned only the newest
 # page. Now the floor (--oldest = the channel's newest inbox ts) is
 # passed, pages walk forward, and anything past the cap is left for
