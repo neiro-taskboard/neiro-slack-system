@@ -89,8 +89,8 @@ class BackfillThreadTest(unittest.TestCase):
             return [json.loads(line) for line in f if line.strip()]
 
     def run_main(self):
-        backfill.fetch_history = lambda key, ch, limit=20, quiet=False: \
-            list(self.history)
+        backfill.fetch_history = lambda key, ch, limit=20, quiet=False, \
+            oldest=None: list(self.history)
         backfill.fetch_thread_messages = lambda ws, ch, pts, oldest=None: (
             self.thread_calls.append((pts, oldest)),
             self.threads.get(pts, []),

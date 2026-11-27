@@ -194,30 +194,81 @@ def restore_inbox(path, events):
     os.replace(tmp, path)
 
 
-def fetch_history(workspace_key, channel, limit=20, quiet=False):
-    """Return the channel's recent top-level messages via slackcli."""
+HISTORY_PAGE_LIMIT = 20
+HISTORY_MAX_PAGES = 3
+
+
+def _fetch_history_page(workspace_key, channel, limit=HISTORY_PAGE_LIMIT,
+                         oldest=None, quiet=False):
+    """One page of a channel's history via slackcli.
+
+    Returns (messages, has_more, next_oldest). slackcli returns
+    messages oldest-first; --oldest is exclusive, so chaining with
+    next_oldest (the newest ts of the page just read) walks forward
+    without duplicates. Returns ([], False, None) on any failure.
+    """
     cmd = [SLACKCLI, "conversations", "read", channel,
            "--workspace", workspace_key, "--limit", str(limit), "--json"]
+    if oldest is not None:
+        cmd += ["--oldest", str(oldest)]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     except (subprocess.SubprocessError, OSError) as e:
         if not quiet:
             log(f"history fetch failed for {channel}: {e}")
-        return []
+        return [], False, None
     out = proc.stdout
     start = out.find("{")
     if start < 0:
         if not quiet:
             log(f"history fetch failed for {channel}: no JSON in output "
                 f"(rc={proc.returncode}, stderr={proc.stderr.strip()[:200]})")
-        return []
+        return [], False, None
     try:
         data = json.loads(out[start:])
     except json.JSONDecodeError as e:
         if not quiet:
             log(f"history fetch failed for {channel}: bad JSON: {e}")
-        return []
-    return data.get("messages", [])
+        return [], False, None
+    return data.get("messages", []), bool(data.get("has_more")), \
+        data.get("next_oldest")
+
+
+# History paging (agreed 2026-11-21 with Yama / Yanayana: up to 2-3
+# pages, warn when the cap is hit). One page is 20 messages, so a
+# burst of more than 20 missed messages in one channel used to lose
+# the oldest ones silently: the single fetch returned only the newest
+# page. Now the floor (--oldest = the channel's newest inbox ts) is
+# passed, pages walk forward, and anything past the cap is left for
+# the next run (the inbox baseline only advances by what was added),
+# with a warning so the gap is visible instead of silent.
+def fetch_history(workspace_key, channel, limit=HISTORY_PAGE_LIMIT,
+                  quiet=False, oldest=None):
+    """Return the channel's recent top-level messages via slackcli.
+
+    Pages forward from `oldest` (exclusive) up to HISTORY_MAX_PAGES
+    pages of `limit` messages each. Callers pass the channel's newest
+    inbox ts as `oldest` so only messages newer than the baseline are
+    fetched at all.
+    """
+    messages = []
+    cursor = oldest
+    for page in range(HISTORY_MAX_PAGES):
+        page_msgs, has_more, next_oldest = _fetch_history_page(
+            workspace_key, channel, limit=limit, oldest=cursor,
+            quiet=quiet)
+        messages.extend(page_msgs)
+        if not has_more:
+            return messages
+        if not next_oldest:
+            log(f"history paging stopped for {channel}: has_more but "
+                f"no next_oldest on page {page + 1}")
+            return messages
+        cursor = next_oldest
+    log(f"history paging hit the {HISTORY_MAX_PAGES}-page cap for "
+        f"{channel} ({len(messages)} messages); newer messages past "
+        f"the cap are left for the next backfill run")
+    return messages
 
 
 def fetch_thread(workspace_key, channel, thread_ts, oldest=None,
@@ -395,7 +446,8 @@ def main():
                 got_any = False
                 for key, ident in ((ws.get("slackcli_key", ""), "bot"),
                                    (ws["slackcli_user_key"], "user")):
-                    msgs = fetch_history(key, channel, quiet=True)
+                    msgs = fetch_history(key, channel, quiet=True,
+                                        oldest=newest)
                     if msgs:
                         got_any = True
                     for m in msgs:
@@ -409,7 +461,8 @@ def main():
                         f"neither bot nor user key can read it")
                 messages = list(by_ts.values())
             else:
-                messages = fetch_history(ws.get("slackcli_key", ""), channel)
+                messages = fetch_history(ws.get("slackcli_key", ""), channel,
+                                         oldest=newest)
             # Thread replies (2026-11-18, Yanayana's approach): re-read
             # each parent with replies and admit its replies through
             # the same checks as top-level posts. Only fetch a thread
